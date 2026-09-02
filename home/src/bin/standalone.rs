@@ -10,7 +10,10 @@ use alloc::{
     vec::Vec,
 };
 use anyhow::{Context, Result};
-use core::fmt::Write;
+use core::{
+    fmt::Write,
+    sync::atomic::{AtomicBool, Ordering},
+};
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
@@ -27,8 +30,11 @@ use esp_radio::wifi::{
     sta::StationConfig,
 };
 use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Value};
-use freemdu_home::OpticalPort;
-use log::{error, info};
+use freemdu_home::{
+    OpticalPort,
+    accelerometer::{Lis2dh, Metrics, WindowStats},
+};
+use log::{debug, error, info, warn};
 use mcutie::{
     McutieBuilder, McutieReceiver, McutieTask, MqttMessage, PublishBytes, Publishable, Topic,
     homeassistant::{
@@ -48,8 +54,14 @@ const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
 // Delay between Wi-Fi reconnection attempts
 const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
 
+const ACCEL_SAMPLE_HZ: u32 = freemdu_home::num_from_env!("ACCEL_SAMPLE_HZ", u32);
+const ACCEL_PUBLISH_INTERVAL: u32 = freemdu_home::num_from_env!("ACCEL_PUBLISH_INTERVAL", u32);
+const ACCEL_RETRY_DELAY: Duration = Duration::from_secs(1);
+
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
+
+static MQTT_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 esp_bootloader_esp_idf::esp_app_desc!();
 
@@ -80,10 +92,12 @@ async fn mqtt_message_task(
         match select::select(receiver.receive(), ticker.next()).await {
             Either::First(MqttMessage::Connected) => {
                 connected = true;
+                MQTT_CONNECTED.store(true, Ordering::Relaxed);
                 ticker.reset();
             }
             Either::First(MqttMessage::Disconnected) => {
                 connected = false;
+                MQTT_CONNECTED.store(false, Ordering::Relaxed);
             }
             Either::First(MqttMessage::Publish(Topic::Device(topic), payload)) => {
                 if let Ok(param) = str::from_utf8(&payload)
@@ -112,6 +126,155 @@ async fn mqtt_message_task(
 
         led.set_level((!connected).into());
     }
+}
+
+#[embassy_executor::task]
+async fn accelerometer_task(mut sensor: Lis2dh<'static>, hostname: String) -> ! {
+    let sample_hz = ACCEL_SAMPLE_HZ.max(1);
+    let sample_period = Duration::from_micros(1_000_000_u64 / u64::from(sample_hz));
+    let target_samples = sample_hz.saturating_mul(ACCEL_PUBLISH_INTERVAL.max(1));
+    let mut discovery_published = false;
+
+    loop {
+        let address = match sensor.init(sample_hz).await {
+            Ok(address) => address,
+            Err(err) => {
+                error!("Failed to initialize LIS2DH: {err:?}");
+                embassy_time::Timer::after(ACCEL_RETRY_DELAY).await;
+                continue;
+            }
+        };
+
+        info!("LIS2DH connected at I2C address 0x{address:02x}, sampling at {sample_hz} Hz");
+
+        let mut ticker = Ticker::every(sample_period);
+        let mut stats = WindowStats::new();
+
+        loop {
+            ticker.next().await;
+
+            let sample = match sensor.read_sample().await {
+                Ok(sample) => sample,
+                Err(err) => {
+                    warn!("Failed to read LIS2DH, reinitializing: {err:?}");
+                    discovery_published = false;
+                    embassy_time::Timer::after(ACCEL_RETRY_DELAY).await;
+                    break;
+                }
+            };
+            stats.push(sample);
+
+            let Some(metrics) = stats.finish().filter(|m| m.samples >= target_samples) else {
+                continue;
+            };
+
+            // mcutie uses QoS 0 by default and publishing while disconnected can
+            // appear successful, so only mark discovery as sent while the MQTT
+            // receiver reports an active connection.
+            if !MQTT_CONNECTED.load(Ordering::Relaxed) {
+                discovery_published = false;
+                stats = WindowStats::new();
+                continue;
+            }
+
+            if !discovery_published {
+                match publish_accelerometer_discovery(&hostname).await {
+                    Ok(()) => {
+                        discovery_published = true;
+                        info!("Published LIS2DH Home Assistant discovery");
+                    }
+                    Err(err) => debug!("Failed to publish LIS2DH discovery: {err:#}"),
+                }
+            }
+
+            if let Err(err) = publish_accelerometer_metrics(&metrics).await {
+                debug!("Failed to publish LIS2DH metrics: {err:#}");
+            }
+
+            stats = WindowStats::new();
+        }
+    }
+}
+
+async fn publish_accelerometer_discovery(hostname: &str) -> Result<()> {
+    publish_accelerometer_sensor(hostname, "acceleration_x_mean", "Acceleration X mean", "mg")
+        .await?;
+    publish_accelerometer_sensor(hostname, "acceleration_y_mean", "Acceleration Y mean", "mg")
+        .await?;
+    publish_accelerometer_sensor(hostname, "acceleration_z_mean", "Acceleration Z mean", "mg")
+        .await?;
+    publish_accelerometer_sensor(hostname, "vibration_x_stddev", "Vibration X stddev", "mg")
+        .await?;
+    publish_accelerometer_sensor(hostname, "vibration_y_stddev", "Vibration Y stddev", "mg")
+        .await?;
+    publish_accelerometer_sensor(hostname, "vibration_z_stddev", "Vibration Z stddev", "mg")
+        .await?;
+    publish_accelerometer_sensor(hostname, "vibration_rms", "Vibration RMS", "mg").await?;
+    publish_accelerometer_sensor(
+        hostname,
+        "acceleration_peak_to_peak",
+        "Acceleration peak-to-peak",
+        "mg",
+    )
+    .await?;
+
+    Ok(())
+}
+
+async fn publish_accelerometer_sensor(
+    hostname: &str,
+    id: &str,
+    name: &str,
+    unit: &str,
+) -> Result<()> {
+    let unique_id = format!("{hostname}_lis2dh_{id}");
+    let state_topic = Topic::Device(format!("accelerometer/{id}/value"));
+
+    Entity {
+        device: HaDevice {
+            name: Some("FreeMDU vibration monitor"),
+            ..HaDevice::default()
+        },
+        origin: Origin::default(),
+        object_id: &unique_id,
+        unique_id: Some(&unique_id),
+        name,
+        // Keep accelerometer availability independent of the Miele optical
+        // interface. The sensor is intentionally useful even when no Miele
+        // connection can be established.
+        availability: AvailabilityTopics::<0>::None,
+        state_topic: Some(state_topic.as_ref()),
+        command_topic: None,
+        component: Sensor {
+            device_class: None,
+            state_class: None,
+            unit_of_measurement: Some(unit),
+        },
+    }
+    .publish_discovery()
+    .await
+    .map_err(|err| anyhow::anyhow!("Failed to publish HA accelerometer sensor: {err:?}"))
+}
+
+async fn publish_accelerometer_metrics(metrics: &Metrics) -> Result<()> {
+    publish_accelerometer_value("acceleration_x_mean", metrics.x_mean_mg).await?;
+    publish_accelerometer_value("acceleration_y_mean", metrics.y_mean_mg).await?;
+    publish_accelerometer_value("acceleration_z_mean", metrics.z_mean_mg).await?;
+    publish_accelerometer_value("vibration_x_stddev", metrics.x_stddev_mg).await?;
+    publish_accelerometer_value("vibration_y_stddev", metrics.y_stddev_mg).await?;
+    publish_accelerometer_value("vibration_z_stddev", metrics.z_stddev_mg).await?;
+    publish_accelerometer_value("vibration_rms", metrics.vibration_rms_mg).await?;
+    publish_accelerometer_value("acceleration_peak_to_peak", metrics.peak_to_peak_mg).await?;
+
+    Ok(())
+}
+
+async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -> Result<()> {
+    Topic::Device(format!("accelerometer/{id}/value"))
+        .with_display(value)
+        .publish()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to publish LIS2DH value {id}: {err:?}"))
 }
 
 async fn publish_device(port: &mut OpticalPort<'_>, hostname: &str) -> Result<()> {
@@ -364,6 +527,9 @@ async fn main(spawner: Spawner) {
 
     let led = freemdu_home::new_status_led();
     let port = freemdu_home::new_optical_port(peripherals.UART1).unwrap();
+    let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
+    let accelerometer = Lis2dh::new(accel_i2c);
+    let accel_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
         init_network(peripherals.WIFI, &hostname).unwrap();
     let (mqtt_receiver, mqtt_task) =
@@ -375,6 +541,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led).unwrap());
+    spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());
 }

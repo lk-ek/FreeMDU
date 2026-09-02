@@ -1,5 +1,7 @@
 #![no_std]
 
+pub mod accelerometer;
+
 use embedded_io_async::{ErrorType, Read, ReadExactError, Write};
 use esp_hal::{
     Async,
