@@ -218,6 +218,14 @@ async fn publish_accelerometer_discovery(hostname: &str) -> Result<()> {
     )
     .await?;
 
+    // Human-readable values in g. The original mg statistics remain available
+    // for lossless long-term analysis.
+    publish_accelerometer_sensor(hostname, "acceleration_peak_g", "Peak acceleration", "g")
+        .await?;
+    publish_accelerometer_sensor(hostname, "dynamic_peak_g", "Dynamic peak", "g").await?;
+    publish_accelerometer_sensor(hostname, "vibration_rms_g", "Vibration RMS", "g").await?;
+    publish_accelerometer_sensor(hostname, "peak_to_peak_g", "Peak-to-peak", "g").await?;
+
     Ok(())
 }
 
@@ -266,7 +274,19 @@ async fn publish_accelerometer_metrics(metrics: &Metrics) -> Result<()> {
     publish_accelerometer_value("vibration_rms", metrics.vibration_rms_mg).await?;
     publish_accelerometer_value("acceleration_peak_to_peak", metrics.peak_to_peak_mg).await?;
 
+    publish_accelerometer_mg_as_g("acceleration_peak_g", metrics.acceleration_peak_mg).await?;
+    publish_accelerometer_mg_as_g("dynamic_peak_g", metrics.dynamic_peak_mg).await?;
+    publish_accelerometer_mg_as_g("vibration_rms_g", metrics.vibration_rms_mg).await?;
+    publish_accelerometer_mg_as_g("peak_to_peak_g", metrics.peak_to_peak_mg).await?;
+
     Ok(())
+}
+
+async fn publish_accelerometer_mg_as_g(id: &str, value_mg: u32) -> Result<()> {
+    // Avoid floating-point math while still publishing a normal decimal value
+    // Home Assistant can graph directly, e.g. 83 mg -> "0.083" g.
+    let value = format!("{}.{:03}", value_mg / 1000, value_mg % 1000);
+    publish_accelerometer_value(id, value).await
 }
 
 async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -> Result<()> {

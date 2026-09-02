@@ -55,6 +55,12 @@ pub struct Metrics {
     pub vibration_rms_mg: u32,
     /// Largest peak-to-peak span of any individual axis in the window.
     pub peak_to_peak_mg: u32,
+    /// Largest instantaneous 3-axis acceleration magnitude in the window.
+    /// This includes gravity, so a stationary sensor reads approximately 1 g.
+    pub acceleration_peak_mg: u32,
+    /// Largest absolute excursion of any axis from that axis' window mean.
+    /// This is a gravity/orientation-independent peak vibration indicator.
+    pub dynamic_peak_mg: u32,
 }
 
 pub struct WindowStats {
@@ -63,6 +69,7 @@ pub struct WindowStats {
     sum_sq: [u64; 3],
     min: [i32; 3],
     max: [i32; 3],
+    max_magnitude_sq: u64,
 }
 
 impl WindowStats {
@@ -74,6 +81,7 @@ impl WindowStats {
             sum_sq: [0; 3],
             min: [i32::MAX; 3],
             max: [i32::MIN; 3],
+            max_magnitude_sq: 0,
         }
     }
 
@@ -81,13 +89,17 @@ impl WindowStats {
         let vals = [sample.x_mg, sample.y_mg, sample.z_mg];
         self.samples += 1;
 
+        let mut magnitude_sq = 0_u64;
         for (idx, value) in vals.into_iter().enumerate() {
             self.sum[idx] += i64::from(value);
             let value64 = i64::from(value);
-            self.sum_sq[idx] += (value64 * value64) as u64;
+            let square = (value64 * value64) as u64;
+            self.sum_sq[idx] += square;
+            magnitude_sq = magnitude_sq.saturating_add(square);
             self.min[idx] = self.min[idx].min(value);
             self.max[idx] = self.max[idx].max(value);
         }
+        self.max_magnitude_sq = self.max_magnitude_sq.max(magnitude_sq);
     }
 
     #[must_use]
@@ -120,9 +132,18 @@ impl WindowStats {
         let vibration_rms = isqrt(variance[0] + variance[1] + variance[2]);
 
         let mut peak_to_peak = 0_u32;
+        let mut dynamic_peak = 0_u32;
         for idx in 0..3 {
             let span = i64::from(self.max[idx]) - i64::from(self.min[idx]);
             peak_to_peak = peak_to_peak.max(span.unsigned_abs().min(u64::from(u32::MAX)) as u32);
+
+            let low_excursion = (i64::from(mean[idx]) - i64::from(self.min[idx])).unsigned_abs();
+            let high_excursion = (i64::from(self.max[idx]) - i64::from(mean[idx])).unsigned_abs();
+            dynamic_peak = dynamic_peak.max(
+                low_excursion
+                    .max(high_excursion)
+                    .min(u64::from(u32::MAX)) as u32,
+            );
         }
 
         Some(Metrics {
@@ -135,6 +156,8 @@ impl WindowStats {
             z_stddev_mg: z_stddev,
             vibration_rms_mg: vibration_rms,
             peak_to_peak_mg: peak_to_peak,
+            acceleration_peak_mg: isqrt(self.max_magnitude_sq),
+            dynamic_peak_mg: dynamic_peak,
         })
     }
 }
