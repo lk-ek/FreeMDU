@@ -16,7 +16,7 @@ use core::{
 };
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
-use embassy_net::{DhcpConfig, Runner, Stack, StackResources};
+use embassy_net::{DhcpConfig, Runner, Stack, StackResources, tcp::TcpSocket};
 use embassy_time::{Duration, Ticker, WithTimeout};
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -25,6 +25,8 @@ use esp_hal::{
     rng::Rng, timer::timg::TimerGroup,
 };
 use esp_println::logger;
+use esp_hal_ota::Ota;
+use esp_storage::FlashStorage;
 use esp_radio::wifi::{
     self, ControllerConfig, CountryInfo, Interface, OperatingClass, WifiController,
     sta::StationConfig,
@@ -57,6 +59,11 @@ const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
 const ACCEL_SAMPLE_HZ: u32 = freemdu_home::num_from_env!("ACCEL_SAMPLE_HZ", u32);
 const ACCEL_PUBLISH_INTERVAL: u32 = freemdu_home::num_from_env!("ACCEL_PUBLISH_INTERVAL", u32);
 const ACCEL_RETRY_DELAY: Duration = Duration::from_secs(1);
+
+const OTA_PORT: u16 = freemdu_home::num_from_env!("OTA_PORT", u16);
+const OTA_TOKEN: &str = env!("OTA_TOKEN");
+const OTA_MAX_IMAGE_SIZE: usize = 0x1f0000;
+const OTA_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
@@ -463,6 +470,139 @@ async fn connect_to_device<'a, 'b>(
 }
 
 #[embassy_executor::task]
+async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) -> ! {
+    if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
+        error!("OTA disabled: set a non-default OTA_TOKEN in .cargo/config.toml");
+        core::future::pending::<()>().await;
+        unreachable!();
+    }
+
+    let mut ota = match Ota::new(flash) {
+        Ok(ota) => ota,
+        Err(err) => {
+            error!("Failed to initialize OTA support: {err:?}");
+            core::future::pending::<()>().await;
+            unreachable!();
+        }
+    };
+
+    let mut rx_buffer = [0_u8; 4096];
+    let mut tx_buffer = [0_u8; 256];
+
+    loop {
+        stack.wait_config_up().await;
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(OTA_SOCKET_TIMEOUT));
+
+        if let Err(err) = socket.accept(OTA_PORT).await {
+            warn!("OTA accept failed: {err:?}");
+            continue;
+        }
+        info!("OTA client connected from {:?}", socket.remote_endpoint());
+
+        let mut header = [0_u8; 256];
+        let mut header_len = 0_usize;
+        while header_len < header.len() {
+            match socket.read(&mut header[header_len..header_len + 1]).await {
+                Ok(0) => break,
+                Ok(1) => {
+                    header_len += 1;
+                    if header[header_len - 1] == b'\n' { break; }
+                }
+                Ok(_) => unreachable!(),
+                Err(err) => {
+                    warn!("OTA header read failed: {err:?}");
+                    break;
+                }
+            }
+        }
+
+        if header_len == 0 || header[header_len - 1] != b'\n' {
+            let _ = socket.write(b"ERR malformed header\n").await;
+            socket.close();
+            continue;
+        }
+        let Ok(line) = core::str::from_utf8(&header[..header_len - 1]) else {
+            let _ = socket.write(b"ERR header encoding\n").await;
+            socket.close();
+            continue;
+        };
+        let mut fields = line.split_ascii_whitespace();
+        let magic = fields.next();
+        let image_size = fields.next().and_then(|v| v.parse::<usize>().ok());
+        let target_crc = fields.next().and_then(|v| u32::from_str_radix(v, 16).ok());
+        let token = fields.next();
+        if magic != Some("FMDU1") || image_size.is_none() || target_crc.is_none()
+            || token != Some(OTA_TOKEN) || fields.next().is_some()
+        {
+            warn!("Rejected invalid OTA request");
+            let _ = socket.write(b"ERR invalid request or token\n").await;
+            socket.close();
+            continue;
+        }
+        let image_size = image_size.unwrap();
+        let target_crc = target_crc.unwrap();
+        if image_size == 0 || image_size > OTA_MAX_IMAGE_SIZE {
+            let _ = socket.write(b"ERR invalid image size\n").await;
+            socket.close();
+            continue;
+        }
+
+        info!("Starting OTA update: {image_size} bytes, CRC32 {target_crc:08x}");
+        ota.ota_begin(image_size as u32, target_crc);
+        if socket.write(b"READY\n").await.is_err() {
+            socket.abort();
+            continue;
+        }
+
+        let mut remaining = image_size;
+        let mut chunk = [0_u8; 4096];
+        let mut complete = false;
+        let mut failed = false;
+        let mut last_percent = 0_u32;
+        while remaining > 0 {
+            let wanted = remaining.min(chunk.len());
+            let n = match socket.read(&mut chunk[..wanted]).await {
+                Ok(0) => { failed = true; break; }
+                Ok(n) => n,
+                Err(err) => { warn!("OTA payload read failed: {err:?}"); failed = true; break; }
+            };
+            match ota.ota_write_chunk(&chunk[..n]) {
+                Ok(done) => complete = done,
+                Err(err) => { error!("OTA flash write failed: {err:?}"); failed = true; break; }
+            }
+            remaining -= n;
+            let percent = ((image_size - remaining) as u64 * 100 / image_size as u64) as u32;
+            if percent >= last_percent + 10 || percent == 100 {
+                info!("OTA progress: {percent}%");
+                last_percent = percent;
+            }
+        }
+
+        if failed || remaining != 0 || !complete {
+            let _ = socket.write(b"ERR upload incomplete\n").await;
+            socket.close();
+            continue;
+        }
+
+        match ota.ota_flush(true, false) {
+            Ok(()) => {
+                info!("OTA image verified; rebooting");
+                let _ = socket.write(b"OK verified; rebooting\n").await;
+                let _ = socket.flush().await;
+                embassy_time::Timer::after(Duration::from_millis(500)).await;
+                esp_hal::reset::software_reset();
+            }
+            Err(err) => {
+                error!("OTA verification failed: {err:?}");
+                let _ = socket.write(b"ERR CRC/flash verification failed\n").await;
+                socket.close();
+            }
+        }
+    }
+}
+
+#[embassy_executor::task]
 async fn network_stack_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
     runner.run().await;
 }
@@ -492,7 +632,7 @@ fn init_network(
     Stack<'static>,
     Runner<'static, Interface<'static>>,
 )> {
-    static RESOURCES: StaticCell<StackResources<3>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
 
     let (controller, intfs) = wifi::new(
         wifi,
@@ -549,6 +689,7 @@ async fn main(spawner: Spawner) {
     let port = freemdu_home::new_optical_port(peripherals.UART1).unwrap();
     let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
     let accelerometer = Lis2dh::new(accel_i2c);
+    let flash = FlashStorage::new(peripherals.FLASH);
     let accel_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
         init_network(peripherals.WIFI, &hostname).unwrap();
@@ -563,5 +704,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led).unwrap());
     spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
+    spawner.spawn(ota_server_task(net_stack, flash).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());
 }

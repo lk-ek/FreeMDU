@@ -23,6 +23,8 @@ esp-backtrace = { version = "0.19.0", features = [
 ] }
 esp-bootloader-esp-idf = { version = "0.5.0", features = ["log-04"] }
 esp-hal = { version = "1.1.0", features = ["log-04", "unstable"] }
+esp-hal-ota = { version = "0.6.0", features = ["log"] }
+esp-storage = "0.9.0"
 esp-println = { version = "0.17.0", features = ["log-04"] }
 esp-rtos = { version = "0.3.0", features = [
   "embassy",
@@ -44,6 +46,8 @@ esp32c3 = [
   "esp-backtrace/esp32c3",
   "esp-bootloader-esp-idf/esp32c3",
   "esp-hal/esp32c3",
+  "esp-hal-ota/esp32c3",
+  "esp-storage/esp32c3",
   "esp-println/esp32c3",
   "esp-radio/esp32c3",
   "esp-rtos/esp32c3",
@@ -52,6 +56,8 @@ esp32c6 = [
   "esp-backtrace/esp32c6",
   "esp-bootloader-esp-idf/esp32c6",
   "esp-hal/esp32c6",
+  "esp-hal-ota/esp32c6",
+  "esp-storage/esp32c6",
   "esp-println/esp32c6",
   "esp-radio/esp32c6",
   "esp-rtos/esp32c6",
