@@ -14,23 +14,27 @@ use core::{
     fmt::Write,
     sync::atomic::{AtomicBool, Ordering},
 };
+
+use freemdu::embedded_io_async::Write as AsyncWrite;
+
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources, tcp::TcpSocket};
 use embassy_time::{Duration, Ticker, WithTimeout};
 use esp_alloc as _;
 use esp_backtrace as _;
+use esp_hal::system::software_reset;
 use esp_hal::{
     efuse, gpio::Output, interrupt::software::SoftwareInterruptControl, peripherals::WIFI,
     rng::Rng, timer::timg::TimerGroup,
 };
-use esp_println::logger;
 use esp_hal_ota::Ota;
-use esp_storage::FlashStorage;
+use esp_println::logger;
 use esp_radio::wifi::{
     self, ControllerConfig, CountryInfo, Interface, OperatingClass, WifiController,
     sta::StationConfig,
 };
+use esp_storage::FlashStorage;
 use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Value};
 use freemdu_home::{
     OpticalPort,
@@ -94,9 +98,20 @@ async fn mqtt_message_task(
 ) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
     let mut connected = false;
+    let mut ir_debug_buf = [0_u8; 8];
 
     loop {
-        match select::select(receiver.receive(), ticker.next()).await {
+        // Keep an optical UART read pending whenever the port is not being used
+        // for an actual Miele transaction. This makes arbitrary IR activity
+        // visible in the log. A normal 38 kHz remote is not expected to decode
+        // as valid 2400-8E1 data, so UART framing/parity errors are useful here:
+        // they still prove that the phototransistor is electrically reacting.
+        match select::select(
+            receiver.receive(),
+            select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+        )
+        .await
+        {
             Either::First(MqttMessage::Connected) => {
                 connected = true;
                 MQTT_CONNECTED.store(true, Ordering::Relaxed);
@@ -114,7 +129,7 @@ async fn mqtt_message_task(
                     error!("Failed to trigger action: {err:#}");
                 }
             }
-            Either::Second(()) if connected => {
+            Either::Second(Either::First(())) if connected => {
                 let state = match publish_device(&mut port, &hostname).await {
                     Ok(()) => AvailabilityState::Online,
                     Err(err) => {
@@ -127,6 +142,14 @@ async fn mqtt_message_task(
                 if let Err(err) = STATUS_TOPIC.with_bytes(&state).publish().await {
                     error!("Failed to publish status: {err:?}");
                 }
+            }
+            Either::Second(Either::Second(Ok(len))) => {
+                if len != 0 {
+                    debug!("OPT AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
+                }
+            }
+            Either::Second(Either::Second(Err(err))) => {
+                debug!("OPT AMBIENT UART activity/error: {err:?}");
             }
             _ => {}
         }
@@ -227,8 +250,7 @@ async fn publish_accelerometer_discovery(hostname: &str) -> Result<()> {
 
     // Human-readable values in g. The original mg statistics remain available
     // for lossless long-term analysis.
-    publish_accelerometer_sensor(hostname, "acceleration_peak_g", "Peak acceleration", "g")
-        .await?;
+    publish_accelerometer_sensor(hostname, "acceleration_peak_g", "Peak acceleration", "g").await?;
     publish_accelerometer_sensor(hostname, "dynamic_peak_g", "Dynamic peak", "g").await?;
     publish_accelerometer_sensor(hostname, "vibration_rms_g", "Vibration RMS", "g").await?;
     publish_accelerometer_sensor(hostname, "peak_to_peak_g", "Peak-to-peak", "g").await?;
@@ -507,7 +529,9 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
                 Ok(0) => break,
                 Ok(1) => {
                     header_len += 1;
-                    if header[header_len - 1] == b'\n' { break; }
+                    if header[header_len - 1] == b'\n' {
+                        break;
+                    }
                 }
                 Ok(_) => unreachable!(),
                 Err(err) => {
@@ -532,8 +556,11 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
         let image_size = fields.next().and_then(|v| v.parse::<usize>().ok());
         let target_crc = fields.next().and_then(|v| u32::from_str_radix(v, 16).ok());
         let token = fields.next();
-        if magic != Some("FMDU1") || image_size.is_none() || target_crc.is_none()
-            || token != Some(OTA_TOKEN) || fields.next().is_some()
+        if magic != Some("FMDU1")
+            || image_size.is_none()
+            || target_crc.is_none()
+            || token != Some(OTA_TOKEN)
+            || fields.next().is_some()
         {
             warn!("Rejected invalid OTA request");
             let _ = socket.write(b"ERR invalid request or token\n").await;
@@ -549,8 +576,16 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
         }
 
         info!("Starting OTA update: {image_size} bytes, CRC32 {target_crc:08x}");
-        ota.ota_begin(image_size as u32, target_crc);
-        if socket.write(b"READY\n").await.is_err() {
+
+        if let Err(err) = ota.ota_begin(image_size as u32, target_crc) {
+            error!("Failed to start OTA update: {err:?}");
+
+            let _ = socket.write_all(b"ERR ota_begin\n").await;
+            socket.close();
+            continue;
+        }
+
+        if socket.write_all(b"READY\n").await.is_err() {
             socket.abort();
             continue;
         }
@@ -563,13 +598,24 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
         while remaining > 0 {
             let wanted = remaining.min(chunk.len());
             let n = match socket.read(&mut chunk[..wanted]).await {
-                Ok(0) => { failed = true; break; }
+                Ok(0) => {
+                    failed = true;
+                    break;
+                }
                 Ok(n) => n,
-                Err(err) => { warn!("OTA payload read failed: {err:?}"); failed = true; break; }
+                Err(err) => {
+                    warn!("OTA payload read failed: {err:?}");
+                    failed = true;
+                    break;
+                }
             };
             match ota.ota_write_chunk(&chunk[..n]) {
                 Ok(done) => complete = done,
-                Err(err) => { error!("OTA flash write failed: {err:?}"); failed = true; break; }
+                Err(err) => {
+                    error!("OTA flash write failed: {err:?}");
+                    failed = true;
+                    break;
+                }
             }
             remaining -= n;
             let percent = ((image_size - remaining) as u64 * 100 / image_size as u64) as u32;
@@ -591,7 +637,7 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
                 let _ = socket.write(b"OK verified; rebooting\n").await;
                 let _ = socket.flush().await;
                 embassy_time::Timer::after(Duration::from_millis(500)).await;
-                esp_hal::reset::software_reset();
+                software_reset();
             }
             Err(err) => {
                 error!("OTA verification failed: {err:?}");

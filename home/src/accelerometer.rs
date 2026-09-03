@@ -139,11 +139,8 @@ impl WindowStats {
 
             let low_excursion = (i64::from(mean[idx]) - i64::from(self.min[idx])).unsigned_abs();
             let high_excursion = (i64::from(self.max[idx]) - i64::from(mean[idx])).unsigned_abs();
-            dynamic_peak = dynamic_peak.max(
-                low_excursion
-                    .max(high_excursion)
-                    .min(u64::from(u32::MAX)) as u32,
-            );
+            dynamic_peak =
+                dynamic_peak.max(low_excursion.max(high_excursion).min(u64::from(u32::MAX)) as u32);
         }
 
         Some(Metrics {

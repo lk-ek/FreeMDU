@@ -1,0 +1,7 @@
+[idf]
+partition_table = "partitions.bin"
+
+[flash]
+size = "4MB"
+mode = "dio"
+frequency = "40MHz"
