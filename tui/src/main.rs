@@ -1,16 +1,19 @@
 mod bar;
 mod popup;
+mod raw_session;
 mod session;
 mod table;
+mod transport;
 mod worker;
 
+use crate::transport::Port;
 use crate::{
+    raw_session::RawSession,
     session::Session,
     worker::{Response, Worker},
 };
 use anyhow::{Context, Result};
 use clap::Parser;
-use freemdu::serial::{self, Port};
 use futures::{StreamExt, future::FutureExt};
 use ratatui::{
     DefaultTerminal,
@@ -25,13 +28,20 @@ use ratatui::{
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Args {
-    /// Serial port path (e.g. /dev/ttyACM0)
-    serial_port: String,
+    /// Serial port path or authenticated Wi-Fi bridge endpoint
+    ///
+    /// Examples: /dev/ttyACM0 or tcp://10.0.42.155:3235
+    endpoint: String,
+
+    /// Wi-Fi bridge token. If omitted, FREEMDU_BRIDGE_TOKEN is used.
+    #[arg(long)]
+    token: Option<String>,
 }
 
 #[derive(Default, Debug)]
 struct App {
     session: Option<Session>,
+    raw_session: Option<RawSession>,
     should_exit: bool,
 }
 
@@ -66,6 +76,11 @@ impl App {
     }
 
     fn handle_event(&mut self, event: &Event) -> Result<()> {
+        if let Some(raw) = &mut self.raw_session
+            && raw.handle_event(event)?
+        {
+            return Ok(());
+        }
         if let Some(sess) = &mut self.session
             && sess.handle_event(event)?
         {
@@ -97,11 +112,21 @@ impl App {
                 actions,
                 tx,
             } => {
+                self.raw_session = None;
                 self.session = Some(Session::create(software_id, kind, actions, tx)?);
             }
-            Response::DeviceDisconnected => self.session = None,
+            Response::UnknownDeviceConnected { software_id, tx } => {
+                self.session = None;
+                self.raw_session = Some(RawSession::create(software_id, tx));
+            }
+            Response::DeviceDisconnected => {
+                self.session = None;
+                self.raw_session = None;
+            }
             _ => {
-                if let Some(sess) = &mut self.session {
+                if let Some(raw) = &mut self.raw_session {
+                    raw.handle_worker_response(resp);
+                } else if let Some(sess) = &mut self.session {
                     sess.handle_worker_response(resp)?;
                 }
             }
@@ -132,7 +157,9 @@ impl StatefulWidget for &App {
             );
         let inner = block.inner(area);
 
-        if let Some(sess) = &self.session {
+        if let Some(raw) = &self.raw_session {
+            raw.render(inner, buf, state);
+        } else if let Some(sess) = &self.session {
             // Session might set cursor position state
             sess.render(inner, buf, state);
         } else {
@@ -155,7 +182,9 @@ async fn main() -> Result<()> {
     env_logger::init();
 
     let args = Args::parse();
-    let port = serial::open(&args.serial_port).context("Failed to open serial port")?;
+    let port = transport::open(&args.endpoint, args.token.as_deref())
+        .await
+        .context("Failed to open communication transport")?;
     let mut term = ratatui::init();
     let res = App::default().run(port, &mut term).await;
 

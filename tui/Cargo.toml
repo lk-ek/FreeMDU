@@ -17,7 +17,7 @@ freemdu = { path = "../protocol", features = ["native-serial"] }
 futures = "0.3.32"
 log = "0.4.29"
 ratatui = { version = "0.30.0", features = ["unstable-rendered-line-info"] }
-tokio = { version = "1.52.0", features = ["rt", "sync", "time", "macros"] }
+tokio = { version = "1.52.0", features = ["rt", "sync", "time", "macros", "net", "io-util"] }
 tui-input = { version = "0.14.0", default-features = false, features = ["crossterm"] }
 
 [lints.clippy]

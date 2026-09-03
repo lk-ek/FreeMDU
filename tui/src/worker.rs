@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
-use freemdu::{
-    device::{self, Action, DeviceKind, Error, Property, PropertyKind, Value},
-    serial::Port,
-};
+use freemdu::Interface;
+use freemdu::device::{self, Action, DeviceKind, Error, Property, PropertyKind, Value};
+
+use crate::transport::Port;
 use log::debug;
 use tokio::{
     sync::mpsc::{self, UnboundedReceiver, UnboundedSender},
@@ -22,6 +22,10 @@ type Device<'a> = Box<dyn device::Device<&'a mut Port> + 'a>;
 pub enum Request {
     QueryProperties(PropertyKind),
     TriggerAction(&'static Action, Option<String>),
+    RawQuerySoftwareId,
+    RawUnlockRead { key: u16 },
+    RawReadMemory16 { key: u16, address: u32 },
+    RawReadEeprom16 { key: u16, address: u16 },
 }
 
 #[derive(Debug)]
@@ -32,10 +36,19 @@ pub enum Response {
         actions: &'static [Action],
         tx: UnboundedSender<Request>,
     },
+    UnknownDeviceConnected {
+        software_id: u16,
+        tx: UnboundedSender<Request>,
+    },
     DeviceDisconnected,
     PropertiesQueried(PropertyKind, Vec<(&'static Property, Value)>),
     InvalidActionArgument(&'static Action),
     InvalidActionState(&'static Action),
+    RawStatus(String),
+    RawData {
+        label: &'static str,
+        data: Vec<u8>,
+    },
 }
 
 pub struct Worker<'a> {
@@ -46,26 +59,44 @@ pub struct Worker<'a> {
 impl Worker<'_> {
     pub fn start(mut port: Port) -> UnboundedReceiver<Response> {
         let (tx, rx) = mpsc::unbounded_channel();
-
         task::spawn_local(async move {
             loop {
-                // Automatically reconnect in case of failure
-                match time::timeout(DEVICE_TIMEOUT, device::connect(&mut port)).await {
-                    Ok(Ok(dev)) => {
-                        let mut worker = Worker { dev, tx: &tx };
-
-                        if let Err(err) = worker.run().await {
-                            debug!("Error running device worker: {err:#}");
+                // device::connect() may return a Device that borrows `port`.
+                // Keep that result inside this scope so the borrow is fully
+                // dropped before the unknown-device fallback borrows `port`.
+                let use_raw_mode = {
+                    match time::timeout(DEVICE_TIMEOUT, device::connect(&mut port)).await {
+                        Ok(Ok(dev)) => {
+                            let mut worker = Worker { dev, tx: &tx };
+                            if let Err(err) = worker.run().await {
+                                debug!("Error running device worker: {err:#}");
+                            }
+                            false
+                        }
+                        Ok(Err(err)) if err.to_string().contains("unknown software ID") => {
+                            debug!("Unsupported device detected: {err:#}");
+                            true
+                        }
+                        Ok(Err(err)) => {
+                            debug!("Error connecting to device: {err:#}");
+                            false
+                        }
+                        Err(_) => {
+                            debug!("Device connection timed out");
+                            false
                         }
                     }
-                    Ok(Err(err)) => debug!("Error connecting to device: {err:#}"),
-                    Err(_) => debug!("Device connection timed out"),
+                };
+
+                if use_raw_mode && let Err(raw_err) = Self::run_unknown_device(&mut port, &tx).await
+                {
+                    debug!("Error running unknown-device worker: {raw_err:#}");
                 }
 
+                let _ = tx.send(Response::DeviceDisconnected);
                 time::sleep(DEVICE_CONNECT_INTERVAL).await;
             }
         });
-
         rx
     }
 
@@ -90,6 +121,10 @@ impl Worker<'_> {
                     .trigger_action(action, param.as_deref())
                     .await
                     .context("Failed to trigger action"),
+                Request::RawQuerySoftwareId
+                | Request::RawUnlockRead { .. }
+                | Request::RawReadMemory16 { .. }
+                | Request::RawReadEeprom16 { .. } => Ok(()),
             };
 
             if res.is_err() {
@@ -99,6 +134,89 @@ impl Worker<'_> {
             }
         }
 
+        Ok(())
+    }
+
+    async fn run_unknown_device(port: &mut Port, tx: &UnboundedSender<Response>) -> Result<()> {
+        let mut intf = Interface::new(port);
+        let software_id = time::timeout(DEVICE_TIMEOUT, intf.query_software_id())
+            .await
+            .context("Raw software-ID query timed out")??;
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        tx.send(Response::UnknownDeviceConnected {
+            software_id,
+            tx: req_tx,
+        })?;
+
+        while let Some(request) = req_rx.recv().await {
+            match request {
+                Request::RawQuerySoftwareId => {
+                    match time::timeout(DEVICE_TIMEOUT, intf.query_software_id()).await {
+                        Ok(Ok(id)) => tx.send(Response::RawStatus(format!(
+                            "Software ID: {id} / 0x{id:04x}"
+                        )))?,
+                        Ok(Err(err)) => tx.send(Response::RawStatus(format!(
+                            "Software-ID query failed: {err}"
+                        )))?,
+                        Err(_) => {
+                            tx.send(Response::RawStatus("Software-ID query timed out".into()))?
+                        }
+                    }
+                }
+                Request::RawUnlockRead { key } => {
+                    let result = async {
+                        intf.query_software_id().await?;
+                        intf.unlock_read_access(key).await
+                    };
+                    match time::timeout(DEVICE_TIMEOUT, result).await {
+                        Ok(Ok(())) => tx.send(Response::RawStatus(format!(
+                            "Read access unlocked with key 0x{key:04x}"
+                        )))?,
+                        Ok(Err(err)) => {
+                            tx.send(Response::RawStatus(format!("Read unlock failed: {err}")))?
+                        }
+                        Err(_) => tx.send(Response::RawStatus("Read unlock timed out".into()))?,
+                    }
+                }
+                Request::RawReadMemory16 { key, address } => {
+                    let result = async {
+                        intf.query_software_id().await?;
+                        intf.unlock_read_access(key).await?;
+                        let data: [u8; 16] = intf.read_memory(address).await?;
+                        Ok::<_, freemdu::Error<std::io::Error>>(data)
+                    };
+                    match time::timeout(DEVICE_TIMEOUT, result).await {
+                        Ok(Ok(data)) => tx.send(Response::RawData {
+                            label: "Memory @ 0x0000",
+                            data: data.to_vec(),
+                        })?,
+                        Ok(Err(err)) => {
+                            tx.send(Response::RawStatus(format!("Memory read failed: {err}")))?
+                        }
+                        Err(_) => tx.send(Response::RawStatus("Memory read timed out".into()))?,
+                    }
+                }
+                Request::RawReadEeprom16 { key, address } => {
+                    let result = async {
+                        intf.query_software_id().await?;
+                        intf.unlock_read_access(key).await?;
+                        let data: [u8; 16] = intf.read_eeprom(address).await?;
+                        Ok::<_, freemdu::Error<std::io::Error>>(data)
+                    };
+                    match time::timeout(DEVICE_TIMEOUT, result).await {
+                        Ok(Ok(data)) => tx.send(Response::RawData {
+                            label: "EEPROM @ word 0x0000",
+                            data: data.to_vec(),
+                        })?,
+                        Ok(Err(err)) => {
+                            tx.send(Response::RawStatus(format!("EEPROM read failed: {err}")))?
+                        }
+                        Err(_) => tx.send(Response::RawStatus("EEPROM read timed out".into()))?,
+                    }
+                }
+                Request::QueryProperties(_) | Request::TriggerAction(_, _) => {}
+            }
+        }
         Ok(())
     }
 

@@ -56,3 +56,4 @@ def load_config_value(name: str) -> str:
         raise RuntimeError(
             f"{name} is not defined in {DEFAULT_CONFIG} or {LOCAL_CONFIG}"
         ) from None
+
