@@ -743,6 +743,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "esp-hal-ota"
+version = "0.6.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9b1d1fc0161045a73fee9e0d787c80feb6c3941c351e8f542b0d0c80d57c6e7a"
+dependencies = [
+ "embedded-storage",
+ "esp-rom-sys",
+ "esp32c3",
+ "esp32c6",
+ "log",
+]
+
+[[package]]
 name = "esp-hal-procmacros"
 version = "0.22.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -898,6 +911,21 @@ dependencies = [
  "portable-atomic",
  "riscv",
  "xtensa-lx",
+]
+
+[[package]]
+name = "esp-storage"
+version = "0.9.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4cf2b3f00c9f94b27c62a4f5296b19470c3a083c687c8146e554a459f9bee596"
+dependencies = [
+ "document-features",
+ "embedded-storage",
+ "esp-hal",
+ "esp-hal-procmacros",
+ "esp-metadata-generated",
+ "esp-rom-sys",
+ "esp-sync",
 ]
 
 [[package]]
@@ -1081,9 +1109,11 @@ dependencies = [
  "esp-backtrace",
  "esp-bootloader-esp-idf",
  "esp-hal",
+ "esp-hal-ota",
  "esp-println",
  "esp-radio",
  "esp-rtos",
+ "esp-storage",
  "freemdu",
  "log",
  "mcutie",
@@ -1332,9 +1362,9 @@ dependencies = [
 
 [[package]]
 name = "log"
-version = "0.4.29"
+version = "0.4.34"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
+checksum = "f9f8bd3e56ce4dfc153cf470fffbfa98c7620958b312ca5c3a4b8d5181fd13c6"
 
 [[package]]
 name = "loom"

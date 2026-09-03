@@ -20,6 +20,7 @@ use core::{
 use freemdu::embedded_io_async::Write as AsyncWrite;
 
 use embassy_executor::Spawner;
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_futures::select::{self, Either};
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources, tcp::TcpSocket};
 use embassy_time::{Duration, Ticker, WithTimeout};
@@ -37,6 +38,7 @@ use esp_radio::wifi::{
 };
 use esp_storage::FlashStorage;
 use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Value};
+use freemdu::Interface as MieleInterface;
 use freemdu_home::{
     OpticalPort,
     accelerometer::{Lis2dh, Metrics, WindowStats},
@@ -73,8 +75,53 @@ const OTA_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 const LOG_PORT: u16 = freemdu_home::num_from_env!("LOG_PORT", u16);
 const LOG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+const DIAG_PORT: u16 = freemdu_home::num_from_env!("DIAG_PORT", u16);
+const DIAG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
+
+
+#[derive(Clone, Copy, Debug)]
+enum DiagnosticCommand {
+    QueryId,
+    FindReadKey { start: u16, end: u16 },
+}
+
+const DIAG_RESPONSE_CAPACITY: usize = 192;
+
+#[derive(Clone, Copy)]
+struct DiagnosticResponse {
+    bytes: [u8; DIAG_RESPONSE_CAPACITY],
+    len: usize,
+}
+
+impl DiagnosticResponse {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; DIAG_RESPONSE_CAPACITY],
+            len: 0,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl core::fmt::Write for DiagnosticResponse {
+    fn write_str(&mut self, value: &str) -> core::fmt::Result {
+        let remaining = self.bytes.len().saturating_sub(self.len);
+        let bytes = value.as_bytes();
+        let count = remaining.min(bytes.len());
+        self.bytes[self.len..self.len + count].copy_from_slice(&bytes[..count]);
+        self.len += count;
+        Ok(())
+    }
+}
+
+static DIAG_COMMANDS: Channel<CriticalSectionRawMutex, DiagnosticCommand, 1> = Channel::new();
+static DIAG_RESPONSES: Channel<CriticalSectionRawMutex, DiagnosticResponse, 1> = Channel::new();
 
 static MQTT_CONNECTED: AtomicBool = AtomicBool::new(false);
 
@@ -111,21 +158,28 @@ async fn mqtt_message_task(
         // as valid 2400-8E1 data, so UART framing/parity errors are useful here:
         // they still prove that the phototransistor is electrically reacting.
         match select::select(
-            receiver.receive(),
-            select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+            DIAG_COMMANDS.receive(),
+            select::select(
+                receiver.receive(),
+                select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+            ),
         )
         .await
         {
-            Either::First(MqttMessage::Connected) => {
+            Either::First(command) => {
+                let response = execute_diagnostic_command(&mut port, command).await;
+                DIAG_RESPONSES.send(response).await;
+            }
+            Either::Second(Either::First(MqttMessage::Connected)) => {
                 connected = true;
                 MQTT_CONNECTED.store(true, Ordering::Relaxed);
                 ticker.reset();
             }
-            Either::First(MqttMessage::Disconnected) => {
+            Either::Second(Either::First(MqttMessage::Disconnected)) => {
                 connected = false;
                 MQTT_CONNECTED.store(false, Ordering::Relaxed);
             }
-            Either::First(MqttMessage::Publish(Topic::Device(topic), payload)) => {
+            Either::Second(Either::First(MqttMessage::Publish(Topic::Device(topic), payload))) => {
                 if let Ok(param) = str::from_utf8(&payload)
                     && let Some((id, "trigger")) = topic.split_once('/')
                     && let Err(err) = trigger_action(&mut port, id, param).await
@@ -133,7 +187,7 @@ async fn mqtt_message_task(
                     error!("Failed to trigger action: {err:#}");
                 }
             }
-            Either::Second(Either::First(())) if connected => {
+            Either::Second(Either::Second(Either::First(()))) if connected => {
                 let state = match publish_device(&mut port, &hostname).await {
                     Ok(()) => AvailabilityState::Online,
                     Err(err) => {
@@ -147,12 +201,12 @@ async fn mqtt_message_task(
                     error!("Failed to publish status: {err:?}");
                 }
             }
-            Either::Second(Either::Second(Ok(len))) => {
+            Either::Second(Either::Second(Either::Second(Ok(len)))) => {
                 if len != 0 {
                     debug!("OPT AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
                 }
             }
-            Either::Second(Either::Second(Err(err))) => {
+            Either::Second(Either::Second(Either::Second(Err(err)))) => {
                 debug!("OPT AMBIENT UART activity/error: {err:?}");
             }
             _ => {}
@@ -160,6 +214,77 @@ async fn mqtt_message_task(
 
         led.set_level((!connected).into());
     }
+}
+
+
+async fn execute_diagnostic_command(
+    port: &mut OpticalPort<'_>,
+    command: DiagnosticCommand,
+) -> DiagnosticResponse {
+    let mut response = DiagnosticResponse::new();
+
+    match command {
+        DiagnosticCommand::QueryId => {
+            let mut intf = MieleInterface::new(&mut *port);
+            match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(id)) => {
+                    let _ = writeln!(&mut response, "OK software_id={id} hex=0x{id:04x}");
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR query_software_id {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR query_software_id timeout {err:?}");
+                }
+            }
+        }
+        DiagnosticCommand::FindReadKey { start, end } => {
+            info!("DIAG scanning read-access keys 0x{start:04x}..=0x{end:04x}");
+
+            let mut intf = MieleInterface::new(&mut *port);
+            match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(id)) => info!("DIAG connected to software ID {id}"),
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR query_software_id {err:?}");
+                    return response;
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR query_software_id timeout {err:?}");
+                    return response;
+                }
+            }
+
+            let mut found = None;
+
+            for raw_key in u32::from(start)..=u32::from(end) {
+                let key = raw_key as u16;
+
+                if raw_key == u32::from(start) || raw_key % 0x0100 == 0 {
+                    info!("DIAG read-key scan at 0x{key:04x}");
+                }
+
+                match intf.unlock_read_access(key).with_timeout(DEVICE_TIMEOUT).await {
+                    Ok(Ok(())) => {
+                        found = Some(key);
+                        break;
+                    }
+                    Ok(Err(_)) | Err(_) => {}
+                }
+            }
+
+            if let Some(key) = found {
+                info!("DIAG found read-access key 0x{key:04x}");
+                let _ = writeln!(&mut response, "OK read_key=0x{key:04x}");
+            } else {
+                let _ = writeln!(
+                    &mut response,
+                    "NOT_FOUND start=0x{start:04x} end=0x{end:04x}"
+                );
+            }
+        }
+    }
+
+    response
 }
 
 #[embassy_executor::task]
@@ -652,6 +777,110 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
     }
 }
 
+
+#[embassy_executor::task]
+async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
+    if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
+        error!("Diagnostic console disabled: set a non-default OTA_TOKEN");
+        core::future::pending::<()>().await;
+        unreachable!();
+    }
+
+    let mut rx_buffer = [0_u8; 384];
+    let mut tx_buffer = [0_u8; 384];
+
+    loop {
+        stack.wait_config_up().await;
+
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(DIAG_AUTH_TIMEOUT));
+
+        if let Err(err) = socket.accept(DIAG_PORT).await {
+            warn!("Diagnostic console accept failed: {err:?}");
+            continue;
+        }
+
+        let mut line_buf = [0_u8; 192];
+        let mut line_len = 0_usize;
+
+        while line_len < line_buf.len() {
+            match socket.read(&mut line_buf[line_len..line_len + 1]).await {
+                Ok(0) => break,
+                Ok(1) => {
+                    line_len += 1;
+                    if line_buf[line_len - 1] == b'\n' {
+                        break;
+                    }
+                }
+                Ok(_) => unreachable!(),
+                Err(_) => break,
+            }
+        }
+
+        if line_len == 0 || line_buf[line_len - 1] != b'\n' {
+            let _ = tcp_write_all(&mut socket, b"ERR malformed request\n").await;
+            socket.close();
+            continue;
+        }
+
+        let Ok(line) = core::str::from_utf8(&line_buf[..line_len - 1]) else {
+            let _ = tcp_write_all(&mut socket, b"ERR request encoding\n").await;
+            socket.close();
+            continue;
+        };
+
+        let mut fields = line.split_ascii_whitespace();
+
+        if fields.next() != Some("FMDUDIAG1") || fields.next() != Some(OTA_TOKEN) {
+            let _ = tcp_write_all(&mut socket, b"ERR invalid token\n").await;
+            socket.close();
+            continue;
+        }
+
+        let command = match fields.next() {
+            Some("id") if fields.next().is_none() => Some(DiagnosticCommand::QueryId),
+            Some("find-read-key") => {
+                let start = fields.next().and_then(parse_diag_u16);
+                let end = fields.next().and_then(parse_diag_u16);
+
+                if fields.next().is_none() {
+                    start
+                        .zip(end)
+                        .filter(|(start, end)| start <= end)
+                        .map(|(start, end)| DiagnosticCommand::FindReadKey { start, end })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        };
+
+        let Some(command) = command else {
+            let _ =
+                tcp_write_all(&mut socket, b"ERR usage: id | find-read-key START END\n").await;
+            socket.close();
+            continue;
+        };
+
+        info!("DIAG request: {command:?}");
+        DIAG_COMMANDS.send(command).await;
+        let response = DIAG_RESPONSES.receive().await;
+        let _ = tcp_write_all(&mut socket, response.as_bytes()).await;
+        socket.close();
+    }
+}
+
+fn parse_diag_u16(value: &str) -> Option<u16> {
+    if let Some(value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u16::from_str_radix(value, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
 #[embassy_executor::task]
 async fn log_server_task(stack: Stack<'static>) -> ! {
     if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
@@ -785,7 +1014,7 @@ fn init_network(
     Stack<'static>,
     Runner<'static, Interface<'static>>,
 )> {
-    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
 
     let (controller, intfs) = wifi::new(
         wifi,
@@ -859,5 +1088,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());
     spawner.spawn(log_server_task(net_stack).unwrap());
+    spawner.spawn(diagnostic_server_task(net_stack).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());
 }
