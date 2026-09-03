@@ -10,6 +10,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+from local_secrets import load_env_secret
+
 
 TARGET = "riscv32imc-unknown-none-elf"
 BIN = "standalone"
@@ -39,7 +41,7 @@ def main() -> int:
     )
     parser.add_argument("host", help="FreeMDU device IP address or hostname")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--token", required=True, help="OTA_TOKEN configured on the device")
+    parser.add_argument("--token", help="override OTA_TOKEN from .cargo/secrets.toml")
     parser.add_argument(
         "--no-build",
         action="store_true",
@@ -54,8 +56,13 @@ def main() -> int:
     parser.add_argument("--timeout", type=float, default=30.0)
     args = parser.parse_args()
 
-    if not args.token or any(c.isspace() for c in args.token):
-        parser.error("--token must be non-empty and contain no whitespace")
+    try:
+        token = args.token or load_env_secret("OTA_TOKEN")
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
+    if any(c.isspace() for c in token):
+        parser.error("OTA token must not contain whitespace")
 
     elf = Path("target") / TARGET / "release" / BIN
 
@@ -96,7 +103,7 @@ def main() -> int:
     with socket.create_connection((args.host, args.port), timeout=args.timeout) as sock:
         sock.settimeout(args.timeout)
 
-        header = f"FMDU1 {size} {crc:08x} {args.token}\n".encode("ascii")
+        header = f"FMDU1 {size} {crc:08x} {token}\n".encode("ascii")
         sock.sendall(header)
 
         reply = recv_line(sock).decode("utf-8", errors="replace").strip()

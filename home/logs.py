@@ -8,6 +8,8 @@ import socket
 import sys
 import time
 
+from local_secrets import load_env_secret
+
 
 def stream(host: str, port: int, token: str, timeout: float) -> None:
     with socket.create_connection((host, port), timeout=timeout) as sock:
@@ -37,18 +39,20 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Stream FreeMDU live logs over Wi-Fi")
     parser.add_argument("host", help="FreeMDU IP address or hostname")
     parser.add_argument("--port", type=int, default=3233)
-    parser.add_argument("--token", required=True, help="same token as OTA_TOKEN")
+    parser.add_argument("--token", help="override OTA_TOKEN from .cargo/secrets.toml")
     parser.add_argument("--reconnect", action="store_true", help="reconnect after OTA/reboots")
     parser.add_argument("--retry-delay", type=float, default=1.0)
     parser.add_argument("--timeout", type=float, default=10.0)
     args = parser.parse_args()
 
-    if not args.token:
-        parser.error("--token must not be empty")
+    try:
+        token = args.token or load_env_secret("OTA_TOKEN")
+    except RuntimeError as exc:
+        parser.error(str(exc))
 
     while True:
         try:
-            stream(args.host, args.port, args.token, args.timeout)
+            stream(args.host, args.port, token, args.timeout)
         except (OSError, RuntimeError) as exc:
             if not args.reconnect:
                 print(f"error: {exc}", file=sys.stderr)
