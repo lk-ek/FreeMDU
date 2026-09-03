@@ -1,0 +1,21 @@
+# Copy this file to `.cargo/local.toml`.
+# Only values that differ from .cargo/config.toml need to be listed here.
+# This file is ignored by Git and may contain both secrets and device-specific
+# configuration such as alternate GPIO assignments.
+
+[env]
+# Example XIAO ESP32-C3 optical interface overrides:
+PIN_OPTICAL_RX = "3"
+PIN_OPTICAL_TX = "4"
+
+# Add any other local pin/config overrides here as needed.
+# PIN_ACCEL_SDA = "6"
+# PIN_ACCEL_SCL = "7"
+
+WIFI_SSID = ""
+WIFI_PASSWORD = ""
+MQTT_HOSTNAME = ""
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
+
+OTA_TOKEN = ""

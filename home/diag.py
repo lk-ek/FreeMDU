@@ -5,7 +5,7 @@ import argparse
 import socket
 import sys
 
-from local_secrets import load_env_secret
+from local_config import load_config_value
 
 
 def number(value: str) -> str:
@@ -23,7 +23,7 @@ def number(value: str) -> str:
 parser = argparse.ArgumentParser(description="FreeMDU read-only diagnostic client")
 parser.add_argument("host")
 parser.add_argument("--port", type=int, default=3234)
-parser.add_argument("--token", help="override OTA_TOKEN from .cargo/secrets.toml")
+parser.add_argument("--token", help="override OTA_TOKEN from .cargo/local.toml")
 
 sub = parser.add_subparsers(dest="command", required=True)
 sub.add_parser("id")
@@ -35,9 +35,15 @@ scan.add_argument("end", type=number)
 args = parser.parse_args()
 
 try:
-    token = args.token or load_env_secret("OTA_TOKEN")
+    token = args.token or load_config_value("OTA_TOKEN")
 except RuntimeError as exc:
     parser.error(str(exc))
+
+if not token or token == "change-me":
+    parser.error(
+        "OTA_TOKEN is unset/default; define it in .cargo/local.toml "
+        "or pass --token"
+    )
 
 parts = ["FMDUDIAG1", token, args.command]
 if args.command == "find-read-key":

@@ -1,5 +1,3 @@
-include = [{ path = "secrets.toml", optional = true }]
-
 [build]
 # Unset default target
 target = ""
@@ -11,14 +9,20 @@ PIN_LED_STATUS = "10"
 PIN_OPTICAL_RX = "0"
 PIN_OPTICAL_TX = "1"
 
+WIFI_SSID = ""
+WIFI_PASSWORD = ""
+MQTT_HOSTNAME = ""
+MQTT_USERNAME = ""
+MQTT_PASSWORD = ""
 
-# Local OTA server. Replace before flashing OTA-enabled firmware.
+# Local OTA server. Override device-specific values via local.toml.
 OTA_PORT = "3232"
+OTA_TOKEN = "change-me"
 
 # Authenticated live log console (uses OTA_TOKEN).
 LOG_PORT = "3233"
 
-# Authenticated read-only Miele diagnostic console (uses OTA_TOKEN from secrets.toml).
+# Authenticated read-only Miele diagnostic console (uses OTA_TOKEN).
 DIAG_PORT = "3234"
 
 # Interval (in seconds) for publishing device properties and actions

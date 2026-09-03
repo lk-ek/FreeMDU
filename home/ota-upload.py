@@ -10,7 +10,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from local_secrets import load_env_secret
+from local_config import load_config_value
 
 
 TARGET = "riscv32imc-unknown-none-elf"
@@ -41,7 +41,7 @@ def main() -> int:
     )
     parser.add_argument("host", help="FreeMDU device IP address or hostname")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT)
-    parser.add_argument("--token", help="override OTA_TOKEN from .cargo/secrets.toml")
+    parser.add_argument("--token", help="override OTA_TOKEN from .cargo/local.toml")
     parser.add_argument(
         "--no-build",
         action="store_true",
@@ -57,10 +57,15 @@ def main() -> int:
     args = parser.parse_args()
 
     try:
-        token = args.token or load_env_secret("OTA_TOKEN")
+        token = args.token or load_config_value("OTA_TOKEN")
     except RuntimeError as exc:
         parser.error(str(exc))
 
+    if not token or token == "change-me":
+        parser.error(
+            "OTA_TOKEN is unset/default; define it in .cargo/local.toml "
+            "or pass --token"
+        )
     if any(c.isspace() for c in token):
         parser.error("OTA token must not contain whitespace")
 
@@ -68,7 +73,7 @@ def main() -> int:
 
     if not args.no_build:
         run([
-            "cargo", "build",
+            "cargo-local", "build",
             "--features", "esp32c3",
             "--target", TARGET,
             "--release",

@@ -1,0 +1,41 @@
+#!/usr/bin/env python3
+"""Run Cargo with .cargo/local.toml overriding tracked config defaults."""
+
+from __future__ import annotations
+
+import os
+import shutil
+import sys
+
+from local_config import load_local_env
+
+
+def main() -> int:
+    if len(sys.argv) == 1:
+        print("usage: ./cargo-local <cargo arguments...>", file=sys.stderr)
+        return 2
+
+    cargo = shutil.which("cargo")
+    if cargo is None:
+        print("cargo-local: cargo not found in PATH", file=sys.stderr)
+        return 127
+
+    try:
+        local = load_local_env()
+    except RuntimeError as exc:
+        print(f"cargo-local: {exc}", file=sys.stderr)
+        return 2
+
+    env = os.environ.copy()
+
+    # Existing shell variables are intentional one-off overrides and retain
+    # highest priority. local.toml otherwise overrides Cargo's [env] defaults.
+    for name, value in local.items():
+        env.setdefault(name, value)
+
+    os.execvpe(cargo, [cargo, *sys.argv[1:]], env)
+    return 127
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
