@@ -3,6 +3,8 @@
 
 extern crate alloc;
 
+mod netlog;
+
 use alloc::{
     boxed::Box,
     format,
@@ -29,7 +31,6 @@ use esp_hal::{
     rng::Rng, timer::timg::TimerGroup,
 };
 use esp_hal_ota::Ota;
-use esp_println::logger;
 use esp_radio::wifi::{
     self, ControllerConfig, CountryInfo, Interface, OperatingClass, WifiController,
     sta::StationConfig,
@@ -68,6 +69,9 @@ const OTA_PORT: u16 = freemdu_home::num_from_env!("OTA_PORT", u16);
 const OTA_TOKEN: &str = env!("OTA_TOKEN");
 const OTA_MAX_IMAGE_SIZE: usize = 0x1f0000;
 const OTA_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
+
+const LOG_PORT: u16 = freemdu_home::num_from_env!("LOG_PORT", u16);
+const LOG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
@@ -649,6 +653,109 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
 }
 
 #[embassy_executor::task]
+async fn log_server_task(stack: Stack<'static>) -> ! {
+    if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
+        error!("Network log console disabled: set a non-default OTA_TOKEN");
+        core::future::pending::<()>().await;
+        unreachable!();
+    }
+
+    let mut rx_buffer = [0_u8; 512];
+    let mut tx_buffer = [0_u8; 1024];
+
+    loop {
+        stack.wait_config_up().await;
+
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(LOG_AUTH_TIMEOUT));
+
+        if let Err(err) = socket.accept(LOG_PORT).await {
+            warn!("Log console accept failed: {err:?}");
+            continue;
+        }
+
+        let mut header = [0_u8; 192];
+        let mut header_len = 0_usize;
+        let mut malformed = false;
+
+        while header_len < header.len() {
+            match socket.read(&mut header[header_len..]).await {
+                Ok(0) => {
+                    malformed = true;
+                    break;
+                }
+                Ok(len) => {
+                    header_len += len;
+                    if header[..header_len].contains(&b'\n') {
+                        break;
+                    }
+                }
+                Err(_) => {
+                    malformed = true;
+                    break;
+                }
+            }
+        }
+
+        let newline = header[..header_len].iter().position(|byte| *byte == b'\n');
+        let authenticated = newline
+            .and_then(|index| core::str::from_utf8(&header[..index]).ok())
+            .is_some_and(|line| {
+                let mut fields = line.split_ascii_whitespace();
+                fields.next() == Some("FMDULOG1")
+                    && fields.next() == Some(OTA_TOKEN)
+                    && fields.next().is_none()
+            });
+
+        if malformed || !authenticated {
+            let _ = tcp_write_all(&mut socket, b"ERR invalid request or token\n").await;
+            socket.close();
+            continue;
+        }
+
+        if tcp_write_all(&mut socket, b"OK FreeMDU live logs\n")
+            .await
+            .is_err()
+        {
+            socket.abort();
+            continue;
+        }
+
+        // A live log stream may legitimately be quiet for minutes. Keep the
+        // authenticated connection open indefinitely. The host client can
+        // reconnect after Wi-Fi drops, OTA updates or reboots.
+        socket.set_timeout(None);
+        info!(
+            "Network log client connected from {:?}",
+            socket.remote_endpoint()
+        );
+
+        loop {
+            let line = netlog::next_line().await;
+            if tcp_write_all(&mut socket, line.as_bytes()).await.is_err() {
+                socket.abort();
+                break;
+            }
+        }
+    }
+}
+
+async fn tcp_write_all(
+    socket: &mut TcpSocket<'_>,
+    mut data: &[u8],
+) -> Result<(), embassy_net::tcp::Error> {
+    while !data.is_empty() {
+        let written = socket.write(data).await?;
+        if written == 0 {
+            return Err(embassy_net::tcp::Error::ConnectionReset);
+        }
+        data = &data[written..];
+    }
+
+    Ok(())
+}
+
+#[embassy_executor::task]
 async fn network_stack_task(mut runner: Runner<'static, Interface<'static>>) -> ! {
     runner.run().await;
 }
@@ -678,7 +785,7 @@ fn init_network(
     Stack<'static>,
     Runner<'static, Interface<'static>>,
 )> {
-    static RESOURCES: StaticCell<StackResources<4>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<5>> = StaticCell::new();
 
     let (controller, intfs) = wifi::new(
         wifi,
@@ -712,7 +819,7 @@ fn init_network(
 
 #[esp_rtos::main]
 async fn main(spawner: Spawner) {
-    logger::init_logger_from_env();
+    netlog::init();
 
     let peripherals = esp_hal::init(esp_hal::Config::default());
 
@@ -751,5 +858,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());
+    spawner.spawn(log_server_task(net_stack).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());
 }
