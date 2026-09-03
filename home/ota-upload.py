@@ -73,7 +73,7 @@ def main() -> int:
 
     if not args.no_build:
         run([
-            "cargo-local", "build",
+            "./cargo-local", "build",
             "--features", "esp32c3",
             "--target", TARGET,
             "--release",

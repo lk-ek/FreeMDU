@@ -86,9 +86,11 @@ const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
 enum DiagnosticCommand {
     QueryId,
     FindReadKey { start: u16, end: u16 },
+    ReadMemory128 { key: u16, address: u32 },
+    ReadEeprom128 { key: u16, address: u16 },
 }
 
-const DIAG_RESPONSE_CAPACITY: usize = 192;
+const DIAG_RESPONSE_CAPACITY: usize = 384;
 
 #[derive(Clone, Copy)]
 struct DiagnosticResponse {
@@ -282,9 +284,102 @@ async fn execute_diagnostic_command(
                 );
             }
         }
+        DiagnosticCommand::ReadMemory128 { key, address } => {
+            let mut intf = MieleInterface::new(&mut *port);
+
+            if let Err(err) = prepare_read_access(&mut intf, key).await {
+                let _ = writeln!(&mut response, "{err}");
+                return response;
+            }
+
+            match intf
+                .read_memory(address)
+                .with_timeout(DEVICE_TIMEOUT)
+                .await
+            {
+                Ok(Ok(data)) => {
+                    let data: [u8; 0x80] = data;
+                    let _ = write!(
+                        &mut response,
+                        "OK kind=memory address=0x{address:08x} data="
+                    );
+                    for byte in data {
+                        let _ = write!(&mut response, "{byte:02x}");
+                    }
+                    let _ = writeln!(&mut response);
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR read_memory {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR read_memory timeout {err:?}");
+                }
+            }
+        }
+        DiagnosticCommand::ReadEeprom128 { key, address } => {
+            let mut intf = MieleInterface::new(&mut *port);
+
+            if let Err(err) = prepare_read_access(&mut intf, key).await {
+                let _ = writeln!(&mut response, "{err}");
+                return response;
+            }
+
+            match intf
+                .read_eeprom(address)
+                .with_timeout(DEVICE_TIMEOUT)
+                .await
+            {
+                Ok(Ok(data)) => {
+                    let data: [u8; 0x80] = data;
+                    let _ = write!(
+                        &mut response,
+                        "OK kind=eeprom address=0x{address:04x} data="
+                    );
+                    for byte in data {
+                        let _ = write!(&mut response, "{byte:02x}");
+                    }
+                    let _ = writeln!(&mut response);
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR read_eeprom {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR read_eeprom timeout {err:?}");
+                }
+            }
+        }
     }
 
     response
+}
+
+async fn prepare_read_access(
+    intf: &mut MieleInterface<&mut OpticalPort<'_>>,
+    key: u16,
+) -> Result<(), &'static str> {
+    match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+        Ok(Ok(id)) => debug!("DIAG connected to software ID {id}"),
+        Ok(Err(err)) => {
+            warn!("DIAG query_software_id failed: {err:?}");
+            return Err("ERR query_software_id");
+        }
+        Err(err) => {
+            warn!("DIAG query_software_id timeout: {err:?}");
+            return Err("ERR query_software_id timeout");
+        }
+    }
+
+    match intf.unlock_read_access(key).with_timeout(DEVICE_TIMEOUT).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(err)) => {
+            warn!("DIAG unlock_read_access failed: {err:?}");
+            Err("ERR unlock_read_access")
+        }
+        Err(err) => {
+            warn!("DIAG unlock_read_access timeout: {err:?}");
+            Err("ERR unlock_read_access timeout")
+        }
+    }
 }
 
 #[embassy_executor::task]
@@ -852,12 +947,34 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
                     None
                 }
             }
+            Some("mem128") => {
+                let key = fields.next().and_then(parse_diag_u16);
+                let address = fields.next().and_then(parse_diag_u32);
+
+                if fields.next().is_none() {
+                    key.zip(address)
+                        .map(|(key, address)| DiagnosticCommand::ReadMemory128 { key, address })
+                } else {
+                    None
+                }
+            }
+            Some("eeprom128") => {
+                let key = fields.next().and_then(parse_diag_u16);
+                let address = fields.next().and_then(parse_diag_u16);
+
+                if fields.next().is_none() && address.is_none_or(|address| address <= 0xff80) {
+                    key.zip(address)
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom128 { key, address })
+                } else {
+                    None
+                }
+            }
             _ => None,
         };
 
         let Some(command) = command else {
             let _ =
-                tcp_write_all(&mut socket, b"ERR usage: id | find-read-key START END\n").await;
+                tcp_write_all(&mut socket, b"ERR usage: id | find-read-key START END | mem128 KEY ADDR | eeprom128 KEY ADDR\n").await;
             socket.close();
             continue;
         };
@@ -891,6 +1008,17 @@ fn parse_diag_u16(value: &str) -> Option<u16> {
         .or_else(|| value.strip_prefix("0X"))
     {
         u16::from_str_radix(value, 16).ok()
+    } else {
+        value.parse().ok()
+    }
+}
+
+fn parse_diag_u32(value: &str) -> Option<u32> {
+    if let Some(value) = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        u32::from_str_radix(value, 16).ok()
     } else {
         value.parse().ok()
     }
