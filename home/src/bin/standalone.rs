@@ -18,11 +18,12 @@ use core::{
 };
 
 use freemdu::embedded_io_async::Write as AsyncWrite;
+use freemdu::embedded_io_async::Read;
 
 use embassy_executor::Spawner;
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_futures::select::{self, Either};
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources, tcp::TcpSocket};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
 use embassy_time::{Duration, Ticker, WithTimeout};
 use esp_alloc as _;
 use esp_backtrace as _;
@@ -37,8 +38,8 @@ use esp_radio::wifi::{
     sta::StationConfig,
 };
 use esp_storage::FlashStorage;
-use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Value};
 use freemdu::Interface as MieleInterface;
+use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Value};
 use freemdu_home::{
     OpticalPort,
     accelerometer::{Lis2dh, Metrics, WindowStats},
@@ -78,19 +79,22 @@ const LOG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const DIAG_PORT: u16 = freemdu_home::num_from_env!("DIAG_PORT", u16);
 const DIAG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
+const BRIDGE_PORT: u16 = freemdu_home::num_from_env!("BRIDGE_PORT", u16);
+const BRIDGE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+const BRIDGE_CHUNK_SIZE: usize = 32;
+
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
-
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticCommand {
     QueryId,
     FindReadKey { start: u16, end: u16 },
-    ReadMemory128 { key: u16, address: u32 },
-    ReadEeprom128 { key: u16, address: u16 },
+    ReadMemory16 { key: u16, address: u32 },
+    ReadEeprom16 { key: u16, address: u16 },
 }
 
-const DIAG_RESPONSE_CAPACITY: usize = 384;
+const DIAG_RESPONSE_CAPACITY: usize = 160;
 
 #[derive(Clone, Copy)]
 struct DiagnosticResponse {
@@ -125,6 +129,53 @@ impl core::fmt::Write for DiagnosticResponse {
 static DIAG_COMMANDS: Channel<CriticalSectionRawMutex, DiagnosticCommand, 1> = Channel::new();
 static DIAG_RESPONSES: Channel<CriticalSectionRawMutex, DiagnosticResponse, 1> = Channel::new();
 
+#[derive(Clone, Copy)]
+struct BridgeChunk {
+    bytes: [u8; BRIDGE_CHUNK_SIZE],
+    len: usize,
+}
+
+impl BridgeChunk {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; BRIDGE_CHUNK_SIZE],
+            len: 0,
+        }
+    }
+
+    fn from_slice(data: &[u8]) -> Option<Self> {
+        if data.len() > BRIDGE_CHUNK_SIZE {
+            return None;
+        }
+
+        let mut chunk = Self::new();
+        chunk.bytes[..data.len()].copy_from_slice(data);
+        chunk.len = data.len();
+        Some(chunk)
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+#[derive(Clone, Copy)]
+enum BridgeCommand {
+    Connect,
+    Data(BridgeChunk),
+    Disconnect,
+}
+
+#[derive(Clone, Copy)]
+enum BridgeEvent {
+    Connected,
+    Data(BridgeChunk),
+}
+
+static BRIDGE_COMMANDS: Channel<CriticalSectionRawMutex, BridgeCommand, 4> = Channel::new();
+static BRIDGE_EVENTS: Channel<CriticalSectionRawMutex, BridgeEvent, 8> = Channel::new();
+static BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 static MQTT_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -154,34 +205,54 @@ async fn mqtt_message_task(
     let mut ir_debug_buf = [0_u8; 8];
 
     loop {
-        // Keep an optical UART read pending whenever the port is not being used
-        // for an actual Miele transaction. This makes arbitrary IR activity
-        // visible in the log. A normal 38 kHz remote is not expected to decode
-        // as valid 2400-8E1 data, so UART framing/parity errors are useful here:
-        // they still prove that the phototransistor is electrically reacting.
+        // The remote bridge takes exclusive ownership of the optical UART.
+        // MQTT polling, diagnostics and ambient-IR reads are suspended while a
+        // bridge client is attached, matching the behaviour of the dedicated
+        // USB bridge firmware and avoiding concurrent protocol transactions.
         match select::select(
-            DIAG_COMMANDS.receive(),
+            BRIDGE_COMMANDS.receive(),
             select::select(
-                receiver.receive(),
-                select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+                DIAG_COMMANDS.receive(),
+                select::select(
+                    receiver.receive(),
+                    select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+                ),
             ),
         )
         .await
         {
-            Either::First(command) => {
+            Either::First(BridgeCommand::Connect) => {
+                BRIDGE_ACTIVE.store(true, Ordering::Relaxed);
+                info!("Remote optical bridge acquired UART");
+                BRIDGE_EVENTS.send(BridgeEvent::Connected).await;
+
+                run_optical_bridge(&mut port).await;
+
+                BRIDGE_ACTIVE.store(false, Ordering::Relaxed);
+                ticker.reset();
+                info!("Remote optical bridge released UART");
+            }
+            Either::First(_) => {
+                // Stale bridge data/disconnect from a client that vanished
+                // before ownership was established. Ignore it.
+            }
+            Either::Second(Either::First(command)) => {
                 let response = execute_diagnostic_command(&mut port, command).await;
                 DIAG_RESPONSES.send(response).await;
             }
-            Either::Second(Either::First(MqttMessage::Connected)) => {
+            Either::Second(Either::Second(Either::First(MqttMessage::Connected))) => {
                 connected = true;
                 MQTT_CONNECTED.store(true, Ordering::Relaxed);
                 ticker.reset();
             }
-            Either::Second(Either::First(MqttMessage::Disconnected)) => {
+            Either::Second(Either::Second(Either::First(MqttMessage::Disconnected))) => {
                 connected = false;
                 MQTT_CONNECTED.store(false, Ordering::Relaxed);
             }
-            Either::Second(Either::First(MqttMessage::Publish(Topic::Device(topic), payload))) => {
+            Either::Second(Either::Second(Either::First(MqttMessage::Publish(
+                Topic::Device(topic),
+                payload,
+            )))) => {
                 if let Ok(param) = str::from_utf8(&payload)
                     && let Some((id, "trigger")) = topic.split_once('/')
                     && let Err(err) = trigger_action(&mut port, id, param).await
@@ -189,7 +260,7 @@ async fn mqtt_message_task(
                     error!("Failed to trigger action: {err:#}");
                 }
             }
-            Either::Second(Either::Second(Either::First(()))) if connected => {
+            Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
                 let state = match publish_device(&mut port, &hostname).await {
                     Ok(()) => AvailabilityState::Online,
                     Err(err) => {
@@ -203,12 +274,12 @@ async fn mqtt_message_task(
                     error!("Failed to publish status: {err:?}");
                 }
             }
-            Either::Second(Either::Second(Either::Second(Ok(len)))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Ok(len))))) => {
                 if len != 0 {
                     debug!("OPT AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
                 }
             }
-            Either::Second(Either::Second(Either::Second(Err(err)))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Err(err))))) => {
                 debug!("OPT AMBIENT UART activity/error: {err:?}");
             }
             _ => {}
@@ -218,6 +289,39 @@ async fn mqtt_message_task(
     }
 }
 
+async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
+    let mut rx_buf = [0_u8; BRIDGE_CHUNK_SIZE];
+
+    loop {
+        match select::select(BRIDGE_COMMANDS.receive(), port.read(&mut rx_buf)).await {
+            Either::First(BridgeCommand::Data(chunk)) => {
+                if let Err(err) = port.write(chunk.as_bytes()).await {
+                    warn!("Remote optical bridge TX failed: {err:?}");
+                    return;
+                }
+            }
+            Either::First(BridgeCommand::Disconnect) => return,
+            Either::First(BridgeCommand::Connect) => {
+                // Only one bridge client can own UART1 at a time.
+            }
+            Either::Second(Ok(len)) => {
+                if len == 0 {
+                    continue;
+                }
+
+                let Some(chunk) = BridgeChunk::from_slice(&rx_buf[..len]) else {
+                    warn!("Remote optical bridge RX chunk too large: {len}");
+                    continue;
+                };
+
+                BRIDGE_EVENTS.send(BridgeEvent::Data(chunk)).await;
+            }
+            Either::Second(Err(err)) => {
+                debug!("Remote optical bridge UART activity/error: {err:?}");
+            }
+        }
+    }
+}
 
 async fn execute_diagnostic_command(
     port: &mut OpticalPort<'_>,
@@ -265,7 +369,11 @@ async fn execute_diagnostic_command(
                     info!("DIAG read-key scan at 0x{key:04x}");
                 }
 
-                match intf.unlock_read_access(key).with_timeout(DEVICE_TIMEOUT).await {
+                match intf
+                    .unlock_read_access(key)
+                    .with_timeout(DEVICE_TIMEOUT)
+                    .await
+                {
                     Ok(Ok(())) => {
                         found = Some(key);
                         break;
@@ -284,7 +392,7 @@ async fn execute_diagnostic_command(
                 );
             }
         }
-        DiagnosticCommand::ReadMemory128 { key, address } => {
+        DiagnosticCommand::ReadMemory16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
 
             if let Err(err) = prepare_read_access(&mut intf, key).await {
@@ -292,13 +400,9 @@ async fn execute_diagnostic_command(
                 return response;
             }
 
-            match intf
-                .read_memory(address)
-                .with_timeout(DEVICE_TIMEOUT)
-                .await
-            {
+            match intf.read_memory(address).with_timeout(DEVICE_TIMEOUT).await {
                 Ok(Ok(data)) => {
-                    let data: [u8; 0x80] = data;
+                    let data: [u8; 0x10] = data;
                     let _ = write!(
                         &mut response,
                         "OK kind=memory address=0x{address:08x} data="
@@ -316,7 +420,7 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::ReadEeprom128 { key, address } => {
+        DiagnosticCommand::ReadEeprom16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
 
             if let Err(err) = prepare_read_access(&mut intf, key).await {
@@ -324,13 +428,9 @@ async fn execute_diagnostic_command(
                 return response;
             }
 
-            match intf
-                .read_eeprom(address)
-                .with_timeout(DEVICE_TIMEOUT)
-                .await
-            {
+            match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
                 Ok(Ok(data)) => {
-                    let data: [u8; 0x80] = data;
+                    let data: [u8; 0x10] = data;
                     let _ = write!(
                         &mut response,
                         "OK kind=eeprom address=0x{address:04x} data="
@@ -369,7 +469,11 @@ async fn prepare_read_access(
         }
     }
 
-    match intf.unlock_read_access(key).with_timeout(DEVICE_TIMEOUT).await {
+    match intf
+        .unlock_read_access(key)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+    {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
             warn!("DIAG unlock_read_access failed: {err:?}");
@@ -872,6 +976,129 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
     }
 }
 
+#[embassy_executor::task]
+async fn bridge_server_task(stack: Stack<'static>) -> ! {
+    if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
+        error!("Remote optical bridge disabled: set a non-default OTA_TOKEN");
+        core::future::pending::<()>().await;
+        unreachable!();
+    }
+
+    let mut rx_buffer = [0_u8; 512];
+    let mut tx_buffer = [0_u8; 512];
+
+    loop {
+        stack.wait_config_up().await;
+
+        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
+        socket.set_timeout(Some(BRIDGE_AUTH_TIMEOUT));
+
+        if let Err(err) = socket.accept(BRIDGE_PORT).await {
+            warn!("Remote optical bridge accept failed: {err:?}");
+            continue;
+        }
+
+        if BRIDGE_ACTIVE.load(Ordering::Relaxed) {
+            let _ = tcp_write_all(&mut socket, b"ERR bridge busy\n").await;
+            socket.close();
+            continue;
+        }
+
+        let mut header = [0_u8; 192];
+        let mut header_len = 0_usize;
+
+        while header_len < header.len() {
+            match socket.read(&mut header[header_len..header_len + 1]).await {
+                Ok(0) => break,
+                Ok(1) => {
+                    header_len += 1;
+                    if header[header_len - 1] == b'\n' {
+                        break;
+                    }
+                }
+                Ok(_) => unreachable!(),
+                Err(_) => break,
+            }
+        }
+
+        if header_len == 0 || header[header_len - 1] != b'\n' {
+            let _ = tcp_write_all(&mut socket, b"ERR malformed request\n").await;
+            socket.close();
+            continue;
+        }
+
+        let Ok(line) = core::str::from_utf8(&header[..header_len - 1]) else {
+            let _ = tcp_write_all(&mut socket, b"ERR request encoding\n").await;
+            socket.close();
+            continue;
+        };
+
+        let mut fields = line.split_ascii_whitespace();
+        let authenticated = fields.next() == Some("FMDUBRIDGE1")
+            && fields.next() == Some(OTA_TOKEN)
+            && fields.next().is_none();
+
+        if !authenticated {
+            let _ = tcp_write_all(&mut socket, b"ERR invalid token\n").await;
+            socket.close();
+            continue;
+        }
+
+        BRIDGE_COMMANDS.send(BridgeCommand::Connect).await;
+
+        match BRIDGE_EVENTS.receive().await {
+            BridgeEvent::Connected => {}
+            BridgeEvent::Data(_) => {
+                let _ = BRIDGE_COMMANDS.try_send(BridgeCommand::Disconnect);
+                socket.abort();
+                continue;
+            }
+        }
+
+        if tcp_write_all(&mut socket, b"OK FreeMDU optical bridge\n")
+            .await
+            .is_err()
+        {
+            let _ = BRIDGE_COMMANDS.try_send(BridgeCommand::Disconnect);
+            socket.abort();
+            continue;
+        }
+
+        socket.set_timeout(None);
+        info!(
+            "Remote optical bridge client connected from {:?}",
+            socket.remote_endpoint()
+        );
+
+        let mut host_buf = [0_u8; BRIDGE_CHUNK_SIZE];
+
+        loop {
+            match select::select(socket.read(&mut host_buf), BRIDGE_EVENTS.receive()).await {
+                Either::First(Ok(0)) => break,
+                Either::First(Ok(len)) => {
+                    let Some(chunk) = BridgeChunk::from_slice(&host_buf[..len]) else {
+                        warn!("Remote optical bridge host chunk too large: {len}");
+                        break;
+                    };
+                    BRIDGE_COMMANDS.send(BridgeCommand::Data(chunk)).await;
+                }
+                Either::First(Err(err)) => {
+                    debug!("Remote optical bridge socket read ended: {err:?}");
+                    break;
+                }
+                Either::Second(BridgeEvent::Data(chunk)) => {
+                    if tcp_write_all(&mut socket, chunk.as_bytes()).await.is_err() {
+                        break;
+                    }
+                }
+                Either::Second(BridgeEvent::Connected) => {}
+            }
+        }
+
+        let _ = BRIDGE_COMMANDS.try_send(BridgeCommand::Disconnect);
+        socket.abort();
+    }
+}
 
 #[embassy_executor::task]
 async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
@@ -947,24 +1174,24 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
                     None
                 }
             }
-            Some("mem128") => {
+            Some("mem16") => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u32);
 
                 if fields.next().is_none() {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadMemory128 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadMemory16 { key, address })
                 } else {
                     None
                 }
             }
-            Some("eeprom128") => {
+            Some("eeprom16") => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u16);
 
-                if fields.next().is_none() && address.is_none_or(|address| address <= 0xff80) {
+                if fields.next().is_none() && address.is_none_or(|address| address <= 0xfff0) {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadEeprom128 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom16 { key, address })
                 } else {
                     None
                 }
@@ -973,8 +1200,11 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
         };
 
         let Some(command) = command else {
-            let _ =
-                tcp_write_all(&mut socket, b"ERR usage: id | find-read-key START END | mem128 KEY ADDR | eeprom128 KEY ADDR\n").await;
+            let _ = tcp_write_all(
+                &mut socket,
+                b"ERR usage: id | find-read-key START END | mem16 KEY ADDR | eeprom16 KEY ADDR\n",
+            )
+            .await;
             socket.close();
             continue;
         };
@@ -1157,7 +1387,7 @@ fn init_network(
     Stack<'static>,
     Runner<'static, Interface<'static>>,
 )> {
-    static RESOURCES: StaticCell<StackResources<6>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<7>> = StaticCell::new();
 
     let (controller, intfs) = wifi::new(
         wifi,
@@ -1232,5 +1462,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());
     spawner.spawn(log_server_task(net_stack).unwrap());
     spawner.spawn(diagnostic_server_task(net_stack).unwrap());
+    spawner.spawn(bridge_server_task(net_stack).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());
 }

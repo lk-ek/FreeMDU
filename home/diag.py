@@ -11,7 +11,7 @@ import sys
 from local_config import load_config_value
 
 
-CHUNK_SIZE = 0x80
+CHUNK_SIZE = 0x10
 
 
 def number16(value: str) -> str:
@@ -53,7 +53,7 @@ def request(host: str, port: int, token: str, *parts: str) -> str:
 
 
 def read_block(host: str, port: int, token: str, kind: str, key: int, address: int) -> bytes:
-    command = "eeprom128" if kind == "eeprom" else "mem128"
+    command = "eeprom16" if kind == "eeprom" else "mem16"
     width = 4 if kind == "eeprom" else 8
     reply = request(
         host,
@@ -132,11 +132,11 @@ scan = sub.add_parser("find-read-key")
 scan.add_argument("start", type=number16)
 scan.add_argument("end", type=number16)
 
-mem = sub.add_parser("mem128")
+mem = sub.add_parser("mem16")
 mem.add_argument("key", type=number16)
 mem.add_argument("address", type=number32)
 
-eeprom = sub.add_parser("eeprom128")
+eeprom = sub.add_parser("eeprom16")
 eeprom.add_argument("key", type=number16)
 eeprom.add_argument("address", type=number16)
 
@@ -170,15 +170,15 @@ try:
         print(request(args.host, args.port, token, "id"))
     elif args.command == "find-read-key":
         print(request(args.host, args.port, token, "find-read-key", args.start, args.end))
-    elif args.command == "mem128":
+    elif args.command == "mem16":
         data = read_block(
             args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0)
         )
         print(data.hex())
-    elif args.command == "eeprom128":
+    elif args.command == "eeprom16":
         address = int(args.address, 0)
-        if address > 0xFF80:
-            parser.error("eeprom128 address must be <= 0xff80")
+        if address > 0xFFF0:
+            parser.error("eeprom16 address must be <= 0xfff0")
         data = read_block(
             args.host, args.port, token, "eeprom", int(args.key, 0), address
         )

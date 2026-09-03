@@ -25,6 +25,9 @@ LOG_PORT = "3233"
 # Authenticated read-only Miele diagnostic console (uses OTA_TOKEN).
 DIAG_PORT = "3234"
 
+# Authenticated raw optical bridge for remote TUI/protocol tools.
+BRIDGE_PORT = "3235"
+
 # Interval (in seconds) for publishing device properties and actions
 DEVICE_PUBLISH_INTERVAL = "60"
 
