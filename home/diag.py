@@ -40,12 +40,17 @@ if args.command == "find-read-key":
     parts += [args.start, args.end]
 
 with socket.create_connection((args.host, args.port), timeout=10) as sock:
+    # A key scan may take a while, so disable the read timeout after connect.
     sock.settimeout(None)
     sock.sendall((" ".join(parts) + "\n").encode("ascii"))
 
-    while True:
-        chunk = sock.recv(4096)
-        if not chunk:
-            break
-        sys.stdout.buffer.write(chunk)
-        sys.stdout.buffer.flush()
+    # FMDUDIAG1 is deliberately request/response: exactly one newline-
+    # terminated reply is returned for each connection. Do not wait for TCP
+    # EOF; an orderly FIN may be delayed by the embedded TCP stack.
+    reader = sock.makefile("rb", buffering=0)
+    reply = reader.readline()
+    if not reply:
+        raise RuntimeError("device disconnected without a diagnostic response")
+
+    sys.stdout.buffer.write(reply)
+    sys.stdout.buffer.flush()

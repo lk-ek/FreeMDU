@@ -865,8 +865,23 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
         info!("DIAG request: {command:?}");
         DIAG_COMMANDS.send(command).await;
         let response = DIAG_RESPONSES.receive().await;
-        let _ = tcp_write_all(&mut socket, response.as_bytes()).await;
-        socket.close();
+
+        match tcp_write_all(&mut socket, response.as_bytes()).await {
+            Ok(()) => {
+                if let Err(err) = socket.flush().await {
+                    warn!("DIAG response flush failed: {err:?}");
+                    socket.abort();
+                    continue;
+                }
+
+                debug!("DIAG response sent: {} bytes", response.as_bytes().len());
+                socket.close();
+            }
+            Err(err) => {
+                warn!("DIAG response write failed: {err:?}");
+                socket.abort();
+            }
+        }
     }
 }
 
