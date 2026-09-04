@@ -326,9 +326,9 @@ where
             PROP_WATER_LEVEL => Ok(self.query_water_level().await?.into()),
             PROP_WATER_LEVEL_TARGET => Ok(self.query_water_level_target().await?.into()),
             PROP_MOTOR_PWM_DUTY_CYCLE => Ok(self.query_motor_pwm_duty_cycle().await?.into()),
-            PROP_ACTIVE_ACTUATORS_RAW => Ok(
-                format!("0x{:04x}", self.query_active_actuators_raw().await?).into(),
-            ),
+            PROP_ACTIVE_ACTUATORS_RAW => {
+                Ok(format!("0x{:04x}", self.query_active_actuators_raw().await?).into())
+            }
             _ => Err(Error::UnknownProperty),
         }
     }
