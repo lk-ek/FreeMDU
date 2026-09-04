@@ -190,7 +190,6 @@ static BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
 struct Id410Trace {
     checked_device: bool,
     enabled_for_device: bool,
-    read_access_ready: bool,
     initialized: bool,
     snapshot_seq: u32,
     shadow: [u8; ID410_TRACE_RAM_SIZE],
@@ -201,7 +200,6 @@ impl Id410Trace {
         Self {
             checked_device: false,
             enabled_for_device: false,
-            read_access_ready: false,
             initialized: false,
             snapshot_seq: 0,
             shadow: [0; ID410_TRACE_RAM_SIZE],
@@ -272,7 +270,6 @@ async fn mqtt_message_task(
                 BRIDGE_ACTIVE.store(false, Ordering::Relaxed);
                 ticker.reset();
                 trace_ticker.reset();
-                id410_trace.read_access_ready = false;
                 info!("Remote optical bridge released UART");
             }
             Either::First(_) => {
@@ -375,47 +372,27 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
     // no quiet time has been observed to make the controller stop replying.
     Timer::after(Duration::from_millis(250)).await;
 
-    // Read access survives normal memory transactions on these older controllers.
-    // Re-sending the unlock command on every trace sweep can time out even while
-    // the controller is still readable, so establish access only when needed.
-    if !trace.read_access_ready {
-        // A normal MQTT property poll may already have unlocked the appliance.
-        // Probe a harmless read first and only send the unlock command if that
-        // read is rejected.
-        match intf
-            .read_memory::<[u8; ID410_TRACE_BLOCK_SIZE], ID410_TRACE_BLOCK_SIZE>(0)
-            .with_timeout(ID410_TRACE_BLOCK_TIMEOUT)
-            .await
-        {
-            Ok(Ok(_)) => {
-                trace.read_access_ready = true;
-                debug!("ID410 TRACE reusing existing read-access session");
-            }
-            Ok(Err(err)) => {
-                // A complete protocol response means the bus is synchronized;
-                // after a quiet interval it is safe to try a fresh unlock.
-                Timer::after(Duration::from_millis(250)).await;
-                intf.unlock_read_access(ID410_READ_KEY)
-                    .with_timeout(DEVICE_TIMEOUT)
-                    .await
-                    .map_err(|timeout| {
-                        anyhow::anyhow!(
-                            "read-access probe failed ({err:?}); unlock timed out: {timeout:?}"
-                        )
-                    })??;
-                trace.read_access_ready = true;
-                debug!("ID410 TRACE established read-access session");
-            }
-            Err(err) => {
-                // Never stack an unlock command directly behind a timed-out
-                // memory transaction. Retry from a clean idle period next sweep.
-                trace.read_access_ready = false;
-                return Err(anyhow::anyhow!(
-                    "RAM access probe timed out; deferring recovery to next sweep: {err:?}"
-                ));
-            }
-        }
+    // A new Interface needs the same handshake that already works reliably for
+    // normal ID410 polling: query the software ID, then unlock read access.
+    // A bare memory read here consistently times out on the W307 even when the
+    // immediately preceding property poll was able to read memory.
+    let software_id = intf
+        .query_software_id()
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("trace software-ID query timed out: {err:?}"))??;
+
+    if software_id != 410 {
+        trace.enabled_for_device = false;
+        return Err(anyhow::anyhow!(
+            "trace handshake unexpectedly returned software ID {software_id}"
+        ));
     }
+
+    intf.unlock_read_access(ID410_READ_KEY)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("trace read unlock timed out: {err:?}"))??;
 
     let mut current = [0_u8; ID410_TRACE_RAM_SIZE];
 
@@ -427,11 +404,9 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
         {
             Ok(Ok(block)) => block,
             Ok(Err(err)) => {
-                trace.read_access_ready = false;
                 return Err(anyhow::anyhow!("RAM read 0x{offset:04x} failed: {err:?}"));
             }
             Err(err) => {
-                trace.read_access_ready = false;
                 return Err(anyhow::anyhow!(
                     "RAM read 0x{offset:04x} timed out: {err:?}"
                 ));
