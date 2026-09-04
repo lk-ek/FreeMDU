@@ -19,3 +19,6 @@ MQTT_USERNAME = ""
 MQTT_PASSWORD = ""
 
 OTA_TOKEN = ""
+
+# Optional: read-only W307/ID410 RAM trace interval in seconds.
+# ID410_TRACE_INTERVAL = "30"

@@ -31,6 +31,11 @@ BRIDGE_PORT = "3235"
 # Interval (in seconds) for publishing device properties and actions
 DEVICE_PUBLISH_INTERVAL = "60"
 
+# Read-only RAM trace interval for experimental Miele software ID 410 support.
+# A sweep reads 1 KiB in proven-reliable 16-byte chunks and logs only changes.
+# Full snapshots are logged automatically when cycle state or program phase changes.
+ID410_TRACE_INTERVAL = "30"
+
 [target.'cfg(target_arch = "riscv32")']
 runner = "espflash flash --monitor --partition-table ./partitions.csv"
 rustflags = [

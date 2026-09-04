@@ -48,8 +48,7 @@ use log::{debug, error, info, warn};
 use mcutie::{
     McutieBuilder, McutieReceiver, McutieTask, MqttMessage, PublishBytes, Publishable, Topic,
     homeassistant::{
-        AvailabilityState, AvailabilityTopics, Device as HaDevice, Entity, Origin,
-        button::Button,
+        AvailabilityState, AvailabilityTopics, Device as HaDevice, Entity, Origin, button::Button,
         sensor::Sensor,
     },
 };
@@ -83,6 +82,15 @@ const DIAG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const BRIDGE_PORT: u16 = freemdu_home::num_from_env!("BRIDGE_PORT", u16);
 const BRIDGE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 const BRIDGE_CHUNK_SIZE: usize = 32;
+
+// Read-only ID410 RAM tracing. A full 1 KiB sweep uses conservative 16-byte reads,
+// matching the diagnostic path that has proven reliable on the W307.
+const ID410_TRACE_INTERVAL: Duration =
+    Duration::from_secs(freemdu_home::num_from_env!("ID410_TRACE_INTERVAL", u64));
+const ID410_TRACE_RAM_SIZE: usize = 0x400;
+const ID410_TRACE_BLOCK_SIZE: usize = 16;
+const ID410_TRACE_BLOCK_TIMEOUT: Duration = Duration::from_secs(2);
+const ID410_READ_KEY: u16 = 0x43ea;
 
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
@@ -178,6 +186,27 @@ static BRIDGE_COMMANDS: Channel<CriticalSectionRawMutex, BridgeCommand, 4> = Cha
 static BRIDGE_EVENTS: Channel<CriticalSectionRawMutex, BridgeEvent, 8> = Channel::new();
 static BRIDGE_ACTIVE: AtomicBool = AtomicBool::new(false);
 
+#[derive(Debug)]
+struct Id410Trace {
+    checked_device: bool,
+    enabled_for_device: bool,
+    initialized: bool,
+    snapshot_seq: u32,
+    shadow: [u8; ID410_TRACE_RAM_SIZE],
+}
+
+impl Id410Trace {
+    const fn new() -> Self {
+        Self {
+            checked_device: false,
+            enabled_for_device: false,
+            initialized: false,
+            snapshot_seq: 0,
+            shadow: [0; ID410_TRACE_RAM_SIZE],
+        }
+    }
+}
+
 static MQTT_CONNECTED: AtomicBool = AtomicBool::new(false);
 
 esp_bootloader_esp_idf::esp_app_desc!();
@@ -203,6 +232,8 @@ async fn mqtt_message_task(
     mut led: Output<'static>,
 ) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
+    let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
+    let mut id410_trace = Id410Trace::new();
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
 
@@ -217,7 +248,13 @@ async fn mqtt_message_task(
                 DIAG_COMMANDS.receive(),
                 select::select(
                     receiver.receive(),
-                    select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+                    select::select(
+                        ticker.next(),
+                        select::select(
+                            trace_ticker.next(),
+                            port.debug_read_activity(&mut ir_debug_buf),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -232,6 +269,7 @@ async fn mqtt_message_task(
 
                 BRIDGE_ACTIVE.store(false, Ordering::Relaxed);
                 ticker.reset();
+                trace_ticker.reset();
                 info!("Remote optical bridge released UART");
             }
             Either::First(_) => {
@@ -276,12 +314,21 @@ async fn mqtt_message_task(
                     error!("Failed to publish status: {err:?}");
                 }
             }
-            Either::Second(Either::Second(Either::Second(Either::Second(Ok(len))))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Either::First(()))))) => {
+                if let Err(err) = trace_id410_memory(&mut port, &mut id410_trace).await {
+                    warn!("ID410 TRACE sweep failed: {err:#}");
+                }
+            }
+            Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(Ok(
+                len,
+            )))))) => {
                 if len != 0 {
                     debug!("OPT AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
                 }
             }
-            Either::Second(Either::Second(Either::Second(Either::Second(Err(err))))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(
+                Err(err),
+            ))))) => {
                 debug!("OPT AMBIENT UART activity/error: {err:?}");
             }
             _ => {}
@@ -289,6 +336,100 @@ async fn mqtt_message_task(
 
         led.set_level((!connected).into());
     }
+}
+
+async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) -> Result<()> {
+    let mut intf = MieleInterface::new(&mut *port);
+
+    if !trace.checked_device {
+        let software_id = intf
+            .query_software_id()
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|err| anyhow::anyhow!("software-ID query timed out: {err:?}"))??;
+
+        trace.checked_device = true;
+        trace.enabled_for_device = software_id == 410;
+
+        if !trace.enabled_for_device {
+            info!("ID410 TRACE disabled: connected appliance has software ID {software_id}");
+            return Ok(());
+        }
+
+        info!(
+            "ID410 TRACE enabled: read-only 0x0000..0x03ff sweep every {} s",
+            ID410_TRACE_INTERVAL.as_secs()
+        );
+    }
+
+    if !trace.enabled_for_device {
+        return Ok(());
+    }
+
+    intf.unlock_read_access(ID410_READ_KEY)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("read unlock timed out: {err:?}"))??;
+
+    let mut current = [0_u8; ID410_TRACE_RAM_SIZE];
+
+    for offset in (0..ID410_TRACE_RAM_SIZE).step_by(ID410_TRACE_BLOCK_SIZE) {
+        let block: [u8; ID410_TRACE_BLOCK_SIZE] = intf
+            .read_memory(offset as u32)
+            .with_timeout(ID410_TRACE_BLOCK_TIMEOUT)
+            .await
+            .map_err(|err| anyhow::anyhow!("RAM read 0x{offset:04x} timed out: {err:?}"))??;
+        current[offset..offset + ID410_TRACE_BLOCK_SIZE].copy_from_slice(&block);
+
+        // Avoid hammering the old controller with an uninterrupted request train.
+        Timer::after(Duration::from_millis(5)).await;
+    }
+
+    let state = current[0x00cd];
+    let phase = current[0x00a2];
+
+    if !trace.initialized {
+        trace.shadow.copy_from_slice(&current);
+        trace.initialized = true;
+        info!("ID410 TRACE baseline captured: state=0x{state:02x} phase=0x{phase:02x}");
+        return Ok(());
+    }
+
+    let old_state = trace.shadow[0x00cd];
+    let old_phase = trace.shadow[0x00a2];
+    let state_or_phase_changed = state != old_state || phase != old_phase;
+    let mut changed = 0_usize;
+
+    for (offset, (&old, &new)) in trace.shadow.iter().zip(current.iter()).enumerate() {
+        if old != new {
+            changed += 1;
+            info!("ID410 TRACE 0x{offset:04x} {old:02x}->{new:02x}");
+        }
+    }
+
+    if changed != 0 {
+        info!(
+            "ID410 TRACE sweep: {changed} byte(s) changed, state=0x{state:02x}, phase=0x{phase:02x}"
+        );
+    }
+
+    if state_or_phase_changed {
+        trace.snapshot_seq = trace.snapshot_seq.wrapping_add(1);
+        let seq = trace.snapshot_seq;
+        info!(
+            "ID410 SNAPSHOT BEGIN seq={seq} state={old_state:02x}->{state:02x} phase={old_phase:02x}->{phase:02x}"
+        );
+
+        for offset in (0..ID410_TRACE_RAM_SIZE).step_by(ID410_TRACE_BLOCK_SIZE) {
+            let data = &current[offset..offset + ID410_TRACE_BLOCK_SIZE];
+            info!("ID410 SNAPSHOT seq={seq} {offset:04x} {data:02x?}");
+        }
+
+        info!("ID410 SNAPSHOT END seq={seq}");
+    }
+
+    trace.shadow.copy_from_slice(&current);
+    Ok(())
 }
 
 async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
