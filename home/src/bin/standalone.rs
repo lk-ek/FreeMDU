@@ -192,6 +192,8 @@ struct Id410Trace {
     enabled_for_device: bool,
     initialized: bool,
     snapshot_seq: u32,
+    observed_sweeps: u8,
+    change_counts: [u8; ID410_TRACE_RAM_SIZE],
     shadow: [u8; ID410_TRACE_RAM_SIZE],
 }
 
@@ -202,9 +204,20 @@ impl Id410Trace {
             enabled_for_device: false,
             initialized: false,
             snapshot_seq: 0,
+            observed_sweeps: 0,
+            change_counts: [0; ID410_TRACE_RAM_SIZE],
             shadow: [0; ID410_TRACE_RAM_SIZE],
         }
     }
+}
+
+fn id410_trace_is_volatile(change_count: u8, observed_sweeps: u8) -> bool {
+    // Require a few observations before classifying anything as noise. Once
+    // enough history exists, an address is considered volatile when it changed
+    // in at least a quarter of the successful comparison sweeps.
+    observed_sweeps >= 4
+        && change_count >= 2
+        && u16::from(change_count) * 4 >= u16::from(observed_sweeps)
 }
 
 static MQTT_CONNECTED: AtomicBool = AtomicBool::new(false);
@@ -431,24 +444,49 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
     let old_state = trace.shadow[0x00cd];
     let old_phase = trace.shadow[0x00a2];
     let state_or_phase_changed = state != old_state || phase != old_phase;
+    let observed_before = trace.observed_sweeps;
     let mut changed = 0_usize;
+    let mut stable_changed = 0_usize;
+    let mut volatile_changed = 0_usize;
 
     for (offset, (&old, &new)) in trace.shadow.iter().zip(current.iter()).enumerate() {
         if old != new {
             changed += 1;
+            let volatile = id410_trace_is_volatile(trace.change_counts[offset], observed_before);
+
+            if volatile {
+                volatile_changed += 1;
+            } else {
+                stable_changed += 1;
+            }
+
             info!("ID410 TRACE 0x{offset:04x} {old:02x}->{new:02x}");
+
+            // On state/phase transitions, emit a second compact stream that
+            // suppresses addresses which already proved noisy during preceding
+            // successful sweeps. This keeps transition analysis readable while
+            // preserving the full raw diff above.
+            if state_or_phase_changed && !volatile {
+                info!(
+                    "ID410 STABLE 0x{offset:04x} {old:02x}->{new:02x} history={}/{}",
+                    trace.change_counts[offset], observed_before
+                );
+            }
         }
     }
 
     if changed != 0 {
         info!(
-            "ID410 TRACE sweep: {changed} byte(s) changed, state=0x{state:02x}, phase=0x{phase:02x}"
+            "ID410 TRACE sweep: {changed} byte(s) changed ({stable_changed} stable, {volatile_changed} volatile), state=0x{state:02x}, phase=0x{phase:02x}"
         );
     }
 
     if state_or_phase_changed {
         trace.snapshot_seq = trace.snapshot_seq.wrapping_add(1);
         let seq = trace.snapshot_seq;
+        info!(
+            "ID410 STABLE transition seq={seq}: {stable_changed} stable change(s), {volatile_changed} volatile change(s) suppressed"
+        );
         info!(
             "ID410 SNAPSHOT BEGIN seq={seq} state={old_state:02x}->{state:02x} phase={old_phase:02x}->{phase:02x}"
         );
@@ -460,6 +498,37 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
 
         info!("ID410 SNAPSHOT END seq={seq}");
     }
+
+    // Maintain a compact per-address churn history. Keep the counters bounded
+    // to one byte per RAM address; when the observation window fills, decay all
+    // counts by half so long washes keep a useful recent-history ratio instead
+    // of saturating.
+    if trace.observed_sweeps == u8::MAX {
+        for count in &mut trace.change_counts {
+            *count /= 2;
+        }
+        trace.observed_sweeps /= 2;
+    }
+
+    let observed_after = trace.observed_sweeps.saturating_add(1);
+    for (offset, (&old, &new)) in trace.shadow.iter().zip(current.iter()).enumerate() {
+        if old == new {
+            continue;
+        }
+
+        let was_volatile =
+            id410_trace_is_volatile(trace.change_counts[offset], trace.observed_sweeps);
+        trace.change_counts[offset] = trace.change_counts[offset].saturating_add(1);
+        let now_volatile = id410_trace_is_volatile(trace.change_counts[offset], observed_after);
+
+        if !was_volatile && now_volatile {
+            debug!(
+                "ID410 TRACE volatile 0x{offset:04x}: {}/{} sweeps changed",
+                trace.change_counts[offset], observed_after
+            );
+        }
+    }
+    trace.observed_sweeps = observed_after;
 
     trace.shadow.copy_from_slice(&current);
     Ok(())
