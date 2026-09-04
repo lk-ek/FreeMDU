@@ -7,11 +7,14 @@ import argparse
 from pathlib import Path
 import socket
 import sys
+import time
 
 from local_config import load_config_value
 
 
 CHUNK_SIZE = 0x10
+CONNECT_RETRIES = 20
+CONNECT_RETRY_DELAY = 0.1
 
 
 def number16(value: str) -> str:
@@ -34,10 +37,26 @@ def number32(value: str) -> str:
     return value
 
 
+def connect_with_retry(host: str, port: int) -> socket.socket:
+    last_error: OSError | None = None
+
+    for attempt in range(CONNECT_RETRIES):
+        try:
+            return socket.create_connection((host, port), timeout=10)
+        except ConnectionRefusedError as exc:
+            last_error = exc
+            if attempt + 1 == CONNECT_RETRIES:
+                break
+            time.sleep(CONNECT_RETRY_DELAY)
+
+    assert last_error is not None
+    raise last_error
+
+
 def request(host: str, port: int, token: str, *parts: str) -> str:
     wire = ["FMDUDIAG1", token, *parts]
 
-    with socket.create_connection((host, port), timeout=10) as sock:
+    with connect_with_retry(host, port) as sock:
         sock.settimeout(None)
         sock.sendall((" ".join(wire) + "\n").encode("ascii"))
 
@@ -94,16 +113,30 @@ def dump_range(
         raise RuntimeError(f"start must be aligned to 0x{CHUNK_SIZE:x}")
     if (end + 1) % CHUNK_SIZE:
         raise RuntimeError(f"end + 1 must be aligned to 0x{CHUNK_SIZE:x}")
-    if kind == "eeprom" and end > 0xFFFF:
-        raise RuntimeError("EEPROM end address must fit in 16 bits")
+
+    # Older Miele controllers address EEPROM in 16-bit words while the read
+    # length is still expressed in bytes. The dump CLI intentionally uses byte
+    # offsets, so a contiguous 16-byte block advances the protocol address by
+    # 8 words rather than 16.
+    if kind == "eeprom":
+        if end > 0x1FFFF:
+            raise RuntimeError("EEPROM byte end offset is out of range")
+
+        def protocol_address(byte_offset: int) -> int:
+            return byte_offset // 2
+    else:
+        def protocol_address(byte_offset: int) -> int:
+            return byte_offset
 
     total = end - start + 1
     completed = 0
 
     with output.open("wb") as handle:
-        for address in range(start, end + 1, CHUNK_SIZE):
+        for byte_offset in range(start, end + 1, CHUNK_SIZE):
+            address = protocol_address(byte_offset)
             print(
-                f"\r{kind}: 0x{address:08x}  "
+                f"\r{kind}: byte 0x{byte_offset:08x} "
+                f"(protocol 0x{address:04x})  "
                 f"{completed}/{total} bytes ({completed * 100 // total:3d}%)",
                 end="",
                 file=sys.stderr,
@@ -146,11 +179,14 @@ dump_mem.add_argument("--key", type=number16, default="0x0000")
 dump_mem.add_argument("--start", type=number32, required=True)
 dump_mem.add_argument("--end", type=number32, required=True)
 
-dump_eeprom = sub.add_parser("dump-eeprom")
+dump_eeprom = sub.add_parser(
+    "dump-eeprom",
+    help="dump a contiguous EEPROM byte range (old devices use word addresses on wire)",
+)
 dump_eeprom.add_argument("output", type=Path)
 dump_eeprom.add_argument("--key", type=number16, default="0x0000")
-dump_eeprom.add_argument("--start", type=number16, default="0x0000")
-dump_eeprom.add_argument("--end", type=number16, required=True)
+dump_eeprom.add_argument("--start", type=number32, default="0x0000", help="byte offset")
+dump_eeprom.add_argument("--end", type=number32, required=True, help="inclusive byte offset")
 
 args = parser.parse_args()
 

@@ -17,8 +17,8 @@ use core::{
     sync::atomic::{AtomicBool, Ordering},
 };
 
-use freemdu::embedded_io_async::Write as AsyncWrite;
 use freemdu::embedded_io_async::Read;
+use freemdu::embedded_io_async::Write as AsyncWrite;
 
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
@@ -655,6 +655,22 @@ async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -
 }
 
 async fn publish_device(port: &mut OpticalPort<'_>, hostname: &str) -> Result<()> {
+    // ID 410 (W307, ca. 2003) is not in the upstream device database yet.
+    // Probe the software ID before using device::connect() and expose the
+    // read-only fields that have already been verified against RAM snapshots.
+    {
+        let mut intf = MieleInterface::new(&mut *port);
+        let software_id = intf
+            .query_software_id()
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|err| anyhow::anyhow!("Failed to query software ID: {err:?}"))??;
+
+        if software_id == 410 {
+            return publish_w307_id410(&mut intf, hostname).await;
+        }
+    }
+
     let mut dev = connect_to_device(port).await?;
     let dev_kind = dev.kind().to_string();
     let props = dev
@@ -696,6 +712,376 @@ async fn publish_device(port: &mut OpticalPort<'_>, hostname: &str) -> Result<()
     }
 
     Ok(())
+}
+
+const W307_ID410_READ_KEY: u16 = 0x43ea;
+const W307_ID410_DEVICE_NAME: &str = "Miele W307 (experimental ID 410)";
+
+async fn publish_w307_id410(
+    intf: &mut MieleInterface<&mut OpticalPort<'_>>,
+    hostname: &str,
+) -> Result<()> {
+    intf.unlock_read_access(W307_ID410_READ_KEY)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("W307 read unlock timed out: {err:?}"))??;
+
+    // Read a few compact regions rather than dozens of individual bytes.
+    // The offsets below are either directly confirmed on ID 410 or are
+    // conservative id360-derived fields that matched the idle/program-selected
+    // snapshots. Everything remains strictly read-only.
+    let op_a: [u8; 0x20] = intf
+        .read_memory(0x009e)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("W307 operation block A timed out: {err:?}"))??;
+    let op_b: [u8; 0x30] = intf
+        .read_memory(0x00c8)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("W307 operation block B timed out: {err:?}"))??;
+    let io_a: [u8; 0x10] = intf
+        .read_memory(0x0078)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("W307 I/O block timed out: {err:?}"))??;
+    let temp: [u8; 0x10] = intf
+        .read_memory(0x0130)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("W307 temperature block timed out: {err:?}"))??;
+    let motor: [u8; 0x10] = intf
+        .read_memory(0x0280)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("W307 motor block timed out: {err:?}"))??;
+
+    let display = decode_w307_display([op_a[0], op_a[1], op_a[2], op_a[3]]);
+    let phase_raw = op_a[0x00a2 - 0x009e];
+    let selected_program_raw = op_a[0x00b5 - 0x009e];
+
+    let operating_state_raw = op_b[0x00cd - 0x00c8];
+    let program_type_raw = op_b[0x00de - 0x00c8];
+    let program_temperature = op_b[0x00df - 0x00c8];
+
+    let active_actuators = u16::from_le_bytes([io_a[0x007d - 0x0078], io_a[0x007e - 0x0078]]);
+    let water_level = io_a[0x007f - 0x0078];
+    let water_level_target = io_a[0x0080 - 0x0078];
+
+    let target_temperature = temp[0x0135 - 0x0130];
+    let current_temperature = temp[0x0136 - 0x0130];
+
+    let motor_pwm_raw = motor[0];
+    let motor_pwm_percent = u16::from(motor_pwm_raw) * 100 / 0xff;
+
+    let operating_state = w307_operating_state(operating_state_raw);
+    let selected_program = w307_program(selected_program_raw);
+    let program_type = w307_program_type(program_type_raw);
+    let program_phase = w307_program_phase(phase_raw);
+
+    publish_w307_sensor(
+        hostname,
+        "cycle_status",
+        "Cycle status",
+        None,
+        operating_state,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "program_running",
+        "Program running",
+        None,
+        if operating_state_raw == 2 {
+            "Yes"
+        } else {
+            "No"
+        },
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "program_finished",
+        "Program finished",
+        None,
+        if operating_state_raw == 3 {
+            "Yes"
+        } else {
+            "No"
+        },
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "selected_program",
+        "Selected program",
+        None,
+        selected_program,
+    )
+    .await?;
+    publish_w307_sensor(hostname, "program_type", "Program type", None, program_type).await?;
+    publish_w307_sensor(
+        hostname,
+        "program_phase",
+        "Program phase",
+        None,
+        program_phase,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "program_temperature",
+        "Selected temperature",
+        Some("°C"),
+        program_temperature,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "temperature",
+        "Drum temperature",
+        Some("°C"),
+        current_temperature,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "target_temperature",
+        "Target temperature",
+        Some("°C"),
+        target_temperature,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "display_contents",
+        "Display contents",
+        None,
+        if display.is_empty() {
+            "--"
+        } else {
+            display.as_str()
+        },
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "water_level",
+        "Water level",
+        Some("mmH₂O"),
+        water_level,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "water_level_target",
+        "Target water level",
+        Some("mmH₂O"),
+        water_level_target,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "motor_pwm_duty_cycle",
+        "Motor PWM duty cycle",
+        Some("%"),
+        motor_pwm_percent,
+    )
+    .await?;
+    publish_w307_sensor(
+        hostname,
+        "active_actuators_raw",
+        "Active actuators (raw)",
+        None,
+        format!("0x{active_actuators:04x}"),
+    )
+    .await?;
+
+    info!(
+        "Published W307/ID410: state={operating_state} program={selected_program} \
+         type={program_type} temp={program_temperature}°C phase={program_phase} \
+         display={display:?}"
+    );
+
+    Ok(())
+}
+
+async fn publish_w307_sensor(
+    hostname: &str,
+    id: &str,
+    name: &str,
+    unit: Option<&str>,
+    value: impl core::fmt::Display,
+) -> Result<()> {
+    let unique_id = format!("{hostname}_w307_{id}");
+    let topic = Topic::Device(format!("w307/{id}/value"));
+
+    Entity {
+        device: HaDevice {
+            name: Some(W307_ID410_DEVICE_NAME),
+            ..HaDevice::default()
+        },
+        origin: Origin::default(),
+        object_id: &unique_id,
+        unique_id: Some(&unique_id),
+        name,
+        availability: AvailabilityTopics::All([STATUS_TOPIC]),
+        state_topic: Some(topic.as_ref()),
+        command_topic: None,
+        component: Sensor {
+            device_class: None,
+            state_class: None,
+            unit_of_measurement: unit,
+        },
+    }
+    .publish_discovery()
+    .await
+    .map_err(|err| anyhow::anyhow!("Failed to publish W307 HA discovery for {id}: {err:?}"))?;
+
+    topic
+        .with_display(value)
+        .publish()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to publish W307 value {id}: {err:?}"))
+}
+
+fn w307_operating_state(value: u8) -> &'static str {
+    match value {
+        0 => "Door open",
+        1 => "Ready",
+        2 => "Running",
+        3 => "Finished",
+        4 => "Service programming",
+        5 => "Customer programming",
+        6 => "Service",
+        _ => "Unknown",
+    }
+}
+
+fn w307_program(value: u8) -> &'static str {
+    match value {
+        0 => "Finish",
+        1 => "Cottons 95 °C",
+        2 => "Cottons 75 °C",
+        3 => "Cottons 60 °C",
+        4 => "Cottons 40 °C",
+        5 => "Cottons 30 °C",
+        6 => "Minimum iron 60 °C",
+        7 => "Minimum iron 50 °C",
+        8 => "Minimum iron 40 °C",
+        9 => "Minimum iron 30 °C",
+        10 => "Drain/Spin",
+        11 => "Separate rinse",
+        12 => "Starch",
+        13 => "Mixed wash 40 °C",
+        14 => "Quick wash 40 °C",
+        15 => "Woolens cold",
+        16 => "Woolens 30 °C",
+        17 => "Woolens 40 °C",
+        18 => "Silks 30 °C",
+        19 => "Delicates cold",
+        20 => "Delicates 30 °C",
+        21 => "Delicates 40 °C",
+        _ => "Unknown",
+    }
+}
+
+fn w307_program_type(value: u8) -> &'static str {
+    match value {
+        0x00 => "None",
+        0x01 => "Cottons",
+        0x02 => "Minimum iron",
+        0x03 => "Delicates",
+        0x04 => "Woolens",
+        0x05 => "Quick wash",
+        0x06 => "Starch",
+        0x07 => "Drain/Spin",
+        0x09 => "Separate rinse",
+        0x0a => "Mixed wash",
+        0x0b => "Silks",
+        _ => "Unknown",
+    }
+}
+
+fn w307_program_phase(value: u8) -> &'static str {
+    match value {
+        0 => "Idle",
+        1 => "Delayed start",
+        2 => "Soak/Pre-wash 1",
+        3 => "Soak/Pre-wash 2",
+        4 => "Main wash",
+        5 => "Rinse 1",
+        6 => "Rinse 2",
+        7 => "Rinse 3",
+        8 => "Rinse 4",
+        9 => "Rinse 5",
+        10 => "Rinse hold",
+        11 => "Drain",
+        12 => "Final spin",
+        13 => "Anti-crease/Finish",
+        _ => "Unknown",
+    }
+}
+
+fn decode_w307_display(data: [u8; 4]) -> String {
+    let points = (data[2] & 0x70) >> 4;
+    let codes = [
+        (data[0] & 0x0f, (data[3] & 0x02) != 0),
+        ((data[0] & 0xf0) >> 4, (data[3] & 0x04) != 0),
+        (data[1] & 0x0f, (data[3] & 0x08) != 0),
+    ];
+
+    let mut result = String::new();
+
+    for (index, (code, special)) in codes.into_iter().enumerate() {
+        if let Some(ch) = decode_w307_display_digit(code, special) {
+            result.push(ch);
+        }
+
+        let digit = index as u8 + 1;
+        if points == digit || points == 0x07 {
+            result.push('.');
+        }
+    }
+
+    result
+}
+
+fn decode_w307_display_digit(code: u8, special: bool) -> Option<char> {
+    match (code, special) {
+        (0x00, false) => Some('0'),
+        (0x01, false) => Some('1'),
+        (0x02, false) => Some('2'),
+        (0x03, false) => Some('3'),
+        (0x04, false) => Some('4'),
+        (0x05, false) => Some('5'),
+        (0x06, false) => Some('6'),
+        (0x07, false) => Some('7'),
+        (0x08, false) => Some('8'),
+        (0x09, false) => Some('9'),
+        (0x0a, false) => Some('A'),
+        (0x0b, false) => Some('b'),
+        (0x0c, false) => Some('C'),
+        (0x0d, false) => Some('d'),
+        (0x0e, false) => Some('E'),
+        (0x0f, false) => Some('F'),
+        (0x01, true) => Some('c'),
+        (0x02, true) => Some('H'),
+        (0x03, true) => Some('h'),
+        (0x04, true) => Some('J'),
+        (0x05, true) => Some('L'),
+        (0x06, true) => Some('n'),
+        (0x07, true) => Some('o'),
+        (0x08, true) => Some('P'),
+        (0x09, true) => Some('r'),
+        (0x0a, true) => Some('U'),
+        (0x0b, true) => Some('u'),
+        (0x0c, true) => Some('y'),
+        (0x0d, true) => Some('-'),
+        (0x0e, true) => Some('='),
+        (0x0f, true) => Some('°'),
+        _ => None,
+    }
 }
 
 async fn publish_property(prop: &Property, dev: &str, hostname: &str) -> Result<()> {
