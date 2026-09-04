@@ -48,7 +48,9 @@ use log::{debug, error, info, warn};
 use mcutie::{
     McutieBuilder, McutieReceiver, McutieTask, MqttMessage, PublishBytes, Publishable, Topic,
     homeassistant::{
-        AvailabilityState, AvailabilityTopics, Device as HaDevice, Entity, Origin, button::Button,
+        AvailabilityState, AvailabilityTopics, Device as HaDevice, Entity, Origin,
+        binary_sensor::{BinarySensor, BinarySensorState},
+        button::Button,
         sensor::Sensor,
     },
 };
@@ -757,7 +759,6 @@ async fn publish_w307_id410(
         .await
         .map_err(|err| anyhow::anyhow!("W307 motor block timed out: {err:?}"))??;
 
-    let display = decode_w307_display([op_a[0], op_a[1], op_a[2], op_a[3]]);
     let phase_raw = op_a[0x00a2 - 0x009e];
     let selected_program_raw = op_a[0x00b5 - 0x009e];
 
@@ -788,28 +789,18 @@ async fn publish_w307_id410(
         operating_state,
     )
     .await?;
-    publish_w307_sensor(
+    publish_w307_binary_sensor(
         hostname,
         "program_running",
         "Program running",
-        None,
-        if operating_state_raw == 2 {
-            "Yes"
-        } else {
-            "No"
-        },
+        operating_state_raw == 2,
     )
     .await?;
-    publish_w307_sensor(
+    publish_w307_binary_sensor(
         hostname,
         "program_finished",
         "Program finished",
-        None,
-        if operating_state_raw == 3 {
-            "Yes"
-        } else {
-            "No"
-        },
+        operating_state_raw == 3,
     )
     .await?;
     publish_w307_sensor(
@@ -855,29 +846,17 @@ async fn publish_w307_id410(
     .await?;
     publish_w307_sensor(
         hostname,
-        "display_contents",
-        "Display contents",
-        None,
-        if display.is_empty() {
-            "--"
-        } else {
-            display.as_str()
-        },
-    )
-    .await?;
-    publish_w307_sensor(
-        hostname,
         "water_level",
-        "Water level",
-        Some("mmH₂O"),
+        "Water level (raw)",
+        None,
         water_level,
     )
     .await?;
     publish_w307_sensor(
         hostname,
         "water_level_target",
-        "Target water level",
-        Some("mmH₂O"),
+        "Target water level (raw)",
+        None,
         water_level_target,
     )
     .await?;
@@ -901,10 +880,50 @@ async fn publish_w307_id410(
     info!(
         "Published W307/ID410: state={operating_state} program={selected_program} \
          type={program_type} temp={program_temperature}°C phase={program_phase} \
-         display={display:?}"
+         current_temp={current_temperature}°C target_temp={target_temperature}°C \
+         water={water_level}/{water_level_target} actuators=0x{active_actuators:04x}"
     );
 
     Ok(())
+}
+
+async fn publish_w307_binary_sensor(
+    hostname: &str,
+    id: &str,
+    name: &str,
+    value: bool,
+) -> Result<()> {
+    let unique_id = format!("{hostname}_w307_{id}");
+    let topic = Topic::Device(format!("w307/{id}/value"));
+
+    let entity = Entity {
+        device: HaDevice {
+            name: Some(W307_ID410_DEVICE_NAME),
+            ..HaDevice::default()
+        },
+        origin: Origin::default(),
+        object_id: &unique_id,
+        unique_id: Some(&unique_id),
+        name,
+        availability: AvailabilityTopics::All([STATUS_TOPIC]),
+        state_topic: Some(topic.as_ref()),
+        command_topic: None,
+        component: BinarySensor { device_class: None },
+    };
+
+    entity
+        .publish_discovery()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to publish W307 HA discovery for {id}: {err:?}"))?;
+
+    entity
+        .publish_state(if value {
+            BinarySensorState::On
+        } else {
+            BinarySensorState::Off
+        })
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to publish W307 binary value {id}: {err:?}"))
 }
 
 async fn publish_w307_sensor(
@@ -1005,6 +1024,9 @@ fn w307_program_type(value: u8) -> &'static str {
 }
 
 fn w307_program_phase(value: u8) -> &'static str {
+    // Confirmed on ID410: 0 = Idle, 4 = Main wash, 13 = Anti-crease/Finish.
+    // The remaining labels are inherited from the closely related ID360 profile
+    // until they are observed directly on this machine.
     match value {
         0 => "Idle",
         1 => "Delayed start",
@@ -1021,67 +1043,6 @@ fn w307_program_phase(value: u8) -> &'static str {
         12 => "Final spin",
         13 => "Anti-crease/Finish",
         _ => "Unknown",
-    }
-}
-
-fn decode_w307_display(data: [u8; 4]) -> String {
-    let points = (data[2] & 0x70) >> 4;
-    let codes = [
-        (data[0] & 0x0f, (data[3] & 0x02) != 0),
-        ((data[0] & 0xf0) >> 4, (data[3] & 0x04) != 0),
-        (data[1] & 0x0f, (data[3] & 0x08) != 0),
-    ];
-
-    let mut result = String::new();
-
-    for (index, (code, special)) in codes.into_iter().enumerate() {
-        if let Some(ch) = decode_w307_display_digit(code, special) {
-            result.push(ch);
-        }
-
-        let digit = index as u8 + 1;
-        if points == digit || points == 0x07 {
-            result.push('.');
-        }
-    }
-
-    result
-}
-
-fn decode_w307_display_digit(code: u8, special: bool) -> Option<char> {
-    match (code, special) {
-        (0x00, false) => Some('0'),
-        (0x01, false) => Some('1'),
-        (0x02, false) => Some('2'),
-        (0x03, false) => Some('3'),
-        (0x04, false) => Some('4'),
-        (0x05, false) => Some('5'),
-        (0x06, false) => Some('6'),
-        (0x07, false) => Some('7'),
-        (0x08, false) => Some('8'),
-        (0x09, false) => Some('9'),
-        (0x0a, false) => Some('A'),
-        (0x0b, false) => Some('b'),
-        (0x0c, false) => Some('C'),
-        (0x0d, false) => Some('d'),
-        (0x0e, false) => Some('E'),
-        (0x0f, false) => Some('F'),
-        (0x01, true) => Some('c'),
-        (0x02, true) => Some('H'),
-        (0x03, true) => Some('h'),
-        (0x04, true) => Some('J'),
-        (0x05, true) => Some('L'),
-        (0x06, true) => Some('n'),
-        (0x07, true) => Some('o'),
-        (0x08, true) => Some('P'),
-        (0x09, true) => Some('r'),
-        (0x0a, true) => Some('U'),
-        (0x0b, true) => Some('u'),
-        (0x0c, true) => Some('y'),
-        (0x0d, true) => Some('-'),
-        (0x0e, true) => Some('='),
-        (0x0f, true) => Some('°'),
-        _ => None,
     }
 }
 
