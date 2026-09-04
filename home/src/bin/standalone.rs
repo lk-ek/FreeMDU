@@ -23,14 +23,14 @@ use freemdu::embedded_io_async::Write as AsyncWrite;
 use embassy_executor::Spawner;
 use embassy_futures::select::{self, Either};
 use embassy_net::{DhcpConfig, Runner, Stack, StackResources, tcp::TcpSocket};
-use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel};
-use embassy_time::{Duration, Ticker, WithTimeout};
+use embassy_sync::{blocking_mutex::raw::CriticalSectionRawMutex, channel::Channel, mutex::Mutex};
+use embassy_time::{Duration, Ticker, Timer, WithTimeout};
 use esp_alloc as _;
 use esp_backtrace as _;
 use esp_hal::system::software_reset;
 use esp_hal::{
     efuse, gpio::Output, interrupt::software::SoftwareInterruptControl, peripherals::WIFI,
-    rng::Rng, timer::timg::TimerGroup,
+    rng::Rng, timer::timg::TimerGroup, usb_serial_jtag::UsbSerialJtag,
 };
 use esp_hal_ota::Ota;
 use esp_radio::wifi::{
@@ -128,6 +128,7 @@ impl core::fmt::Write for DiagnosticResponse {
 
 static DIAG_COMMANDS: Channel<CriticalSectionRawMutex, DiagnosticCommand, 1> = Channel::new();
 static DIAG_RESPONSES: Channel<CriticalSectionRawMutex, DiagnosticResponse, 1> = Channel::new();
+static DIAG_REQUEST_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
 
 #[derive(Clone, Copy)]
 struct BridgeChunk {
@@ -1486,6 +1487,204 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
     }
 }
 
+async fn run_diag_command(command: DiagnosticCommand) -> DiagnosticResponse {
+    let _guard = DIAG_REQUEST_LOCK.lock().await;
+    DIAG_COMMANDS.send(command).await;
+    DIAG_RESPONSES.receive().await
+}
+
+fn serial_diag_print_response(response: &DiagnosticResponse) {
+    match core::str::from_utf8(response.as_bytes()) {
+        Ok(text) => esp_println::println!("SERDIAG {}", text.trim_end()),
+        Err(_) => esp_println::println!("SERDIAG ERR invalid response encoding"),
+    }
+}
+
+async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
+    if start > end || start % 16 != 0 || (end + 1) % 16 != 0 {
+        esp_println::println!("SERDIAG ERR dump range must be 16-byte aligned and inclusive");
+        return;
+    }
+
+    if kind == "eeprom" && end > 0x1ffff {
+        esp_println::println!("SERDIAG ERR EEPROM byte offset out of range");
+        return;
+    }
+
+    esp_println::println!(
+        "SERDUMP BEGIN {} key=0x{:04x} start=0x{:08x} end=0x{:08x}",
+        kind,
+        key,
+        start,
+        end
+    );
+
+    let mut offset = start;
+    while offset <= end {
+        let command = if kind == "memory" {
+            DiagnosticCommand::ReadMemory16 {
+                key,
+                address: offset,
+            }
+        } else {
+            DiagnosticCommand::ReadEeprom16 {
+                key,
+                // EEPROM protocol addresses are 16-bit words on these older
+                // controllers; the serial CLI uses byte offsets for dumps.
+                address: (offset / 2) as u16,
+            }
+        };
+
+        let response = run_diag_command(command).await;
+        let Ok(text) = core::str::from_utf8(response.as_bytes()) else {
+            esp_println::println!(
+                "SERDUMP ERROR {} 0x{:08x} invalid-response-encoding",
+                kind,
+                offset
+            );
+            return;
+        };
+
+        let Some(data) = text.trim_end().split(" data=").nth(1) else {
+            esp_println::println!(
+                "SERDUMP ERROR {} 0x{:08x} {}",
+                kind,
+                offset,
+                text.trim_end()
+            );
+            return;
+        };
+
+        esp_println::println!("SERDUMP {} {:08x} {}", kind, offset, data);
+        offset += 16;
+
+        // Yield so logging/MQTT/network tasks stay responsive during a dump.
+        Timer::after(Duration::from_millis(1)).await;
+    }
+
+    esp_println::println!("SERDUMP END {}", kind);
+}
+
+async fn handle_serial_diag_line(line: &str) {
+    let mut fields = line.split_ascii_whitespace();
+
+    if fields.next() != Some("diag") {
+        return;
+    }
+
+    match fields.next() {
+        Some("help") | None => {
+            esp_println::println!(
+                "SERDIAG usage: diag id | diag mem16 KEY ADDR | \
+                 diag eeprom16 KEY WORD_ADDR | \
+                 diag dump-memory KEY START END | \
+                 diag dump-eeprom KEY BYTE_START BYTE_END"
+            );
+        }
+        Some("id") if fields.next().is_none() => {
+            serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
+        }
+        Some("mem16") => {
+            let key = fields.next().and_then(parse_diag_u16);
+            let address = fields.next().and_then(parse_diag_u32);
+
+            if let (Some(key), Some(address), None) = (key, address, fields.next()) {
+                serial_diag_print_response(
+                    &run_diag_command(DiagnosticCommand::ReadMemory16 { key, address }).await,
+                );
+            } else {
+                esp_println::println!("SERDIAG ERR usage: diag mem16 KEY ADDR");
+            }
+        }
+        Some("eeprom16") => {
+            let key = fields.next().and_then(parse_diag_u16);
+            let address = fields.next().and_then(parse_diag_u16);
+
+            if let (Some(key), Some(address), None) = (key, address, fields.next()) {
+                serial_diag_print_response(
+                    &run_diag_command(DiagnosticCommand::ReadEeprom16 { key, address }).await,
+                );
+            } else {
+                esp_println::println!("SERDIAG ERR usage: diag eeprom16 KEY WORD_ADDR");
+            }
+        }
+        Some("dump-memory") => {
+            let key = fields.next().and_then(parse_diag_u16);
+            let start = fields.next().and_then(parse_diag_u32);
+            let end = fields.next().and_then(parse_diag_u32);
+
+            if let (Some(key), Some(start), Some(end), None) = (key, start, end, fields.next()) {
+                serial_diag_dump("memory", key, start, end).await;
+            } else {
+                esp_println::println!("SERDIAG ERR usage: diag dump-memory KEY START END");
+            }
+        }
+        Some("dump-eeprom") => {
+            let key = fields.next().and_then(parse_diag_u16);
+            let start = fields.next().and_then(parse_diag_u32);
+            let end = fields.next().and_then(parse_diag_u32);
+
+            if let (Some(key), Some(start), Some(end), None) = (key, start, end, fields.next()) {
+                serial_diag_dump("eeprom", key, start, end).await;
+            } else {
+                esp_println::println!(
+                    "SERDIAG ERR usage: diag dump-eeprom KEY BYTE_START BYTE_END"
+                );
+            }
+        }
+        Some(_) => {
+            esp_println::println!("SERDIAG ERR unknown command; type: diag help");
+        }
+    }
+}
+
+#[embassy_executor::task]
+async fn serial_diag_task(mut usb_serial: UsbSerialJtag<'static, esp_hal::Blocking>) -> ! {
+    let mut line = [0_u8; 160];
+    let mut len = 0_usize;
+
+    info!("USB serial diagnostic console ready; type 'diag help'");
+
+    loop {
+        let mut received = false;
+
+        while let Ok(byte) = usb_serial.read_byte() {
+            received = true;
+
+            match byte {
+                b'\r' => {}
+                b'\n' => {
+                    if len != 0 {
+                        if let Ok(command) = core::str::from_utf8(&line[..len]) {
+                            handle_serial_diag_line(command).await;
+                        } else {
+                            esp_println::println!("SERDIAG ERR command is not UTF-8");
+                        }
+                        len = 0;
+                    }
+                }
+                0x08 | 0x7f => {
+                    len = len.saturating_sub(1);
+                }
+                byte if len < line.len() => {
+                    line[len] = byte;
+                    len += 1;
+                }
+                _ => {
+                    len = 0;
+                    esp_println::println!("SERDIAG ERR command line too long");
+                }
+            }
+        }
+
+        // read_byte() is non-blocking. Yield when the host has no data so the
+        // USB console never stalls the Embassy executor.
+        if !received {
+            Timer::after(Duration::from_millis(10)).await;
+        }
+    }
+}
+
 #[embassy_executor::task]
 async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
     if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
@@ -1596,8 +1795,7 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
         };
 
         info!("DIAG request: {command:?}");
-        DIAG_COMMANDS.send(command).await;
-        let response = DIAG_RESPONSES.receive().await;
+        let response = run_diag_command(command).await;
 
         match tcp_write_all(&mut socket, response.as_bytes()).await {
             Ok(()) => {
@@ -1831,6 +2029,7 @@ async fn main(spawner: Spawner) {
     let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
     let accelerometer = Lis2dh::new(accel_i2c);
     let flash = FlashStorage::new(peripherals.FLASH);
+    let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
     let accel_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
         init_network(peripherals.WIFI, &hostname).unwrap();
@@ -1844,6 +2043,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led).unwrap());
     spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
+    spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());
     spawner.spawn(log_server_task(net_stack).unwrap());
