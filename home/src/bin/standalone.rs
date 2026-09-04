@@ -369,6 +369,12 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
         return Ok(());
     }
 
+    // The W307 controller needs a short idle gap after the normal property poll.
+    // A trace ticker can become ready while MQTT polling owns the UART and would
+    // otherwise run immediately afterwards. Starting another command train with
+    // no quiet time has been observed to make the controller stop replying.
+    Timer::after(Duration::from_millis(250)).await;
+
     // Read access survives normal memory transactions on these older controllers.
     // Re-sending the unlock command on every trace sweep can time out even while
     // the controller is still readable, so establish access only when needed.
@@ -385,13 +391,28 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
                 trace.read_access_ready = true;
                 debug!("ID410 TRACE reusing existing read-access session");
             }
-            _ => {
+            Ok(Err(err)) => {
+                // A complete protocol response means the bus is synchronized;
+                // after a quiet interval it is safe to try a fresh unlock.
+                Timer::after(Duration::from_millis(250)).await;
                 intf.unlock_read_access(ID410_READ_KEY)
                     .with_timeout(DEVICE_TIMEOUT)
                     .await
-                    .map_err(|err| anyhow::anyhow!("read unlock timed out: {err:?}"))??;
+                    .map_err(|timeout| {
+                        anyhow::anyhow!(
+                            "read-access probe failed ({err:?}); unlock timed out: {timeout:?}"
+                        )
+                    })??;
                 trace.read_access_ready = true;
                 debug!("ID410 TRACE established read-access session");
+            }
+            Err(err) => {
+                // Never stack an unlock command directly behind a timed-out
+                // memory transaction. Retry from a clean idle period next sweep.
+                trace.read_access_ready = false;
+                return Err(anyhow::anyhow!(
+                    "RAM access probe timed out; deferring recovery to next sweep: {err:?}"
+                ));
             }
         }
     }
