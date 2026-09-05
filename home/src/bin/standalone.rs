@@ -60,7 +60,7 @@ const DEVICE_PUBLISH_INTERVAL: Duration =
 
 // Timeout for device operations (e.g. connection)
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
-const READ_KEY_CHECK_TIMEOUT: Duration = Duration::from_millis(100);
+const READ_KEY_CHECK_TIMEOUT_MS: u64 = 100;
 
 // Delay between Wi-Fi reconnection attempts
 const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -102,9 +102,20 @@ const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticCommand {
     QueryId,
-    FindReadKey { start: u16, end: u16 },
-    ReadMemory16 { key: u16, address: u32 },
-    ReadEeprom16 { key: u16, address: u16 },
+    QueryMaxBaud,
+    FindReadKey {
+        start: u16,
+        end: u16,
+        timeout_ms: u64,
+    },
+    ReadMemory16 {
+        key: u16,
+        address: u32,
+    },
+    ReadEeprom16 {
+        key: u16,
+        address: u16,
+    },
 }
 
 const DIAG_RESPONSE_CAPACITY: usize = 160;
@@ -608,8 +619,32 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::FindReadKey { start, end } => {
-            info!("DIAG scanning read-access keys 0x{start:04x}..=0x{end:04x}");
+        DiagnosticCommand::QueryMaxBaud => {
+            let mut intf = MieleInterface::new(&mut *port);
+            match intf
+                .query_max_baud_rate()
+                .with_timeout(DEVICE_TIMEOUT)
+                .await
+            {
+                Ok(Ok(rate)) => {
+                    let _ = writeln!(&mut response, "OK max_baud={}", rate.as_baud());
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR query_max_baud_rate {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR query_max_baud_rate timeout {err:?}");
+                }
+            }
+        }
+        DiagnosticCommand::FindReadKey {
+            start,
+            end,
+            timeout_ms,
+        } => {
+            info!(
+                "DIAG scanning read-access keys 0x{start:04x}..=0x{end:04x} with {timeout_ms} ms read timeout"
+            );
             netlog::set_quiet_diagnostic_scan(true);
 
             let mut intf = MieleInterface::new(&mut *port);
@@ -674,7 +709,7 @@ async fn execute_diagnostic_command(
                 // and keeps a 16-bit scan practical at 2400 baud.
                 if matches!(
                     intf.read_memory::<u8, 1>(0x0000)
-                        .with_timeout(READ_KEY_CHECK_TIMEOUT)
+                        .with_timeout(Duration::from_millis(timeout_ms))
                         .await,
                     Ok(Ok(_))
                 ) {
@@ -692,6 +727,8 @@ async fn execute_diagnostic_command(
                     "NOT_FOUND start=0x{start:04x} end=0x{end:04x}"
                 );
             }
+
+            netlog::set_quiet_diagnostic_scan(false);
         }
         DiagnosticCommand::ReadMemory16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
@@ -1550,25 +1587,37 @@ async fn handle_serial_diag_line(line: &str) {
                  diag eeprom16 KEY WORD_ADDR | \
                  diag dump-memory KEY START END | \
                  diag dump-eeprom KEY BYTE_START BYTE_END | \
-                 diag find-read-key START END | diag probe"
+                 diag find-read-key START END [TIMEOUT_MS] | diag max-baud | diag probe"
             );
         }
         Some("id") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
         }
+        Some("max-baud") if fields.next().is_none() => {
+            serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryMaxBaud).await);
+        }
         Some("find-read-key") => {
             let start = fields.next().and_then(parse_diag_u16);
             let end = fields.next().and_then(parse_diag_u16);
+            let timeout_ms = fields
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .unwrap_or(READ_KEY_CHECK_TIMEOUT_MS);
 
             if let (Some(start), Some(end), None) = (start, end, fields.next()) {
                 if start <= end {
                     esp_println::println!(
-                        "SERKEY BEGIN start=0x{:04x} end=0x{:04x} read-only",
+                        "SERKEY BEGIN start=0x{:04x} end=0x{:04x} timeout_ms={} read-only",
                         start,
-                        end
+                        end,
+                        timeout_ms
                     );
-                    let response =
-                        run_diag_command(DiagnosticCommand::FindReadKey { start, end }).await;
+                    let response = run_diag_command(DiagnosticCommand::FindReadKey {
+                        start,
+                        end,
+                        timeout_ms,
+                    })
+                    .await;
                     match core::str::from_utf8(response.as_bytes()) {
                         Ok(text) => esp_println::println!("SERKEY {}", text.trim_end()),
                         Err(_) => esp_println::println!("SERKEY ERR invalid response encoding"),
@@ -1578,7 +1627,9 @@ async fn handle_serial_diag_line(line: &str) {
                     esp_println::println!("SERDIAG ERR START must be <= END");
                 }
             } else {
-                esp_println::println!("SERDIAG ERR usage: diag find-read-key START END");
+                esp_println::println!(
+                    "SERDIAG ERR usage: diag find-read-key START END [TIMEOUT_MS]"
+                );
             }
         }
         Some("probe") if fields.next().is_none() => {
@@ -1746,15 +1797,24 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
 
         let command = match fields.next() {
             Some("id") if fields.next().is_none() => Some(DiagnosticCommand::QueryId),
+            Some("max-baud") if fields.next().is_none() => Some(DiagnosticCommand::QueryMaxBaud),
             Some("find-read-key") => {
                 let start = fields.next().and_then(parse_diag_u16);
                 let end = fields.next().and_then(parse_diag_u16);
+                let timeout_ms = fields
+                    .next()
+                    .and_then(|value| value.parse::<u64>().ok())
+                    .unwrap_or(READ_KEY_CHECK_TIMEOUT_MS);
 
                 if fields.next().is_none() {
                     start
                         .zip(end)
                         .filter(|(start, end)| start <= end)
-                        .map(|(start, end)| DiagnosticCommand::FindReadKey { start, end })
+                        .map(|(start, end)| DiagnosticCommand::FindReadKey {
+                            start,
+                            end,
+                            timeout_ms,
+                        })
                 } else {
                     None
                 }

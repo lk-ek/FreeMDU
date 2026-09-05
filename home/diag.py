@@ -75,7 +75,7 @@ def connect_with_retry(host: str, port: int) -> socket.socket:
 
 
 def request(host: str, port: int, token: str, *parts: str) -> str:
-    wire = ["FMDUDIAG1", token, *parts]
+    wire = ["FMDUDIAG1", token, *(str(part) for part in parts)]
 
     with connect_with_retry(host, port) as sock:
         sock.settimeout(None)
@@ -468,6 +468,13 @@ probe.add_argument(
 scan = sub.add_parser("find-read-key")
 scan.add_argument("start", type=number16)
 scan.add_argument("end", type=number16)
+scan.add_argument(
+    "--timeout-ms",
+    type=int,
+    default=100,
+    help="RAM-read validation timeout per candidate key (default: 100 ms)",
+)
+sub.add_parser("max-baud")
 
 mem = sub.add_parser("mem16")
 mem.add_argument("key", type=number16)
@@ -515,7 +522,19 @@ try:
             args.no_interactive,
         )
     elif args.command == "find-read-key":
-        print(request(args.host, args.port, token, "find-read-key", args.start, args.end))
+        print(
+            request(
+                args.host,
+                args.port,
+                token,
+                "find-read-key",
+                args.start,
+                args.end,
+                args.timeout_ms,
+            )
+        )
+    elif args.command == "max-baud":
+        print(request(args.host, args.port, token, "max-baud"))
     elif args.command == "mem16":
         data = read_block(
             args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0)
