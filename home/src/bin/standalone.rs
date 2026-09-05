@@ -642,80 +642,123 @@ async fn execute_diagnostic_command(
             end,
             timeout_ms,
         } => {
+            const KEY_SCAN_LINK_RETRIES: usize = 3;
+
             info!(
                 "DIAG scanning read-access keys 0x{start:04x}..=0x{end:04x} with {timeout_ms} ms read timeout"
             );
             netlog::set_quiet_diagnostic_scan(true);
 
             let mut intf = MieleInterface::new(&mut *port);
-            match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
-                Ok(Ok(id)) => info!("DIAG connected to software ID {id}"),
-                Ok(Err(err)) => {
-                    let _ = writeln!(&mut response, "ERR query_software_id {err:?}");
-                    netlog::set_quiet_diagnostic_scan(false);
-                    return response;
-                }
-                Err(err) => {
-                    let _ = writeln!(&mut response, "ERR query_software_id timeout {err:?}");
-                    netlog::set_quiet_diagnostic_scan(false);
-                    return response;
+            let mut connected_id = None;
+            for attempt in 1..=KEY_SCAN_LINK_RETRIES {
+                match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                    Ok(Ok(id)) => {
+                        connected_id = Some(id);
+                        break;
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            "DIAG read-key scan initial query failed (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                        );
+                    }
+                    Err(err) => {
+                        warn!(
+                            "DIAG read-key scan initial query timed out (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                        );
+                    }
                 }
             }
 
+            let Some(id) = connected_id else {
+                let _ = writeln!(&mut response, "ERR query_software_id transient_failure");
+                netlog::set_quiet_diagnostic_scan(false);
+                return response;
+            };
+            info!("DIAG connected to software ID {id}");
+
             let mut found = None;
 
-            for raw_key in u32::from(start)..=u32::from(end) {
+            'keys: for raw_key in u32::from(start)..=u32::from(end) {
                 let key = raw_key as u16;
 
                 if raw_key == u32::from(start) || raw_key % 0x0100 == 0 {
                     info!("DIAG read-key scan at 0x{key:04x}");
                 }
 
-                // Match FreeMDU's host-side key finder: query the software ID
-                // before every unlock attempt, then validate the key with an
-                // actual read. unlock_read_access() only transmits the key and
-                // therefore cannot by itself tell whether the appliance
-                // accepted it.
-                match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
-                    Ok(Ok(_)) => {}
-                    Ok(Err(err)) => {
-                        warn!("DIAG read-key scan query failed at 0x{key:04x}: {err:?}");
-                        continue;
+                // A NOT_FOUND range is only trustworthy if every key in it was
+                // actually tested. Retry transient protocol/checksum failures
+                // for the same key instead of silently skipping it.
+                for attempt in 1..=KEY_SCAN_LINK_RETRIES {
+                    match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                        Ok(Ok(_)) => {}
+                        Ok(Err(err)) => {
+                            warn!(
+                                "DIAG read-key scan query failed at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "DIAG read-key scan query timed out at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                            );
+                            continue;
+                        }
                     }
-                    Err(err) => {
-                        warn!("DIAG read-key scan query timed out at 0x{key:04x}: {err:?}");
-                        continue;
-                    }
-                }
 
-                match intf
-                    .unlock_read_access(key)
-                    .with_timeout(DEVICE_TIMEOUT)
-                    .await
-                {
-                    Ok(Ok(())) => {}
-                    Ok(Err(err)) => {
-                        warn!("DIAG read-key scan unlock failed at 0x{key:04x}: {err:?}");
-                        continue;
+                    match intf
+                        .unlock_read_access(key)
+                        .with_timeout(DEVICE_TIMEOUT)
+                        .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(err)) => {
+                            warn!(
+                                "DIAG read-key scan unlock failed at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                            );
+                            continue;
+                        }
+                        Err(err) => {
+                            warn!(
+                                "DIAG read-key scan unlock timed out at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                            );
+                            continue;
+                        }
                     }
-                    Err(err) => {
-                        warn!("DIAG read-key scan unlock timed out at 0x{key:04x}: {err:?}");
-                        continue;
-                    }
-                }
 
-                // Wrong keys normally make the following read stay silent.
-                // 100 ms is the timeout used by FreeMDU's examples/find_keys.rs
-                // and keeps a 16-bit scan practical at 2400 baud.
-                if matches!(
-                    intf.read_memory::<u8, 1>(0x0000)
+                    match intf
+                        .read_memory::<u8, 1>(0x0000)
                         .with_timeout(Duration::from_millis(timeout_ms))
-                        .await,
-                    Ok(Ok(_))
-                ) {
-                    found = Some(key);
-                    break;
+                        .await
+                    {
+                        Ok(Ok(_)) => {
+                            found = Some(key);
+                            break 'keys;
+                        }
+                        // Silence after a clean query+unlock is the expected
+                        // rejection behavior for a wrong key, so this key has
+                        // been conclusively tested.
+                        Err(_) => continue 'keys,
+                        // A protocol/checksum error is not evidence that the
+                        // key is wrong. Retry the complete handshake for it.
+                        Ok(Err(err)) => {
+                            warn!(
+                                "DIAG read-key scan validation failed at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
+                            );
+                            continue;
+                        }
+                    }
                 }
+
+                // Do not return NOT_FOUND for a range containing a key that
+                // could not be tested reliably. The host will retry this chunk
+                // and, importantly, will not persist it as negative.
+                let _ = writeln!(
+                    &mut response,
+                    "ERR scan_inconclusive key=0x{key:04x} transient_optical_error"
+                );
+                netlog::set_quiet_diagnostic_scan(false);
+                return response;
             }
 
             if let Some(key) = found {

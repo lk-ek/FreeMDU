@@ -209,7 +209,9 @@ def request(host: str, port: int, token: str, *parts: object) -> str:
         # optical handshake/read because the 2400-baud link is temporarily
         # busy or noisy. Treat explicit timeout replies as transient so dump
         # commands retry the same block instead of aborting the whole file.
-        if text.startswith("ERR ") and "timeout" in text.lower():
+        if text.startswith("ERR ") and (
+            "timeout" in text.lower() or text.startswith("ERR query_software_id")
+        ):
             raise DiagnosticTransientError(text)
         raise RuntimeError(text)
     return text
