@@ -60,6 +60,7 @@ const DEVICE_PUBLISH_INTERVAL: Duration =
 
 // Timeout for device operations (e.g. connection)
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
+const READ_KEY_CHECK_TIMEOUT: Duration = Duration::from_millis(100);
 
 // Delay between Wi-Fi reconnection attempts
 const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -632,16 +633,50 @@ async fn execute_diagnostic_command(
                     info!("DIAG read-key scan at 0x{key:04x}");
                 }
 
+                // Match FreeMDU's host-side key finder: query the software ID
+                // before every unlock attempt, then validate the key with an
+                // actual read. unlock_read_access() only transmits the key and
+                // therefore cannot by itself tell whether the appliance
+                // accepted it.
+                match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                    Ok(Ok(_)) => {}
+                    Ok(Err(err)) => {
+                        warn!("DIAG read-key scan query failed at 0x{key:04x}: {err:?}");
+                        continue;
+                    }
+                    Err(err) => {
+                        warn!("DIAG read-key scan query timed out at 0x{key:04x}: {err:?}");
+                        continue;
+                    }
+                }
+
                 match intf
                     .unlock_read_access(key)
                     .with_timeout(DEVICE_TIMEOUT)
                     .await
                 {
-                    Ok(Ok(())) => {
-                        found = Some(key);
-                        break;
+                    Ok(Ok(())) => {}
+                    Ok(Err(err)) => {
+                        warn!("DIAG read-key scan unlock failed at 0x{key:04x}: {err:?}");
+                        continue;
                     }
-                    Ok(Err(_)) | Err(_) => {}
+                    Err(err) => {
+                        warn!("DIAG read-key scan unlock timed out at 0x{key:04x}: {err:?}");
+                        continue;
+                    }
+                }
+
+                // Wrong keys normally make the following read stay silent.
+                // 100 ms is the timeout used by FreeMDU's examples/find_keys.rs
+                // and keeps a 16-bit scan practical at 2400 baud.
+                if matches!(
+                    intf.read_memory::<u8, 1>(0x0000)
+                        .with_timeout(READ_KEY_CHECK_TIMEOUT)
+                        .await,
+                    Ok(Ok(_))
+                ) {
+                    found = Some(key);
+                    break;
                 }
             }
 
@@ -1511,11 +1546,37 @@ async fn handle_serial_diag_line(line: &str) {
                 "SERDIAG usage: diag id | diag mem16 KEY ADDR | \
                  diag eeprom16 KEY WORD_ADDR | \
                  diag dump-memory KEY START END | \
-                 diag dump-eeprom KEY BYTE_START BYTE_END | diag probe"
+                 diag dump-eeprom KEY BYTE_START BYTE_END | \
+                 diag find-read-key START END | diag probe"
             );
         }
         Some("id") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
+        }
+        Some("find-read-key") => {
+            let start = fields.next().and_then(parse_diag_u16);
+            let end = fields.next().and_then(parse_diag_u16);
+
+            if let (Some(start), Some(end), None) = (start, end, fields.next()) {
+                if start <= end {
+                    esp_println::println!(
+                        "SERKEY BEGIN start=0x{:04x} end=0x{:04x} read-only",
+                        start,
+                        end
+                    );
+                    let response =
+                        run_diag_command(DiagnosticCommand::FindReadKey { start, end }).await;
+                    match core::str::from_utf8(response.as_bytes()) {
+                        Ok(text) => esp_println::println!("SERKEY {}", text.trim_end()),
+                        Err(_) => esp_println::println!("SERKEY ERR invalid response encoding"),
+                    }
+                    esp_println::println!("SERKEY END");
+                } else {
+                    esp_println::println!("SERDIAG ERR START must be <= END");
+                }
+            } else {
+                esp_println::println!("SERDIAG ERR usage: diag find-read-key START END");
+            }
         }
         Some("probe") if fields.next().is_none() => {
             serial_diag_probe_unknown().await;
