@@ -73,9 +73,6 @@ const OTA_TOKEN: &str = env!("OTA_TOKEN");
 const OTA_MAX_IMAGE_SIZE: usize = 0x1f0000;
 const OTA_SOCKET_TIMEOUT: Duration = Duration::from_secs(30);
 
-const LOG_PORT: u16 = freemdu_home::num_from_env!("LOG_PORT", u16);
-const LOG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
-
 const DIAG_PORT: u16 = freemdu_home::num_from_env!("DIAG_PORT", u16);
 const DIAG_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -1777,103 +1774,6 @@ fn parse_diag_u32(value: &str) -> Option<u32> {
     }
 }
 
-#[embassy_executor::task]
-async fn log_server_task(stack: Stack<'static>) -> ! {
-    if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
-        error!("Network log console disabled: set a non-default OTA_TOKEN");
-        core::future::pending::<()>().await;
-        unreachable!();
-    }
-
-    let mut rx_buffer = [0_u8; 512];
-    let mut tx_buffer = [0_u8; 1024];
-    // A line is removed from the shared backlog before the TCP write starts.
-    // Retain that in-flight line across disconnects and send it first after
-    // the next successful authentication instead of losing it.
-    let mut pending_line: Option<netlog::LogLine> = None;
-
-    loop {
-        stack.wait_config_up().await;
-
-        let mut socket = TcpSocket::new(stack, &mut rx_buffer, &mut tx_buffer);
-        socket.set_timeout(Some(LOG_AUTH_TIMEOUT));
-
-        if let Err(err) = socket.accept(LOG_PORT).await {
-            warn!("Log console accept failed: {err:?}");
-            continue;
-        }
-
-        let mut header = [0_u8; 192];
-        let mut header_len = 0_usize;
-        let mut malformed = false;
-
-        while header_len < header.len() {
-            match socket.read(&mut header[header_len..]).await {
-                Ok(0) => {
-                    malformed = true;
-                    break;
-                }
-                Ok(len) => {
-                    header_len += len;
-                    if header[..header_len].contains(&b'\n') {
-                        break;
-                    }
-                }
-                Err(_) => {
-                    malformed = true;
-                    break;
-                }
-            }
-        }
-
-        let newline = header[..header_len].iter().position(|byte| *byte == b'\n');
-        let authenticated = newline
-            .and_then(|index| core::str::from_utf8(&header[..index]).ok())
-            .is_some_and(|line| {
-                let mut fields = line.split_ascii_whitespace();
-                fields.next() == Some("FMDULOG1")
-                    && fields.next() == Some(OTA_TOKEN)
-                    && fields.next().is_none()
-            });
-
-        if malformed || !authenticated {
-            let _ = tcp_write_all(&mut socket, b"ERR invalid request or token\n").await;
-            socket.close();
-            continue;
-        }
-
-        if tcp_write_all(&mut socket, b"OK FreeMDU live logs\n")
-            .await
-            .is_err()
-        {
-            socket.abort();
-            continue;
-        }
-
-        // A live log stream may legitimately be quiet for minutes. Keep the
-        // authenticated connection open indefinitely. The host client can
-        // reconnect after Wi-Fi drops, OTA updates or reboots.
-        socket.set_timeout(None);
-        info!(
-            "Network log client connected from {:?}",
-            socket.remote_endpoint()
-        );
-
-        loop {
-            let line = match pending_line.take() {
-                Some(line) => line,
-                None => netlog::next_line().await,
-            };
-
-            if tcp_write_all(&mut socket, line.as_bytes()).await.is_err() {
-                pending_line = Some(line);
-                socket.abort();
-                break;
-            }
-        }
-    }
-}
-
 async fn tcp_write_all(
     socket: &mut TcpSocket<'_>,
     mut data: &[u8],
@@ -1994,7 +1894,6 @@ async fn main(spawner: Spawner) {
     spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());
-    spawner.spawn(log_server_task(net_stack).unwrap());
     spawner.spawn(diagnostic_server_task(net_stack).unwrap());
     spawner.spawn(bridge_server_task(net_stack).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());
