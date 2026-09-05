@@ -19,6 +19,7 @@ CHUNK_SIZE = 0x10
 CONNECT_RETRIES = 20
 CONNECT_RETRY_DELAY = 0.1
 DUMP_RETRY_DELAY = 0.5
+READ_KEY_SCAN_STATE = Path(".freemdu-read-key-scan.json")
 
 # Read-access keys used by the device implementations currently shipped in
 # FreeMDU.  The unknown-device probe only tries these known keys and performs
@@ -56,6 +57,117 @@ def number32(value: str) -> str:
     if not 0 <= parsed <= 0xFFFF_FFFF:
         raise argparse.ArgumentTypeError("value must fit in 32 bits")
     return value
+
+
+
+
+def key_range(value: str) -> tuple[int, int]:
+    """Parse an inclusive 16-bit key range such as 0x1000-0x1fff."""
+    match = re.fullmatch(r"\s*([^:-]+)\s*[:-]\s*([^:-]+)\s*", value)
+    if match is None:
+        raise argparse.ArgumentTypeError("range must be START-END or START:END")
+    try:
+        start = int(match.group(1), 0)
+        end = int(match.group(2), 0)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(f"invalid key range: {value}") from exc
+    if not 0 <= start <= 0xFFFF or not 0 <= end <= 0xFFFF:
+        raise argparse.ArgumentTypeError("range values must fit in 16 bits")
+    if start > end:
+        raise argparse.ArgumentTypeError("range start must not be greater than end")
+    return start, end
+
+
+def merge_ranges(ranges: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    merged: list[tuple[int, int]] = []
+    for start, end in sorted(ranges):
+        if not merged or start > merged[-1][1] + 1:
+            merged.append((start, end))
+        else:
+            merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+    return merged
+
+
+def subtract_ranges(
+    start: int, end: int, excluded: list[tuple[int, int]]
+) -> list[tuple[int, int]]:
+    """Return inclusive subranges not covered by excluded ranges."""
+    pending = [(start, end)]
+    for ex_start, ex_end in merge_ranges(excluded):
+        next_pending: list[tuple[int, int]] = []
+        for cur_start, cur_end in pending:
+            if ex_end < cur_start or ex_start > cur_end:
+                next_pending.append((cur_start, cur_end))
+                continue
+            if ex_start > cur_start:
+                next_pending.append((cur_start, ex_start - 1))
+            if ex_end < cur_end:
+                next_pending.append((ex_end + 1, cur_end))
+        pending = next_pending
+    return pending
+
+
+def load_read_key_scan_state(path: Path) -> dict:
+    if not path.exists():
+        return {"version": 1, "devices": {}}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"cannot read scan state {path}: {exc}") from exc
+    if not isinstance(data, dict) or data.get("version") != 1:
+        raise RuntimeError(f"unsupported scan state format in {path}")
+    if not isinstance(data.get("devices"), dict):
+        raise RuntimeError(f"invalid scan state in {path}: missing devices map")
+    return data
+
+
+def save_read_key_scan_state(path: Path, state: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    tmp.replace(path)
+
+
+def state_device_key(software_id: int) -> str:
+    return f"software_id:{software_id}"
+
+
+def get_tested_ranges(state: dict, software_id: int) -> list[tuple[int, int]]:
+    entry = state["devices"].get(state_device_key(software_id), {})
+    ranges = entry.get("negative_ranges", [])
+    result: list[tuple[int, int]] = []
+    for item in ranges:
+        if (
+            isinstance(item, list)
+            and len(item) == 2
+            and all(isinstance(value, int) for value in item)
+        ):
+            result.append((item[0], item[1]))
+    return merge_ranges(result)
+
+
+def record_negative_range(
+    path: Path, state: dict, software_id: int, start: int, end: int
+) -> None:
+    key = state_device_key(software_id)
+    entry = state["devices"].setdefault(key, {})
+    ranges = get_tested_ranges(state, software_id)
+    ranges.append((start, end))
+    entry["software_id"] = software_id
+    entry["negative_ranges"] = [[a, b] for a, b in merge_ranges(ranges)]
+    entry["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    save_read_key_scan_state(path, state)
+
+
+def record_found_key(
+    path: Path, state: dict, software_id: int, key_value: int
+) -> None:
+    key = state_device_key(software_id)
+    entry = state["devices"].setdefault(key, {})
+    entry["software_id"] = software_id
+    entry["read_key"] = key_value
+    entry["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+    save_read_key_scan_state(path, state)
 
 
 def connect_with_retry(host: str, port: int) -> socket.socket:
@@ -129,62 +241,106 @@ def scan_read_keys(
     end: int,
     timeout_ms: int,
     chunk_size: int,
+    state_path: Path,
+    explicit_excludes: list[tuple[int, int]],
 ) -> str:
-    """Scan in restartable chunks so Wi-Fi loss never skips candidate keys."""
-    current = start
+    """Scan untested keys in restartable chunks and persist negative ranges."""
+    software_id = parse_software_id(request_with_transient_retry(host, port, token, "id"))
+    state = load_read_key_scan_state(state_path)
+    persisted = get_tested_ranges(state, software_id)
 
-    while current <= end:
-        chunk_end = min(end, current + chunk_size - 1)
-        attempt = 0
+    # Ranges supplied with --exclude represent work completed in older runs, so
+    # persist them as negatives as well. This makes the next invocation resume
+    # without requiring the same command-line exclusions again.
+    for ex_start, ex_end in explicit_excludes:
+        record_negative_range(state_path, state, software_id, ex_start, ex_end)
+    persisted = get_tested_ranges(state, software_id)
 
-        while True:
-            attempt += 1
-            try:
-                print(
-                    f"scan 0x{current:04x}..0x{chunk_end:04x} "
-                    f"({timeout_ms} ms)",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                reply = request_reply(
-                    host,
-                    port,
-                    token,
-                    "find-read-key",
-                    f"0x{current:04x}",
-                    f"0x{chunk_end:04x}",
-                    timeout_ms,
-                )
-            except (OSError, DiagnosticDisconnect) as exc:
-                # The appliance-side scan may still be finishing the same
-                # chunk after the TCP connection vanished. Retrying exactly
-                # this chunk is safe and prevents gaps in the key space.
-                print(
-                    f"Wi-Fi diagnostic link lost ({exc}); retrying "
-                    f"0x{current:04x}..0x{chunk_end:04x} in 1 s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(1.0)
-                continue
+    excluded = merge_ranges(persisted + explicit_excludes)
+    pending = subtract_ranges(start, end, excluded)
 
-            if reply.startswith("OK read_key="):
-                return reply
-            if reply.startswith("NOT_FOUND "):
-                current = chunk_end + 1
-                break
-            if reply.startswith("ERR ") and "timeout" in reply.lower():
-                print(
-                    f"transient optical timeout in 0x{current:04x}.."
-                    f"0x{chunk_end:04x}; retrying chunk in 0.5 s",
-                    file=sys.stderr,
-                    flush=True,
-                )
-                time.sleep(DUMP_RETRY_DELAY)
-                continue
-            raise RuntimeError(reply)
+    skipped = sum(
+        max(0, min(end, ex_end) - max(start, ex_start) + 1)
+        for ex_start, ex_end in excluded
+        if ex_end >= start and ex_start <= end
+    )
+    if skipped:
+        print(
+            f"software ID {software_id}: skipping {skipped} previously tested key(s) "
+            f"from {state_path}",
+            file=sys.stderr,
+            flush=True,
+        )
 
-    return f"NOT_FOUND start=0x{start:04x} end=0x{end:04x}"
+    if not pending:
+        return (
+            f"NOT_FOUND start=0x{start:04x} end=0x{end:04x} "
+            f"all_tested software_id={software_id}"
+        )
+
+    for range_start, range_end in pending:
+        current = range_start
+        while current <= range_end:
+            chunk_end = min(range_end, current + chunk_size - 1)
+
+            while True:
+                try:
+                    print(
+                        f"scan 0x{current:04x}..0x{chunk_end:04x} "
+                        f"({timeout_ms} ms)",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    reply = request_reply(
+                        host,
+                        port,
+                        token,
+                        "find-read-key",
+                        f"0x{current:04x}",
+                        f"0x{chunk_end:04x}",
+                        timeout_ms,
+                    )
+                except (OSError, DiagnosticDisconnect) as exc:
+                    print(
+                        f"Wi-Fi diagnostic link lost ({exc}); retrying "
+                        f"0x{current:04x}..0x{chunk_end:04x} in 1 s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(1.0)
+                    continue
+
+                if reply.startswith("OK read_key="):
+                    match = re.search(r"\bread_key=0x([0-9a-fA-F]{1,4})\b", reply)
+                    if match is not None:
+                        record_found_key(
+                            state_path, state, software_id, int(match.group(1), 16)
+                        )
+                    return reply
+                if reply.startswith("NOT_FOUND "):
+                    # Commit only after the appliance explicitly reports that
+                    # the complete chunk was tested. A disconnect therefore
+                    # cannot incorrectly mark unfinished keys as negative.
+                    record_negative_range(
+                        state_path, state, software_id, current, chunk_end
+                    )
+                    current = chunk_end + 1
+                    break
+                if reply.startswith("ERR ") and "timeout" in reply.lower():
+                    print(
+                        f"transient optical timeout in 0x{current:04x}.."
+                        f"0x{chunk_end:04x}; retrying chunk in 0.5 s",
+                        file=sys.stderr,
+                        flush=True,
+                    )
+                    time.sleep(DUMP_RETRY_DELAY)
+                    continue
+                raise RuntimeError(reply)
+
+    return (
+        f"NOT_FOUND start=0x{start:04x} end=0x{end:04x} "
+        f"software_id={software_id}"
+    )
 
 
 def parse_software_id(reply: str) -> int:
@@ -551,6 +707,23 @@ scan.add_argument(
     default=64,
     help="keys per restartable Wi-Fi request (default: 64)",
 )
+scan.add_argument(
+    "--state-file",
+    type=Path,
+    default=READ_KEY_SCAN_STATE,
+    help=f"persistent tested-key database (default: {READ_KEY_SCAN_STATE})",
+)
+scan.add_argument(
+    "--exclude",
+    type=key_range,
+    action="append",
+    default=[],
+    metavar="START-END",
+    help=(
+        "exclude an already-tested inclusive range; may be repeated, e.g. "
+        "--exclude 0x0000-0x1fff --exclude 0x4000-0x47ff"
+    ),
+)
 sub.add_parser("max-baud")
 
 mem = sub.add_parser("mem16")
@@ -612,6 +785,8 @@ try:
                 int(args.end, 0),
                 args.timeout_ms,
                 args.chunk_size,
+                args.state_file,
+                args.exclude,
             )
         )
     elif args.command == "max-baud":
