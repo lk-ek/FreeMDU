@@ -1721,6 +1721,10 @@ async fn log_server_task(stack: Stack<'static>) -> ! {
 
     let mut rx_buffer = [0_u8; 512];
     let mut tx_buffer = [0_u8; 1024];
+    // A line is removed from the shared backlog before the TCP write starts.
+    // Retain that in-flight line across disconnects and send it first after
+    // the next successful authentication instead of losing it.
+    let mut pending_line: Option<netlog::LogLine> = None;
 
     loop {
         stack.wait_config_up().await;
@@ -1790,8 +1794,13 @@ async fn log_server_task(stack: Stack<'static>) -> ! {
         );
 
         loop {
-            let line = netlog::next_line().await;
+            let line = match pending_line.take() {
+                Some(line) => line,
+                None => netlog::next_line().await,
+            };
+
             if tcp_write_all(&mut socket, line.as_bytes()).await.is_err() {
+                pending_line = Some(line);
                 socket.abort();
                 break;
             }
