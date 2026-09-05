@@ -192,6 +192,8 @@ struct Id410Trace {
     enabled_for_device: bool,
     initialized: bool,
     snapshot_seq: u32,
+    last_state: u8,
+    last_phase: u8,
     observed_sweeps: u8,
     change_counts: [u8; ID410_TRACE_RAM_SIZE],
     shadow: [u8; ID410_TRACE_RAM_SIZE],
@@ -204,6 +206,8 @@ impl Id410Trace {
             enabled_for_device: false,
             initialized: false,
             snapshot_seq: 0,
+            last_state: 0,
+            last_phase: 0,
             observed_sweeps: 0,
             change_counts: [0; ID410_TRACE_RAM_SIZE],
             shadow: [0; ID410_TRACE_RAM_SIZE],
@@ -436,13 +440,19 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
 
     if !trace.initialized {
         trace.shadow.copy_from_slice(&current);
+        trace.last_state = state;
+        trace.last_phase = phase;
         trace.initialized = true;
         info!("ID410 TRACE baseline captured: state=0x{state:02x} phase=0x{phase:02x}");
         return Ok(());
     }
 
-    let old_state = trace.shadow[0x00cd];
-    let old_phase = trace.shadow[0x00a2];
+    // Keep transition detection independent from the RAM shadow. A failed
+    // sweep must not be able to consume a state/phase edge, even if shadow
+    // handling is changed later. These values are advanced only after a full
+    // 1 KiB sweep completed successfully.
+    let old_state = trace.last_state;
+    let old_phase = trace.last_phase;
     let state_or_phase_changed = state != old_state || phase != old_phase;
     let observed_before = trace.observed_sweeps;
     let mut changed = 0_usize;
@@ -530,7 +540,12 @@ async fn trace_id410_memory(port: &mut OpticalPort<'_>, trace: &mut Id410Trace) 
     }
     trace.observed_sweeps = observed_after;
 
+    // Commit all trace state atomically at the end of a successful sweep.
+    // Any timeout/error above returns before touching the committed state, so
+    // the next successful sweep still observes the pending transition.
     trace.shadow.copy_from_slice(&current);
+    trace.last_state = state;
+    trace.last_phase = phase;
     Ok(())
 }
 
