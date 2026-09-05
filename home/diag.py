@@ -15,6 +15,15 @@ from local_config import load_config_value
 CHUNK_SIZE = 0x10
 CONNECT_RETRIES = 20
 CONNECT_RETRY_DELAY = 0.1
+DUMP_RETRY_DELAY = 0.5
+
+
+class DiagnosticDisconnect(RuntimeError):
+    """The diagnostic TCP connection closed before a reply arrived."""
+
+
+class DiagnosticTransientError(RuntimeError):
+    """The device returned a transient diagnostic error that is safe to retry."""
 
 
 def number16(value: str) -> str:
@@ -63,10 +72,16 @@ def request(host: str, port: int, token: str, *parts: str) -> str:
         reader = sock.makefile("rb", buffering=0)
         reply = reader.readline()
         if not reply:
-            raise RuntimeError("device disconnected without a diagnostic response")
+            raise DiagnosticDisconnect("device disconnected without a diagnostic response")
 
     text = reply.decode("utf-8", errors="replace").rstrip()
     if not text.startswith("OK "):
+        # The firmware can accept the TCP request but still fail the fresh
+        # optical handshake/read because the 2400-baud link is temporarily
+        # busy or noisy. Treat explicit timeout replies as transient so dump
+        # commands retry the same block instead of aborting the whole file.
+        if text.startswith("ERR ") and "timeout" in text.lower():
+            raise DiagnosticTransientError(text)
         raise RuntimeError(text)
     return text
 
@@ -129,10 +144,31 @@ def dump_range(
             return byte_offset
 
     total = end - start + 1
-    completed = 0
 
-    with output.open("wb") as handle:
-        for byte_offset in range(start, end + 1, CHUNK_SIZE):
+    # Resume an interrupted dump from the first complete block that is not yet
+    # present in the output file. A block is flushed only after a successful
+    # response, so the file size is also the committed byte count.
+    completed = output.stat().st_size if output.exists() else 0
+    if completed > total:
+        raise RuntimeError(
+            f"existing output is larger than requested dump: {completed} > {total} bytes"
+        )
+    if completed % CHUNK_SIZE:
+        raise RuntimeError(
+            f"existing output size {completed} is not aligned to 0x{CHUNK_SIZE:x}; "
+            "refusing to append to a partial block"
+        )
+
+    if completed:
+        print(
+            f"{kind}: resuming {output} at {completed}/{total} bytes "
+            f"(byte 0x{start + completed:08x})",
+            file=sys.stderr,
+        )
+
+    with output.open("ab") as handle:
+        byte_offset = start + completed
+        while byte_offset <= end:
             address = protocol_address(byte_offset)
             print(
                 f"\r{kind}: byte 0x{byte_offset:08x} "
@@ -142,10 +178,27 @@ def dump_range(
                 file=sys.stderr,
                 flush=True,
             )
-            data = read_block(host, port, token, kind, key, address)
+
+            try:
+                data = read_block(host, port, token, kind, key, address)
+            except (OSError, DiagnosticDisconnect, DiagnosticTransientError) as exc:
+                # Every block uses a fresh TCP connection. Keep the last fully
+                # written block as the resume point and retry the same address
+                # after connection failures or transient firmware/optical
+                # timeouts. Ctrl-C can still abort; rerunning the same command
+                # resumes from disk.
+                print(
+                    f"\n{kind}: transient failure at byte 0x{byte_offset:08x}: {exc}; "
+                    f"retrying in {DUMP_RETRY_DELAY:.1f}s",
+                    file=sys.stderr,
+                )
+                time.sleep(DUMP_RETRY_DELAY)
+                continue
+
             handle.write(data)
             handle.flush()
             completed += len(data)
+            byte_offset += len(data)
 
     print(
         f"\r{kind}: done {completed} bytes -> {output}",
