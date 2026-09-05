@@ -1,7 +1,9 @@
+use core::sync::atomic::{AtomicBool, Ordering};
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 const ESP_LOG: &str = env!("ESP_LOG");
 static LOGGER: SerialLogger = SerialLogger;
+static QUIET_DIAGNOSTIC_SCAN: AtomicBool = AtomicBool::new(false);
 
 struct SerialLogger;
 
@@ -15,6 +17,12 @@ impl Log for SerialLogger {
             return;
         }
 
+        // Brute-force diagnostics perform thousands of optical transactions.
+        // Suppress Debug/Trace formatting and USB output while a scan is active.
+        if QUIET_DIAGNOSTIC_SCAN.load(Ordering::Relaxed) && record.level() > Level::Info {
+            return;
+        }
+
         // Keep diagnostics on USB Serial/JTAG only. Do not mirror log records
         // into RAM or expose a TCP log service; this keeps logging independent
         // of Wi-Fi quality and avoids a large static network-log backlog.
@@ -22,6 +30,10 @@ impl Log for SerialLogger {
     }
 
     fn flush(&self) {}
+}
+
+pub fn set_quiet_diagnostic_scan(quiet: bool) {
+    QUIET_DIAGNOSTIC_SCAN.store(quiet, Ordering::Relaxed);
 }
 
 pub fn init() {

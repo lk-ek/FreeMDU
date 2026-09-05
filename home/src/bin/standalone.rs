@@ -610,16 +610,19 @@ async fn execute_diagnostic_command(
         }
         DiagnosticCommand::FindReadKey { start, end } => {
             info!("DIAG scanning read-access keys 0x{start:04x}..=0x{end:04x}");
+            netlog::set_quiet_diagnostic_scan(true);
 
             let mut intf = MieleInterface::new(&mut *port);
             match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
                 Ok(Ok(id)) => info!("DIAG connected to software ID {id}"),
                 Ok(Err(err)) => {
                     let _ = writeln!(&mut response, "ERR query_software_id {err:?}");
+                    netlog::set_quiet_diagnostic_scan(false);
                     return response;
                 }
                 Err(err) => {
                     let _ = writeln!(&mut response, "ERR query_software_id timeout {err:?}");
+                    netlog::set_quiet_diagnostic_scan(false);
                     return response;
                 }
             }
