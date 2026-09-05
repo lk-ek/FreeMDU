@@ -9,7 +9,7 @@ const LINE_CAPACITY: usize = 256;
 // Keep important records separate from verbose DEBUG/TRACE traffic. A transient
 // Wi-Fi outage can otherwise let optical DEBUG logging evict the beginning of
 // an ID410 snapshot before the host reconnects.
-const IMPORTANT_BACKLOG_LINES: usize = 96;
+const IMPORTANT_BACKLOG_LINES: usize = 128;
 const VERBOSE_BACKLOG_LINES: usize = 16;
 
 static IMPORTANT_LOG_CHANNEL: Channel<CriticalSectionRawMutex, LogLine, IMPORTANT_BACKLOG_LINES> =

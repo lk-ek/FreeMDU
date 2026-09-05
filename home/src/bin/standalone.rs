@@ -92,6 +92,12 @@ const ID410_TRACE_BLOCK_SIZE: usize = 16;
 const ID410_TRACE_BLOCK_TIMEOUT: Duration = Duration::from_secs(2);
 const ID410_READ_KEY: u16 = 0x43ea;
 
+// Read-access keys used by the device implementations currently included in
+// FreeMDU. The generic first-contact probe only tries these known keys and
+// performs reads; it never brute-forces arbitrary keys or writes appliance
+// memory.
+const KNOWN_READ_KEYS: [u16; 4] = [0x43ea, 0x1234, 0x8542, 0xb4ee];
+
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
 
@@ -1438,6 +1444,63 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
     esp_println::println!("SERDUMP END {}", kind);
 }
 
+async fn serial_diag_probe_unknown() {
+    esp_println::println!("SERPROBE BEGIN read-only");
+
+    // Query repeatedly so a marginal optical alignment is immediately visible
+    // instead of being mistaken for an appliance/protocol mismatch.
+    for sample in 1..=3 {
+        let response = run_diag_command(DiagnosticCommand::QueryId).await;
+        match core::str::from_utf8(response.as_bytes()) {
+            Ok(text) => esp_println::println!("SERPROBE ID sample={} {}", sample, text.trim_end()),
+            Err(_) => {
+                esp_println::println!("SERPROBE ERROR invalid ID response encoding");
+                return;
+            }
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+
+    let mut selected_key = None;
+    for key in KNOWN_READ_KEYS {
+        let response = run_diag_command(DiagnosticCommand::ReadMemory16 { key, address: 0 }).await;
+
+        if response.as_bytes().starts_with(b"OK ") {
+            esp_println::println!("SERPROBE READ_KEY key=0x{:04x} result=ok", key);
+            selected_key = Some(key);
+            break;
+        }
+
+        match core::str::from_utf8(response.as_bytes()) {
+            Ok(text) => esp_println::println!(
+                "SERPROBE READ_KEY key=0x{:04x} result=failed response={}",
+                key,
+                text.trim_end()
+            ),
+            Err(_) => esp_println::println!(
+                "SERPROBE READ_KEY key=0x{:04x} result=failed invalid-response-encoding",
+                key
+            ),
+        }
+        Timer::after(Duration::from_millis(100)).await;
+    }
+
+    let Some(key) = selected_key else {
+        esp_println::println!(
+            "SERPROBE END no-known-read-key; use diag find-read-key only after reviewing the result"
+        );
+        return;
+    };
+
+    esp_println::println!(
+        "SERPROBE BASELINE key=0x{:04x} memory=0x0000..0x03ff eeprom-bytes=0x0000..0x03ff",
+        key
+    );
+    serial_diag_dump("memory", key, 0x0000, 0x03ff).await;
+    serial_diag_dump("eeprom", key, 0x0000, 0x03ff).await;
+    esp_println::println!("SERPROBE END key=0x{:04x}", key);
+}
+
 async fn handle_serial_diag_line(line: &str) {
     let mut fields = line.split_ascii_whitespace();
 
@@ -1451,11 +1514,14 @@ async fn handle_serial_diag_line(line: &str) {
                 "SERDIAG usage: diag id | diag mem16 KEY ADDR | \
                  diag eeprom16 KEY WORD_ADDR | \
                  diag dump-memory KEY START END | \
-                 diag dump-eeprom KEY BYTE_START BYTE_END"
+                 diag dump-eeprom KEY BYTE_START BYTE_END | diag probe"
             );
         }
         Some("id") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
+        }
+        Some("probe") if fields.next().is_none() => {
+            serial_diag_probe_unknown().await;
         }
         Some("mem16") => {
             let key = fields.next().and_then(parse_diag_u16);
