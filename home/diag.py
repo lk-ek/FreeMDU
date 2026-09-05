@@ -74,7 +74,8 @@ def connect_with_retry(host: str, port: int) -> socket.socket:
     raise last_error
 
 
-def request(host: str, port: int, token: str, *parts: str) -> str:
+def request_reply(host: str, port: int, token: str, *parts: object) -> str:
+    """Send one diagnostic request and return the unclassified reply line."""
     wire = ["FMDUDIAG1", token, *(str(part) for part in parts)]
 
     with connect_with_retry(host, port) as sock:
@@ -86,7 +87,11 @@ def request(host: str, port: int, token: str, *parts: str) -> str:
         if not reply:
             raise DiagnosticDisconnect("device disconnected without a diagnostic response")
 
-    text = reply.decode("utf-8", errors="replace").rstrip()
+    return reply.decode("utf-8", errors="replace").rstrip()
+
+
+def request(host: str, port: int, token: str, *parts: object) -> str:
+    text = request_reply(host, port, token, *parts)
     if not text.startswith("OK "):
         # The firmware can accept the TCP request but still fail the fresh
         # optical handshake/read because the 2400-baud link is temporarily
@@ -114,6 +119,72 @@ def request_with_transient_retry(
             time.sleep(DUMP_RETRY_DELAY)
     assert last_error is not None
     raise RuntimeError(f"transient diagnostic failure after {attempts} attempts: {last_error}")
+
+
+def scan_read_keys(
+    host: str,
+    port: int,
+    token: str,
+    start: int,
+    end: int,
+    timeout_ms: int,
+    chunk_size: int,
+) -> str:
+    """Scan in restartable chunks so Wi-Fi loss never skips candidate keys."""
+    current = start
+
+    while current <= end:
+        chunk_end = min(end, current + chunk_size - 1)
+        attempt = 0
+
+        while True:
+            attempt += 1
+            try:
+                print(
+                    f"scan 0x{current:04x}..0x{chunk_end:04x} "
+                    f"({timeout_ms} ms)",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                reply = request_reply(
+                    host,
+                    port,
+                    token,
+                    "find-read-key",
+                    f"0x{current:04x}",
+                    f"0x{chunk_end:04x}",
+                    timeout_ms,
+                )
+            except (OSError, DiagnosticDisconnect) as exc:
+                # The appliance-side scan may still be finishing the same
+                # chunk after the TCP connection vanished. Retrying exactly
+                # this chunk is safe and prevents gaps in the key space.
+                print(
+                    f"Wi-Fi diagnostic link lost ({exc}); retrying "
+                    f"0x{current:04x}..0x{chunk_end:04x} in 1 s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(1.0)
+                continue
+
+            if reply.startswith("OK read_key="):
+                return reply
+            if reply.startswith("NOT_FOUND "):
+                current = chunk_end + 1
+                break
+            if reply.startswith("ERR ") and "timeout" in reply.lower():
+                print(
+                    f"transient optical timeout in 0x{current:04x}.."
+                    f"0x{chunk_end:04x}; retrying chunk in 0.5 s",
+                    file=sys.stderr,
+                    flush=True,
+                )
+                time.sleep(DUMP_RETRY_DELAY)
+                continue
+            raise RuntimeError(reply)
+
+    return f"NOT_FOUND start=0x{start:04x} end=0x{end:04x}"
 
 
 def parse_software_id(reply: str) -> int:
@@ -474,6 +545,12 @@ scan.add_argument(
     default=100,
     help="RAM-read validation timeout per candidate key (default: 100 ms)",
 )
+scan.add_argument(
+    "--chunk-size",
+    type=int,
+    default=64,
+    help="keys per restartable Wi-Fi request (default: 64)",
+)
 sub.add_parser("max-baud")
 
 mem = sub.add_parser("mem16")
@@ -522,15 +599,19 @@ try:
             args.no_interactive,
         )
     elif args.command == "find-read-key":
+        if args.timeout_ms <= 0:
+            parser.error("--timeout-ms must be > 0")
+        if not 1 <= args.chunk_size <= 0x1000:
+            parser.error("--chunk-size must be between 1 and 4096")
         print(
-            request(
+            scan_read_keys(
                 args.host,
                 args.port,
                 token,
-                "find-read-key",
-                args.start,
-                args.end,
+                int(args.start, 0),
+                int(args.end, 0),
                 args.timeout_ms,
+                args.chunk_size,
             )
         )
     elif args.command == "max-baud":

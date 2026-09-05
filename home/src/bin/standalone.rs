@@ -1854,6 +1854,12 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
             continue;
         };
 
+        // The 10 s socket timeout is only for receiving/authenticating the
+        // request. Long-running diagnostic commands (notably read-key scans)
+        // must not be aborted merely because no TCP bytes are exchanged while
+        // the optical transaction is in progress.
+        socket.set_timeout(None);
+
         info!("DIAG request: {command:?}");
         let response = run_diag_command(command).await;
 
