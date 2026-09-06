@@ -577,8 +577,8 @@ def dump_range(
         raise RuntimeError("start must not be greater than end")
     if start % DUMP_CHUNK_SIZE:
         raise RuntimeError(f"start must be aligned to 0x{DUMP_CHUNK_SIZE:x}")
-    if (end + 1) % DUMP_CHUNK_SIZE:
-        raise RuntimeError(f"end + 1 must be aligned to 0x{DUMP_CHUNK_SIZE:x}")
+    if (end + 1) % CHUNK_SIZE:
+        raise RuntimeError(f"end + 1 must be aligned to 0x{CHUNK_SIZE:x}")
 
     # Older Miele controllers address EEPROM in 16-bit words while the read
     # length is still expressed in bytes. The dump CLI intentionally uses byte
@@ -604,9 +604,9 @@ def dump_range(
         raise RuntimeError(
             f"existing output is larger than requested dump: {completed} > {total} bytes"
         )
-    if completed % DUMP_CHUNK_SIZE:
+    if completed % CHUNK_SIZE:
         raise RuntimeError(
-            f"existing output size {completed} is not aligned to 0x{DUMP_CHUNK_SIZE:x}; "
+            f"existing output size {completed} is not aligned to 0x{CHUNK_SIZE:x}; "
             "refusing to append to a partial block"
         )
 
@@ -630,11 +630,14 @@ def dump_range(
                 flush=True,
             )
 
+            remaining = end - byte_offset + 1
+            block_size = DUMP_CHUNK_SIZE if remaining >= DUMP_CHUNK_SIZE else CHUNK_SIZE
+
             try:
-                data = read_block(host, port, token, kind, key, address, DUMP_CHUNK_SIZE)
+                data = read_block(host, port, token, kind, key, address, block_size)
             except (OSError, DiagnosticDisconnect, DiagnosticTransientError) as exc:
                 # Every block uses a fresh TCP connection. Keep the last fully
-                # written 128-byte block as the resume point and retry the same
+                # written block as the resume point and retry the same
                 # address after connection failures or transient firmware/optical
                 # timeouts. Ctrl-C can still abort; rerunning the same command
                 # resumes from disk.
