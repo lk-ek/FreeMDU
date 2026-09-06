@@ -50,14 +50,19 @@ async fn bridge_task(
 
     loop {
         match select::select(serial.read(&mut serial_buf), opt.read(&mut opt_buf)).await {
-            // Ignore all errors
+            // Never replay a failed appliance write automatically.
             Either::First(Ok(len)) => {
-                let _ = opt.write(&serial_buf[..len]).await;
+                if opt.write_all(&serial_buf[..len]).await.is_err() {
+                    let _ = opt.resynchronize().await;
+                }
 
                 LED_SIGNAL.signal(());
             }
             Either::Second(Ok(len)) => {
                 let _ = Write::write(&mut serial, &opt_buf[..len]).await;
+            }
+            Either::Second(Err(_)) => {
+                let _ = opt.resynchronize().await;
             }
             _ => {}
         }

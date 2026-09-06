@@ -1,0 +1,6 @@
+key,software_ids,source
+0x43ea,218 324 360 410 469 629 2088 2895,FreeMDU device profiles
+0x1234,605,FreeMDU device profile
+0x8542,517,FreeMDU device profile
+0xb4ee,419,FreeMDU device profile
+0x2b67,1998,https://github.com/medusalix/FreeMDU/issues/27

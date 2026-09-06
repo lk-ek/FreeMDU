@@ -6,7 +6,7 @@ use embedded_io_async::{ErrorType, Read, ReadExactError, Write};
 use esp_hal::{
     Async,
     gpio::{AnyPin, Input, InputConfig, Level, Output, OutputConfig},
-    uart::{Config, ConfigError, Instance, IoError, Parity, RxError, Uart},
+    uart::{Config, ConfigError, Instance, Parity, RxError, Uart},
 };
 
 #[macro_export]
@@ -19,45 +19,118 @@ macro_rules! num_from_env {
     };
 }
 
-pub struct OpticalPort<'a>(Uart<'a, Async>);
+#[derive(Debug)]
+pub enum OpticalError {
+    Receive(RxError),
+    Transmit,
+    EchoTimeout,
+    EmptyRead,
+    EchoMismatch,
+    NoisyLine,
+    LateInput,
+}
+
+impl core::fmt::Display for OpticalError {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "optical transport: {self:?}")
+    }
+}
+impl core::error::Error for OpticalError {}
+impl embedded_io_async::Error for OpticalError {
+    fn kind(&self) -> embedded_io_async::ErrorKind {
+        embedded_io_async::ErrorKind::Other
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct OpticalProgress {
+    pub tx: usize,
+    pub rx: usize,
+}
+
+pub struct OpticalPort<'a>(Uart<'a, Async>, OpticalProgress);
 
 impl OpticalPort<'_> {
     /// Perform one unfiltered UART read for idle optical activity debugging.
     ///
-    /// Unlike `read_raw`, this does not retry errors. A consumer can therefore
+    /// Like protocol reads, this exposes errors immediately. A consumer can
     /// see framing/parity errors caused by arbitrary IR sources such as a
     /// household remote control, which does not speak Miele's 2400-8E1 UART.
     pub async fn debug_read_activity(&mut self, buf: &mut [u8]) -> Result<usize, RxError> {
         self.0.read_async(buf).await
     }
 
-    /// Read directly from the UART, retrying transient UART errors.
-    ///
-    /// This intentionally does not emit an RX trace. It is also used for the
-    /// local optical echo consumed by `Write::write`, which must be
-    /// distinguished from bytes received from the appliance.
-    async fn read_raw(&mut self, buf: &mut [u8]) -> Result<usize, IoError> {
-        loop {
-            match self.0.read_async(buf).await {
-                Ok(0) => {
-                    log::warn!("OPT UART returned an empty read; retrying");
-                }
-                Ok(len) => return Ok(len),
-                Err(err) => {
-                    log::warn!("OPT UART read error: {err:?}; retrying");
+    #[must_use]
+    pub fn progress(&self) -> OpticalProgress {
+        self.1
+    }
+
+    /// Drain stale bytes until 30 ms of silence; bounded even with ambient IR.
+    pub async fn drain_input(&mut self) -> Result<(), OpticalError> {
+        use embassy_time::{Duration, Timer, with_timeout};
+        with_timeout(Duration::from_millis(300), async {
+            let mut buf = [0_u8; 32];
+            let mut activity = false;
+            loop {
+                match with_timeout(Duration::from_millis(30), self.0.read_async(&mut buf)).await {
+                    Err(_) => {
+                        return if activity {
+                            Err(OpticalError::LateInput)
+                        } else {
+                            Ok(())
+                        };
+                    }
+                    Ok(Ok(_)) => activity = true,
+                    Ok(Err(_)) => {
+                        activity = true;
+                        Timer::after(Duration::from_millis(1)).await;
+                    }
                 }
             }
+        })
+        .await
+        .map_err(|_| OpticalError::NoisyLine)?
+    }
+
+    /// No TX for longer than the appliance's three-second session timeout.
+    /// Drain delayed responses while waiting, then require a quiet input.
+    pub async fn resynchronize(&mut self) -> Result<(), OpticalError> {
+        use embassy_time::{Duration, Timer, with_timeout};
+        let _ = with_timeout(Duration::from_millis(3200), async {
+            let mut buf = [0_u8; 32];
+            loop {
+                let _ = self.0.read_async(&mut buf).await;
+                Timer::after(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        self.drain_input().await
+    }
+
+    async fn read_raw(&mut self, buf: &mut [u8]) -> Result<usize, OpticalError> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        match self
+            .0
+            .read_async(buf)
+            .await
+            .map_err(OpticalError::Receive)?
+        {
+            0 => Err(OpticalError::EmptyRead),
+            len => Ok(len),
         }
     }
 }
 
 impl ErrorType for OpticalPort<'_> {
-    type Error = IoError;
+    type Error = OpticalError;
 }
 
 impl Read for OpticalPort<'_> {
     async fn read(&mut self, buf: &mut [u8]) -> Result<usize, Self::Error> {
         let len = self.read_raw(buf).await?;
+        self.1.rx = self.1.rx.wrapping_add(len);
         log::debug!("OPT RX {len}B {:x?}", &buf[..len]);
         Ok(len)
     }
@@ -75,7 +148,10 @@ impl Read for OpticalPort<'_> {
 
 impl Write for OpticalPort<'_> {
     async fn write(&mut self, buf: &[u8]) -> Result<usize, Self::Error> {
-        let len = self.0.write_async(buf).await?;
+        let len = self.0.write_async(buf).await.map_err(|err| {
+            log::warn!("OPT UART write error: {err:?}");
+            OpticalError::Transmit
+        })?;
         log::debug!("OPT TX {len}B {:x?}", &buf[..len]);
 
         // The SFH7250 receiver sees our own transmitted light. FreeMDU has
@@ -91,7 +167,12 @@ impl Write for OpticalPort<'_> {
         let mut echo_ok = true;
         for (index, expected) in buf[..len].iter().copied().enumerate() {
             let mut echo = [0_u8; 1];
-            self.read_raw(&mut echo).await?;
+            embassy_time::with_timeout(
+                embassy_time::Duration::from_millis(100),
+                self.read_raw(&mut echo),
+            )
+            .await
+            .map_err(|_| OpticalError::EchoTimeout)??;
 
             if echo[0] != expected {
                 echo_ok = false;
@@ -109,13 +190,18 @@ impl Write for OpticalPort<'_> {
             log::debug!("OPT ECHO {len}B OK");
         } else {
             log::warn!("OPT ECHO {len}B completed with mismatch(es)");
+            return Err(OpticalError::EchoMismatch);
         }
 
+        self.1.tx = self.1.tx.wrapping_add(len);
         Ok(len)
     }
 
     async fn flush(&mut self) -> Result<(), Self::Error> {
-        Ok(self.0.flush_async().await?)
+        self.0
+            .flush_async()
+            .await
+            .map_err(|_| OpticalError::Transmit)
     }
 }
 
@@ -144,5 +230,5 @@ pub fn new_optical_port<'a>(uart: impl Instance + 'a) -> Result<OpticalPort<'a>,
         .with_tx(tx.into_peripheral_output().with_output_inverter(true))
         .into_async();
 
-    Ok(OpticalPort(uart))
+    Ok(OpticalPort(uart, OpticalProgress::default()))
 }

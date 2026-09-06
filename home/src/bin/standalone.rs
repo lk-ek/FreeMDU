@@ -94,7 +94,7 @@ const ID410_READ_KEY: u16 = 0x43ea;
 // FreeMDU. The generic first-contact probe only tries these known keys and
 // performs reads; it never brute-forces arbitrary keys or writes appliance
 // memory.
-const KNOWN_READ_KEYS: [u16; 4] = [0x43ea, 0x1234, 0x8542, 0xb4ee];
+use freemdu::known_read_keys::KNOWN_READ_KEYS;
 
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
@@ -194,6 +194,7 @@ enum BridgeCommand {
 #[derive(Clone, Copy)]
 enum BridgeEvent {
     Connected,
+    Disconnected,
     Data(BridgeChunk),
 }
 
@@ -298,6 +299,8 @@ async fn mqtt_message_task(
                 BRIDGE_EVENTS.send(BridgeEvent::Connected).await;
 
                 run_optical_bridge(&mut port).await;
+                BRIDGE_EVENTS.send(BridgeEvent::Disconnected).await;
+                let _ = port.resynchronize().await;
 
                 BRIDGE_ACTIVE.store(false, Ordering::Relaxed);
                 ticker.reset();
@@ -310,6 +313,9 @@ async fn mqtt_message_task(
             }
             Either::Second(Either::First(command)) => {
                 let response = execute_diagnostic_command(&mut port, command).await;
+                if response.as_bytes().starts_with(b"ERR ") {
+                    let _ = port.resynchronize().await;
+                }
                 DIAG_RESPONSES.send(response).await;
             }
             Either::Second(Either::Second(Either::First(MqttMessage::Connected))) => {
@@ -330,6 +336,7 @@ async fn mqtt_message_task(
                     && let Err(err) = trigger_action(&mut port, id, param).await
                 {
                     error!("Failed to trigger action: {err:#}");
+                    let _ = port.resynchronize().await;
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
@@ -337,6 +344,7 @@ async fn mqtt_message_task(
                     Ok(()) => AvailabilityState::Online,
                     Err(err) => {
                         error!("Failed to publish device: {err:#}");
+                        let _ = port.resynchronize().await;
 
                         AvailabilityState::Offline
                     }
@@ -349,6 +357,7 @@ async fn mqtt_message_task(
             Either::Second(Either::Second(Either::Second(Either::Second(Either::First(()))))) => {
                 if let Err(err) = trace_id410_memory(&mut port, &mut id410_trace).await {
                     warn!("ID410 TRACE sweep failed: {err:#}");
+                    let _ = port.resynchronize().await;
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(Ok(
@@ -570,7 +579,7 @@ async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
     loop {
         match select::select(BRIDGE_COMMANDS.receive(), port.read(&mut rx_buf)).await {
             Either::First(BridgeCommand::Data(chunk)) => {
-                if let Err(err) = port.write(chunk.as_bytes()).await {
+                if let Err(err) = port.write_all(chunk.as_bytes()).await {
                     warn!("Remote optical bridge TX failed: {err:?}");
                     return;
                 }
@@ -592,7 +601,8 @@ async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
                 BRIDGE_EVENTS.send(BridgeEvent::Data(chunk)).await;
             }
             Either::Second(Err(err)) => {
-                debug!("Remote optical bridge UART activity/error: {err:?}");
+                warn!("Remote optical bridge UART error: {err:?}");
+                return;
             }
         }
     }
@@ -642,137 +652,16 @@ async fn execute_diagnostic_command(
             end,
             timeout_ms,
         } => {
-            const KEY_SCAN_LINK_RETRIES: usize = 3;
-
-            info!(
-                "DIAG scanning read-access keys 0x{start:04x}..=0x{end:04x} with {timeout_ms} ms read timeout"
-            );
+            // v2 replies must never be interpreted as conclusive wrong-key proof.
+            if start > end || !(100..=2000).contains(&timeout_ms) {
+                return diagnostic_error("ERR invalid_scan_arguments");
+            }
             netlog::set_quiet_diagnostic_scan(true);
-
-            let mut intf = MieleInterface::new(&mut *port);
-            let mut connected_id = None;
-            for attempt in 1..=KEY_SCAN_LINK_RETRIES {
-                match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
-                    Ok(Ok(id)) => {
-                        connected_id = Some(id);
-                        break;
-                    }
-                    Ok(Err(err)) => {
-                        warn!(
-                            "DIAG read-key scan initial query failed (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                        );
-                    }
-                    Err(err) => {
-                        warn!(
-                            "DIAG read-key scan initial query timed out (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                        );
-                    }
-                }
-            }
-
-            let Some(id) = connected_id else {
-                let _ = writeln!(&mut response, "ERR query_software_id transient_failure");
-                netlog::set_quiet_diagnostic_scan(false);
-                return response;
-            };
-            info!("DIAG connected to software ID {id}");
-
-            let mut found = None;
-
-            'keys: for raw_key in u32::from(start)..=u32::from(end) {
-                let key = raw_key as u16;
-
-                if raw_key == u32::from(start) || raw_key % 0x0100 == 0 {
-                    info!("DIAG read-key scan at 0x{key:04x}");
-                }
-
-                // A NOT_FOUND range is only trustworthy if every key in it was
-                // actually tested. Retry transient protocol/checksum failures
-                // for the same key instead of silently skipping it.
-                for attempt in 1..=KEY_SCAN_LINK_RETRIES {
-                    match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
-                        Ok(Ok(_)) => {}
-                        Ok(Err(err)) => {
-                            warn!(
-                                "DIAG read-key scan query failed at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                            );
-                            continue;
-                        }
-                        Err(err) => {
-                            warn!(
-                                "DIAG read-key scan query timed out at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                            );
-                            continue;
-                        }
-                    }
-
-                    match intf
-                        .unlock_read_access(key)
-                        .with_timeout(DEVICE_TIMEOUT)
-                        .await
-                    {
-                        Ok(Ok(())) => {}
-                        Ok(Err(err)) => {
-                            warn!(
-                                "DIAG read-key scan unlock failed at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                            );
-                            continue;
-                        }
-                        Err(err) => {
-                            warn!(
-                                "DIAG read-key scan unlock timed out at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                            );
-                            continue;
-                        }
-                    }
-
-                    match intf
-                        .read_memory::<u8, 1>(0x0000)
-                        .with_timeout(Duration::from_millis(timeout_ms))
-                        .await
-                    {
-                        Ok(Ok(_)) => {
-                            found = Some(key);
-                            break 'keys;
-                        }
-                        // Silence after a clean query+unlock is the expected
-                        // rejection behavior for a wrong key, so this key has
-                        // been conclusively tested.
-                        Err(_) => continue 'keys,
-                        // A protocol/checksum error is not evidence that the
-                        // key is wrong. Retry the complete handshake for it.
-                        Ok(Err(err)) => {
-                            warn!(
-                                "DIAG read-key scan validation failed at 0x{key:04x} (attempt {attempt}/{KEY_SCAN_LINK_RETRIES}): {err:?}"
-                            );
-                            continue;
-                        }
-                    }
-                }
-
-                // Do not return NOT_FOUND for a range containing a key that
-                // could not be tested reliably. The host will retry this chunk
-                // and, importantly, will not persist it as negative.
-                let _ = writeln!(
-                    &mut response,
-                    "ERR scan_inconclusive key=0x{key:04x} transient_optical_error"
-                );
-                netlog::set_quiet_diagnostic_scan(false);
-                return response;
-            }
-
-            if let Some(key) = found {
-                info!("DIAG found read-access key 0x{key:04x}");
-                let _ = writeln!(&mut response, "OK read_key=0x{key:04x}");
-            } else {
-                let _ = writeln!(
-                    &mut response,
-                    "NOT_FOUND start=0x{start:04x} end=0x{end:04x}"
-                );
-            }
-
+            let result = scan_read_keys(port, start, end, timeout_ms).await;
             netlog::set_quiet_diagnostic_scan(false);
+            return result;
         }
+
         DiagnosticCommand::ReadMemory16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
 
@@ -831,6 +720,141 @@ async fn execute_diagnostic_command(
         }
     }
 
+    response
+}
+
+fn diagnostic_error(message: &str) -> DiagnosticResponse {
+    let mut response = DiagnosticResponse::new();
+    let _ = writeln!(&mut response, "{message}");
+    response
+}
+
+// One clean handshake and one read. False means no appliance bytes arrived
+// AFTER all five read-request bytes and their echoes were received correctly.
+async fn probe_read_key(
+    port: &mut OpticalPort<'_>,
+    expected_id: u16,
+    key: u16,
+    timeout_ms: u64,
+) -> Result<bool> {
+    {
+        let mut intf = MieleInterface::new(&mut *port);
+        let id = intf
+            .query_software_id()
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("diagnostic timeout"))??;
+        if id != expected_id {
+            return Err(anyhow::anyhow!("software ID changed: {id}"));
+        }
+        intf.unlock_read_access(key)
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("diagnostic timeout"))??;
+    }
+    let before = port.progress();
+    let result = {
+        let mut intf = MieleInterface::new(&mut *port);
+        intf.read_memory::<u8, 1>(0)
+            .with_timeout(Duration::from_millis(timeout_ms))
+            .await
+    };
+    match result {
+        Ok(Ok(_)) => Ok(true),
+        Ok(Err(err)) => Err(anyhow::anyhow!("read transport/protocol error: {err:?}")),
+        Err(_) => {
+            let after = port.progress();
+            if after.tx.wrapping_sub(before.tx) == 5 && after.rx == before.rx {
+                Ok(false)
+            } else {
+                Err(anyhow::anyhow!("partial read/echo timeout"))
+            }
+        }
+    }
+}
+
+async fn confirm_read_key(port: &mut OpticalPort<'_>, id: u16, key: u16) -> Result<()> {
+    // Independently relock through inactivity before EACH confirmation.
+    // Do not compare RAM values: they can legitimately change between reads.
+    for _ in 0..2 {
+        port.resynchronize().await?;
+        if !probe_read_key(port, id, key, 1000).await? {
+            return Err(anyhow::anyhow!("candidate did not confirm"));
+        }
+        let mut intf = MieleInterface::new(&mut *port);
+        let _: [u8; 16] = intf
+            .read_memory(0)
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("diagnostic timeout"))??;
+    }
+    Ok(())
+}
+
+async fn scan_read_keys(
+    port: &mut OpticalPort<'_>,
+    start: u16,
+    end: u16,
+    timeout_ms: u64,
+) -> DiagnosticResponse {
+    if port.resynchronize().await.is_err() {
+        return diagnostic_error("ERR scan_inconclusive noisy_line");
+    }
+    let id = {
+        let mut intf = MieleInterface::new(&mut *port);
+        match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+            Ok(Ok(id)) => id,
+            _ => return diagnostic_error("ERR scan_inconclusive initial_query"),
+        }
+    };
+    for key in start..=end {
+        if key == start || key % 256 == 0 {
+            info!("DIAG read-key scan at 0x{key:04x}");
+        }
+        let mut silent = 0;
+        let mut tested = false;
+        for _ in 0..3 {
+            match probe_read_key(port, id, key, timeout_ms).await {
+                Ok(true) => {
+                    if confirm_read_key(port, id, key).await.is_ok() {
+                        let mut response = DiagnosticResponse::new();
+                        let _ = writeln!(
+                            &mut response,
+                            "OK read_key=0x{key:04x} software_id={id} scan_version=2 confirmed=2"
+                        );
+                        return response;
+                    }
+                    // A failed confirmation remains inconclusive, never negative.
+                    let _ = port.resynchronize().await;
+                    return diagnostic_error("ERR scan_inconclusive confirmation_failed");
+                }
+                Ok(false) => {
+                    silent += 1;
+                    if port.drain_input().await.is_err() {
+                        return diagnostic_error("ERR scan_inconclusive noisy_line");
+                    }
+                    if silent == 2 {
+                        tested = true;
+                        break;
+                    }
+                }
+                Err(err) => {
+                    warn!("Read-key 0x{key:04x}: {err:?}");
+                    if port.resynchronize().await.is_err() {
+                        return diagnostic_error("ERR scan_inconclusive recovery_failed");
+                    }
+                }
+            }
+        }
+        if !tested {
+            return diagnostic_error("ERR scan_inconclusive transient_optical_error");
+        }
+    }
+    let mut response = DiagnosticResponse::new();
+    let _ = writeln!(
+        &mut response,
+        "NO_RESPONSE start=0x{start:04x} end=0x{end:04x} software_id={id} scan_version=2 timeout_ms={timeout_ms}"
+    );
     response
 }
 
@@ -1429,7 +1453,7 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
 
         match BRIDGE_EVENTS.receive().await {
             BridgeEvent::Connected => {}
-            BridgeEvent::Data(_) => {
+            BridgeEvent::Data(_) | BridgeEvent::Disconnected => {
                 let _ = BRIDGE_COMMANDS.try_send(BridgeCommand::Disconnect);
                 socket.abort();
                 continue;
@@ -1473,6 +1497,7 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
                     }
                 }
                 Either::Second(BridgeEvent::Connected) => {}
+                Either::Second(BridgeEvent::Disconnected) => break,
             }
         }
 
@@ -1577,7 +1602,8 @@ async fn serial_diag_probe_unknown() {
     }
 
     let mut selected_key = None;
-    for key in KNOWN_READ_KEYS {
+    for candidate in KNOWN_READ_KEYS {
+        let key = candidate.key;
         let response = run_diag_command(DiagnosticCommand::ReadMemory16 { key, address: 0 }).await;
 
         if response.as_bytes().starts_with(b"OK ") {
@@ -1642,10 +1668,9 @@ async fn handle_serial_diag_line(line: &str) {
         Some("find-read-key") => {
             let start = fields.next().and_then(parse_diag_u16);
             let end = fields.next().and_then(parse_diag_u16);
-            let timeout_ms = fields
-                .next()
-                .and_then(|value| value.parse::<u64>().ok())
-                .unwrap_or(READ_KEY_CHECK_TIMEOUT_MS);
+            let timeout_ms = fields.next().map_or(READ_KEY_CHECK_TIMEOUT_MS, |value| {
+                value.parse::<u64>().unwrap_or(0)
+            });
 
             if let (Some(start), Some(end), None) = (start, end, fields.next()) {
                 if start <= end {
@@ -1844,10 +1869,9 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
             Some("find-read-key") => {
                 let start = fields.next().and_then(parse_diag_u16);
                 let end = fields.next().and_then(parse_diag_u16);
-                let timeout_ms = fields
-                    .next()
-                    .and_then(|value| value.parse::<u64>().ok())
-                    .unwrap_or(READ_KEY_CHECK_TIMEOUT_MS);
+                let timeout_ms = fields.next().map_or(READ_KEY_CHECK_TIMEOUT_MS, |value| {
+                    value.parse::<u64>().unwrap_or(0)
+                });
 
                 if fields.next().is_none() {
                     start

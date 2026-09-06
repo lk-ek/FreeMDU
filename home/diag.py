@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 from datetime import datetime
 import json
 from pathlib import Path
@@ -24,7 +25,13 @@ READ_KEY_SCAN_STATE = Path(".freemdu-read-key-scan.json")
 # Read-access keys used by the device implementations currently shipped in
 # FreeMDU.  The unknown-device probe only tries these known keys and performs
 # read operations; it never scans arbitrary keys or sends write commands.
-KNOWN_READ_KEYS = (0x43EA, 0x1234, 0x8542, 0xB4EE)
+KEY_REGISTRY = Path(__file__).resolve().parents[1] / "protocol" / "read_keys.csv"
+with KEY_REGISTRY.open(encoding="utf-8", newline="") as registry:
+    READ_KEY_CANDIDATES = tuple(csv.DictReader(registry))
+KNOWN_READ_KEYS = tuple(int(row["key"], 0) for row in READ_KEY_CANDIDATES)
+SCAN_VERSION = 2
+SCAN_METHOD = "echo-checked-two-silent-reads-v2"
+SCAN_RETRIES = 3
 PROBE_ID_ATTEMPTS = 5
 PROBE_RAM_START = 0x0000
 PROBE_RAM_END = 0x03FF
@@ -109,15 +116,21 @@ def subtract_ranges(
 
 def load_read_key_scan_state(path: Path) -> dict:
     if not path.exists():
-        return {"version": 1, "devices": {}}
+        return {"version": 2, "devices": {}, "profiles": {}}
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, json.JSONDecodeError) as exc:
         raise RuntimeError(f"cannot read scan state {path}: {exc}") from exc
-    if not isinstance(data, dict) or data.get("version") != 1:
+    if not isinstance(data, dict) or data.get("version") not in (1, 2):
         raise RuntimeError(f"unsupported scan state format in {path}")
     if not isinstance(data.get("devices"), dict):
         raise RuntimeError(f"invalid scan state in {path}: missing devices map")
+    if data["version"] == 1:
+        # Preserve old evidence, but never reuse old negative ranges.
+        return {"version": 2, "devices": data["devices"], "profiles": {},
+                "legacy_v1": data}
+    if not isinstance(data.get("profiles"), dict):
+        raise RuntimeError(f"invalid scan state in {path}: missing profiles map")
     return data
 
 
@@ -132,41 +145,41 @@ def state_device_key(software_id: int) -> str:
     return f"software_id:{software_id}"
 
 
-def get_tested_ranges(state: dict, software_id: int) -> list[tuple[int, int]]:
-    entry = state["devices"].get(state_device_key(software_id), {})
-    ranges = entry.get("negative_ranges", [])
-    result: list[tuple[int, int]] = []
+def scan_profile(software_id: int, timeout_ms: int) -> str:
+    return f"{software_id}:{SCAN_METHOD}:{timeout_ms}ms"
+
+
+def get_tested_ranges(state: dict, profile: str) -> list[tuple[int, int]]:
+    entry = state["profiles"].get(profile, {})
+    ranges = entry.get("silent_ranges", [])
+    result = []
     for item in ranges:
-        if (
-            isinstance(item, list)
-            and len(item) == 2
-            and all(isinstance(value, int) for value in item)
-        ):
-            result.append((item[0], item[1]))
+        if not (isinstance(item, list) and len(item) == 2
+                and all(type(value) is int for value in item)
+                and 0 <= item[0] <= item[1] <= 0xffff):
+            raise RuntimeError("invalid silent range in scan state")
+        result.append(tuple(item))
     return merge_ranges(result)
 
 
-def record_negative_range(
-    path: Path, state: dict, software_id: int, start: int, end: int
-) -> None:
-    key = state_device_key(software_id)
-    entry = state["devices"].setdefault(key, {})
-    ranges = get_tested_ranges(state, software_id)
-    ranges.append((start, end))
-    entry["software_id"] = software_id
-    entry["negative_ranges"] = [[a, b] for a, b in merge_ranges(ranges)]
-    entry["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+def record_silent_range(path: Path, state: dict, software_id: int,
+                        timeout_ms: int, start: int, end: int) -> None:
+    profile = scan_profile(software_id, timeout_ms)
+    ranges = get_tested_ranges(state, profile) + [(start, end)]
+    state["profiles"][profile] = {
+        "software_id": software_id, "timeout_ms": timeout_ms,
+        "method": SCAN_METHOD, "firmware_scan_version": SCAN_VERSION,
+        "silent_ranges": [[a, b] for a, b in merge_ranges(ranges)],
+        "updated_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+    }
     save_read_key_scan_state(path, state)
 
 
-def record_found_key(
-    path: Path, state: dict, software_id: int, key_value: int
-) -> None:
-    key = state_device_key(software_id)
-    entry = state["devices"].setdefault(key, {})
-    entry["software_id"] = software_id
-    entry["read_key"] = key_value
-    entry["updated_at"] = datetime.now().astimezone().isoformat(timespec="seconds")
+def record_found_key(path: Path, state: dict, software_id: int, key_value: int) -> None:
+    entry = state["devices"].setdefault(state_device_key(software_id), {})
+    entry.update(software_id=software_id, read_key=key_value,
+                 confirmations=2, firmware_scan_version=SCAN_VERSION,
+                 updated_at=datetime.now().astimezone().isoformat(timespec="seconds"))
     save_read_key_scan_state(path, state)
 
 
@@ -236,113 +249,79 @@ def request_with_transient_retry(
 
 
 def scan_read_keys(
-    host: str,
-    port: int,
-    token: str,
-    start: int,
-    end: int,
-    timeout_ms: int,
-    chunk_size: int,
-    state_path: Path,
-    explicit_excludes: list[tuple[int, int]],
+    host: str, port: int, token: str, start: int, end: int,
+    timeout_ms: int, chunk_size: int, state_path: Path,
+    explicit_excludes: list[tuple[int, int]], recheck: bool = False,
 ) -> str:
-    """Scan untested keys in restartable chunks and persist negative ranges."""
+    """Resume observations under identical settings; silence is not key proof."""
+    if not (0 <= start <= end <= 0xffff and 100 <= timeout_ms <= 2000
+            and 1 <= chunk_size <= 4096):
+        raise RuntimeError("invalid scan range, timeout (100..2000 ms), or chunk size")
     software_id = parse_software_id(request_with_transient_retry(host, port, token, "id"))
     state = load_read_key_scan_state(state_path)
-    persisted = get_tested_ranges(state, software_id)
+    profile = scan_profile(software_id, timeout_ms)
+    observed = [] if recheck else get_tested_ranges(state, profile)
 
-    # Ranges supplied with --exclude represent work completed in older runs, so
-    # persist them as negatives as well. This makes the next invocation resume
-    # without requiring the same command-line exclusions again.
-    for ex_start, ex_end in explicit_excludes:
-        record_negative_range(state_path, state, software_id, ex_start, ex_end)
-    persisted = get_tested_ranges(state, software_id)
-
-    excluded = merge_ranges(persisted + explicit_excludes)
-    pending = subtract_ranges(start, end, excluded)
-
-    skipped = sum(
-        max(0, min(end, ex_end) - max(start, ex_start) + 1)
-        for ex_start, ex_end in excluded
-        if ex_end >= start and ex_start <= end
-    )
-    if skipped:
-        print(
-            f"software ID {software_id}: skipping {skipped} previously tested key(s) "
-            f"from {state_path}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    if not pending:
-        return (
-            f"NOT_FOUND start=0x{start:04x} end=0x{end:04x} "
-            f"all_tested software_id={software_id}"
-        )
-
-    for range_start, range_end in pending:
-        current = range_start
-        while current <= range_end:
-            chunk_end = min(range_end, current + chunk_size - 1)
-
-            while True:
+    def scan_chunk(first: int, last: int) -> str:
+        for attempt in range(SCAN_RETRIES):
+            try:
+                reply = request_reply(host, port, token, "find-read-key",
+                                      f"0x{first:04x}", f"0x{last:04x}", timeout_ms)
+                if reply.startswith("ERR scan_inconclusive") or (
+                    reply.startswith("ERR ") and "timeout" in reply.lower()
+                ):
+                    raise DiagnosticTransientError(reply)
+            except (OSError, DiagnosticDisconnect, DiagnosticTransientError) as exc:
+                if attempt + 1 == SCAN_RETRIES:
+                    raise RuntimeError(f"scan incomplete; range not saved: {exc}") from exc
+                print(f"retry {attempt + 1}/{SCAN_RETRIES}: {exc}", file=sys.stderr)
+                time.sleep(DUMP_RETRY_DELAY)
+                continue
+            fields = dict(re.findall(r"([a-z_]+)=([^ ]+)", reply))
+            if (fields.get("scan_version") != "2"
+                    or fields.get("software_id") != str(software_id)):
+                raise RuntimeError(f"scan version/device mismatch; update firmware: {reply}")
+            if reply.startswith("OK read_key="):
                 try:
-                    print(
-                        f"scan 0x{current:04x}..0x{chunk_end:04x} "
-                        f"({timeout_ms} ms)",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    reply = request_reply(
-                        host,
-                        port,
-                        token,
-                        "find-read-key",
-                        f"0x{current:04x}",
-                        f"0x{chunk_end:04x}",
-                        timeout_ms,
-                    )
-                except (OSError, DiagnosticDisconnect) as exc:
-                    print(
-                        f"Wi-Fi diagnostic link lost ({exc}); retrying "
-                        f"0x{current:04x}..0x{chunk_end:04x} in 1 s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    time.sleep(1.0)
-                    continue
+                    key = int(fields["read_key"], 0)
+                except (ValueError, KeyError) as exc:
+                    raise RuntimeError(f"malformed key reply: {reply}") from exc
+                if not first <= key <= last or fields.get("confirmed") != "2":
+                    raise RuntimeError(f"unconfirmed/out-of-range key: {reply}")
+                record_found_key(state_path, state, software_id, key)
+                return reply
+            if (reply.startswith("NO_RESPONSE ")
+                    and fields.get("start") == f"0x{first:04x}"
+                    and fields.get("end") == f"0x{last:04x}"
+                    and fields.get("timeout_ms") == str(timeout_ms)):
+                record_silent_range(state_path, state, software_id, timeout_ms, first, last)
+                return reply
+            raise RuntimeError(f"unexpected scan reply; range not saved: {reply}")
+        raise AssertionError("unreachable")
 
-                if reply.startswith("OK read_key="):
-                    match = re.search(r"\bread_key=0x([0-9a-fA-F]{1,4})\b", reply)
-                    if match is not None:
-                        record_found_key(
-                            state_path, state, software_id, int(match.group(1), 16)
-                        )
-                    return reply
-                if reply.startswith("NOT_FOUND "):
-                    # Commit only after the appliance explicitly reports that
-                    # the complete chunk was tested. A disconnect therefore
-                    # cannot incorrectly mark unfinished keys as negative.
-                    record_negative_range(
-                        state_path, state, software_id, current, chunk_end
-                    )
-                    current = chunk_end + 1
-                    break
-                if reply.startswith("ERR ") and "timeout" in reply.lower():
-                    print(
-                        f"transient optical timeout in 0x{current:04x}.."
-                        f"0x{chunk_end:04x}; retrying chunk in 0.5 s",
-                        file=sys.stderr,
-                        flush=True,
-                    )
-                    time.sleep(DUMP_RETRY_DELAY)
-                    continue
-                raise RuntimeError(reply)
+    # Saved positives and known keys are always revalidated, even if a previous
+    # run recorded silence. Explicit user exclusions are invocation-local only.
+    saved = state["devices"].get(state_device_key(software_id), {}).get("read_key")
+    candidates = list(dict.fromkeys(([saved] if type(saved) is int else []) + list(KNOWN_READ_KEYS)))
+    for key in candidates:
+        if start <= key <= end and subtract_ranges(key, key, explicit_excludes):
+            print(f"checking known/saved candidate 0x{key:04x}", file=sys.stderr)
+            reply = scan_chunk(key, key)
+            if reply.startswith("OK "):
+                return reply
+            observed.append((key, key))
 
-    return (
-        f"NOT_FOUND start=0x{start:04x} end=0x{end:04x} "
-        f"software_id={software_id}"
-    )
+    pending = subtract_ranges(start, end, observed + explicit_excludes)
+    for first, last in pending:
+        for current in range(first, last + 1, chunk_size):
+            chunk_end = min(last, current + chunk_size - 1)
+            print(f"scan 0x{current:04x}..0x{chunk_end:04x} ({timeout_ms} ms)",
+                  file=sys.stderr, flush=True)
+            reply = scan_chunk(current, chunk_end)
+            if reply.startswith("OK "):
+                return reply
+    return (f"NO_KEY_CONFIRMED software_id={software_id} "
+            "silence_is_not_proof; use --recheck or a larger --timeout-ms to repeat")
 
 
 def parse_software_id(reply: str) -> int:
@@ -545,6 +524,9 @@ def read_block(host: str, port: int, token: str, kind: str, key: int, address: i
         f"0x{address:0{width}x}",
     )
 
+    expected = f"OK kind={kind} address=0x{address:0{width}x} data="
+    if not reply.startswith(expected):
+        raise RuntimeError(f"response kind/address mismatch: {reply}")
     marker = " data="
     if marker not in reply:
         raise RuntimeError(f"malformed response: {reply}")
@@ -669,153 +651,161 @@ def dump_range(
     )
 
 
-parser = argparse.ArgumentParser(description="FreeMDU read-only diagnostic client")
-parser.add_argument("host")
-parser.add_argument("--port", type=int, default=3234)
-parser.add_argument("--token", help="override OTA_TOKEN from .cargo/local.toml")
+def main() -> None:
+    parser = argparse.ArgumentParser(description="FreeMDU read-only diagnostic client")
+    parser.add_argument("host")
+    parser.add_argument("--port", type=int, default=3234)
+    parser.add_argument("--token", help="override OTA_TOKEN from .cargo/local.toml")
 
-sub = parser.add_subparsers(dest="command", required=True)
-sub.add_parser("id")
+    sub = parser.add_subparsers(dest="command", required=True)
+    sub.add_parser("id")
 
-probe = sub.add_parser(
-    "probe-unknown",
-    help="read-only first-contact probe for an unsupported Miele appliance",
-)
-probe.add_argument("output_dir", type=Path)
-probe.add_argument(
-    "--eeprom-end",
-    type=number32,
-    default="0x03ff",
-    help="inclusive EEPROM byte offset for baseline capture",
-)
-probe.add_argument("--skip-eeprom", action="store_true")
-probe.add_argument(
-    "--no-interactive", action="store_true",
-    help="stop after ID/key/RAM/EEPROM baseline instead of prompting for state captures",
-)
-
-scan = sub.add_parser("find-read-key")
-scan.add_argument("start", type=number16)
-scan.add_argument("end", type=number16)
-scan.add_argument(
-    "--timeout-ms",
-    type=int,
-    default=100,
-    help="RAM-read validation timeout per candidate key (default: 100 ms)",
-)
-scan.add_argument(
-    "--chunk-size",
-    type=int,
-    default=64,
-    help="keys per restartable Wi-Fi request (default: 64)",
-)
-scan.add_argument(
-    "--state-file",
-    type=Path,
-    default=READ_KEY_SCAN_STATE,
-    help=f"persistent tested-key database (default: {READ_KEY_SCAN_STATE})",
-)
-scan.add_argument(
-    "--exclude",
-    type=key_range,
-    action="append",
-    default=[],
-    metavar="START-END",
-    help=(
-        "exclude an already-tested inclusive range; may be repeated, e.g. "
-        "--exclude 0x0000-0x1fff --exclude 0x4000-0x47ff"
-    ),
-)
-sub.add_parser("max-baud")
-
-mem = sub.add_parser("mem16")
-mem.add_argument("key", type=number16)
-mem.add_argument("address", type=number32)
-
-eeprom = sub.add_parser("eeprom16")
-eeprom.add_argument("key", type=number16)
-eeprom.add_argument("address", type=number16)
-
-dump_mem = sub.add_parser("dump-memory")
-dump_mem.add_argument("output", type=Path)
-dump_mem.add_argument("--key", type=number16, default="0x0000")
-dump_mem.add_argument("--start", type=number32, required=True)
-dump_mem.add_argument("--end", type=number32, required=True)
-
-dump_eeprom = sub.add_parser(
-    "dump-eeprom",
-    help="dump a contiguous EEPROM byte range (old devices use word addresses on wire)",
-)
-dump_eeprom.add_argument("output", type=Path)
-dump_eeprom.add_argument("--key", type=number16, default="0x0000")
-dump_eeprom.add_argument("--start", type=number32, default="0x0000", help="byte offset")
-dump_eeprom.add_argument("--end", type=number32, required=True, help="inclusive byte offset")
-
-args = parser.parse_args()
-
-try:
-    token = args.token or load_config_value("OTA_TOKEN")
-except RuntimeError as exc:
-    parser.error(str(exc))
-
-if not token or token == "change-me":
-    parser.error(
-        "OTA_TOKEN is unset/default; define it in .cargo/local.toml "
-        "or pass --token"
+    probe = sub.add_parser(
+        "probe-unknown",
+        help="read-only first-contact probe for an unsupported Miele appliance",
+    )
+    probe.add_argument("output_dir", type=Path)
+    probe.add_argument(
+        "--eeprom-end",
+        type=number32,
+        default="0x03ff",
+        help="inclusive EEPROM byte offset for baseline capture",
+    )
+    probe.add_argument("--skip-eeprom", action="store_true")
+    probe.add_argument(
+        "--no-interactive", action="store_true",
+        help="stop after ID/key/RAM/EEPROM baseline instead of prompting for state captures",
     )
 
-try:
-    if args.command == "id":
-        print(request(args.host, args.port, token, "id"))
-    elif args.command == "probe-unknown":
-        probe_unknown_device(
-            args.host, args.port, token, args.output_dir,
-            -1 if args.skip_eeprom else int(args.eeprom_end, 0),
-            args.no_interactive,
+    scan = sub.add_parser("find-read-key")
+    scan.add_argument("start", type=number16)
+    scan.add_argument("end", type=number16)
+    scan.add_argument(
+        "--timeout-ms",
+        type=int,
+        default=100,
+        help="RAM-read validation timeout per candidate key (default: 100 ms)",
+    )
+    scan.add_argument(
+        "--chunk-size",
+        type=int,
+        default=64,
+        help="keys per restartable Wi-Fi request (default: 64)",
+    )
+    scan.add_argument(
+        "--state-file",
+        type=Path,
+        default=READ_KEY_SCAN_STATE,
+        help=f"persistent tested-key database (default: {READ_KEY_SCAN_STATE})",
+    )
+    scan.add_argument(
+        "--exclude",
+        type=key_range,
+        action="append",
+        default=[],
+        metavar="START-END",
+        help=(
+            "skip a range for this invocation only (not stored); may be repeated, e.g. "
+            "--exclude 0x0000-0x1fff --exclude 0x4000-0x47ff"
+        ),
+    )
+    scan.add_argument("--recheck", action="store_true",
+                      help="repeat previously silent ranges under the same settings")
+    sub.add_parser("max-baud")
+
+    mem = sub.add_parser("mem16")
+    mem.add_argument("key", type=number16)
+    mem.add_argument("address", type=number32)
+
+    eeprom = sub.add_parser("eeprom16")
+    eeprom.add_argument("key", type=number16)
+    eeprom.add_argument("address", type=number16)
+
+    dump_mem = sub.add_parser("dump-memory")
+    dump_mem.add_argument("output", type=Path)
+    dump_mem.add_argument("--key", type=number16, default="0x0000")
+    dump_mem.add_argument("--start", type=number32, required=True)
+    dump_mem.add_argument("--end", type=number32, required=True)
+
+    dump_eeprom = sub.add_parser(
+        "dump-eeprom",
+        help="dump a contiguous EEPROM byte range (old devices use word addresses on wire)",
+    )
+    dump_eeprom.add_argument("output", type=Path)
+    dump_eeprom.add_argument("--key", type=number16, default="0x0000")
+    dump_eeprom.add_argument("--start", type=number32, default="0x0000", help="byte offset")
+    dump_eeprom.add_argument("--end", type=number32, required=True, help="inclusive byte offset")
+
+    args = parser.parse_args()
+
+    try:
+        token = args.token or load_config_value("OTA_TOKEN")
+    except RuntimeError as exc:
+        parser.error(str(exc))
+
+    if not token or token == "change-me":
+        parser.error(
+            "OTA_TOKEN is unset/default; define it in .cargo/local.toml "
+            "or pass --token"
         )
-    elif args.command == "find-read-key":
-        if args.timeout_ms <= 0:
-            parser.error("--timeout-ms must be > 0")
-        if not 1 <= args.chunk_size <= 0x1000:
-            parser.error("--chunk-size must be between 1 and 4096")
-        print(
-            scan_read_keys(
-                args.host,
-                args.port,
-                token,
-                int(args.start, 0),
-                int(args.end, 0),
-                args.timeout_ms,
-                args.chunk_size,
-                args.state_file,
-                args.exclude,
+
+    try:
+        if args.command == "id":
+            print(request(args.host, args.port, token, "id"))
+        elif args.command == "probe-unknown":
+            probe_unknown_device(
+                args.host, args.port, token, args.output_dir,
+                -1 if args.skip_eeprom else int(args.eeprom_end, 0),
+                args.no_interactive,
             )
-        )
-    elif args.command == "max-baud":
-        print(request(args.host, args.port, token, "max-baud"))
-    elif args.command == "mem16":
-        data = read_block(
-            args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0)
-        )
-        print(data.hex())
-    elif args.command == "eeprom16":
-        address = int(args.address, 0)
-        if address > 0xFFF0:
-            parser.error("eeprom16 address must be <= 0xfff0")
-        data = read_block(
-            args.host, args.port, token, "eeprom", int(args.key, 0), address
-        )
-        print(data.hex())
-    elif args.command == "dump-memory":
-        dump_range(
-            args.host, args.port, token, "memory", int(args.key, 0),
-            int(args.start, 0), int(args.end, 0), args.output,
-        )
-    elif args.command == "dump-eeprom":
-        dump_range(
-            args.host, args.port, token, "eeprom", int(args.key, 0),
-            int(args.start, 0), int(args.end, 0), args.output,
-        )
-except (OSError, RuntimeError) as exc:
-    print(f"error: {exc}", file=sys.stderr)
-    raise SystemExit(1)
+        elif args.command == "find-read-key":
+            if not 100 <= args.timeout_ms <= 2000:
+                parser.error("--timeout-ms must be between 100 and 2000")
+            if not 1 <= args.chunk_size <= 0x1000:
+                parser.error("--chunk-size must be between 1 and 4096")
+            print(
+                scan_read_keys(
+                    args.host,
+                    args.port,
+                    token,
+                    int(args.start, 0),
+                    int(args.end, 0),
+                    args.timeout_ms,
+                    args.chunk_size,
+                    args.state_file,
+                    args.exclude,
+                    args.recheck,
+                )
+            )
+        elif args.command == "max-baud":
+            print(request(args.host, args.port, token, "max-baud"))
+        elif args.command == "mem16":
+            data = read_block(
+                args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0)
+            )
+            print(data.hex())
+        elif args.command == "eeprom16":
+            address = int(args.address, 0)
+            if address > 0xFFF0:
+                parser.error("eeprom16 address must be <= 0xfff0")
+            data = read_block(
+                args.host, args.port, token, "eeprom", int(args.key, 0), address
+            )
+            print(data.hex())
+        elif args.command == "dump-memory":
+            dump_range(
+                args.host, args.port, token, "memory", int(args.key, 0),
+                int(args.start, 0), int(args.end, 0), args.output,
+            )
+        elif args.command == "dump-eeprom":
+            dump_range(
+                args.host, args.port, token, "eeprom", int(args.key, 0),
+                int(args.start, 0), int(args.end, 0), args.output,
+            )
+    except (OSError, RuntimeError) as exc:
+        print(f"error: {exc}", file=sys.stderr)
+        raise SystemExit(1)
+
+
+if __name__ == "__main__":
+    main()

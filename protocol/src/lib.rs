@@ -138,6 +138,7 @@
 extern crate alloc;
 
 pub mod device;
+pub mod known_read_keys;
 
 #[cfg(feature = "native-serial")]
 #[cfg_attr(docsrs, doc(cfg(feature = "native-serial")))]

@@ -71,3 +71,47 @@ freemdu_home/b43a45abcdef/start_program/trigger
 ```
 
 Some actions require parameters, in which case the published value is used as the argument. Actions without parameters ignore the published value. Due to technical limitations, actions requiring parameters are currently not displayed in Home Assistant, but can still be triggered via MQTT.
+
+## Reliable read-key scan (scanner v2)
+
+Update the ESP firmware and `diag.py` together. The client rejects old scanner
+replies rather than saving unverified results. No full-access key is requested
+and no appliance memory is written by this scan.
+
+```sh
+python diag.py DEVICE_HOST find-read-key 0x0000 0xffff
+python diag.py DEVICE_HOST find-read-key 0x0000 0xffff --timeout-ms 300
+python diag.py DEVICE_HOST find-read-key 0x0000 0xffff --recheck
+python -m unittest discover -s tests -v
+```
+
+The scanner forwards UART and echo errors, drains stale input and allows at
+least 3.2 seconds without transmission after broken transactions. Each candidate
+needs two clean handshakes followed by silence before recording `NO_RESPONSE`.
+Partial responses, failed echoes and late bytes remain inconclusive. A hit is
+confirmed twice after separate inactivity resets, using a one-byte read and a
+16-byte checksum-validated RAM read at address zero. RAM values need not match
+between confirmations. This assumes a device supporting reads at address zero;
+a different memory map requires adapting the probe, not excluding every key.
+
+The v2 state file records silent ranges under the software ID, scanner revision,
+method and timeout. Silence is an observation, not proof of an incorrect key.
+Old v1 negative ranges are preserved as legacy evidence but are not reused.
+Changing the timeout or passing `--recheck` repeats previous observations.
+`--exclude` only skips ranges for the current invocation and is not persisted as
+evidence. Known and saved candidates inside the requested range are checked
+first, including during resume. Run only one scan client per state file.
+
+This conservative scan is slower: two probes plus quiet checks take roughly
+8.4 hours for all 65536 keys at the default 100 ms timeout, including initial
+recovery for 64-key chunks but excluding additional retries and device delays.
+Use bounded ranges to limit the time MQTT polling is suspended. An interrupted
+chunk is repeated; completed chunks resume from the state file. After three
+inconclusive chunk attempts the client stops without recording that chunk.
+
+`../protocol/read_keys.csv` is the shared source for Python and the generated
+Rust registry. Each row records a key, reported software IDs and provenance.
+The additional `0x2b67` candidate is reported for ID1998 in upstream issue #27;
+it is not a confirmed T4223C key. When changing scanner semantics, bump the
+firmware scan revision and the Python method/profile version together so old
+observations cannot silently exclude candidates.
