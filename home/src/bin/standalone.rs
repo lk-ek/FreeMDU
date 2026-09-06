@@ -894,6 +894,13 @@ async fn execute_diagnostic_command(
 
             let mut data = [0u8; 0x80];
             for block in 0..8 {
+                if block == 4 {
+                    if let Err(err) = prepare_read_access(&mut intf, key).await {
+                        let _ = writeln!(&mut response, "{err}");
+                        return response;
+                    }
+                }
+
                 let block_address = address + block as u32 * 0x10;
                 match intf
                     .read_memory(block_address)
@@ -971,6 +978,13 @@ async fn execute_diagnostic_command(
 
             let mut data = [0u8; 0x80];
             for block in 0..8 {
+                if block == 4 {
+                    if let Err(err) = prepare_read_access(&mut intf, key).await {
+                        let _ = writeln!(&mut response, "{err}");
+                        return response;
+                    }
+                }
+
                 let block_address = address + block as u16 * 0x08;
                 match intf
                     .read_eeprom(block_address)
