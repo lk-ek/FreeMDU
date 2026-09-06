@@ -971,6 +971,12 @@ async fn execute_diagnostic_command(
         DiagnosticCommand::ReadEeprom128 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
 
+            let address_unit = match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(498)) => 1,
+                Ok(Ok(_)) => 2,
+                _ => return diagnostic_error("ERR query_software_id failed"),
+            };
+
             if let Err(err) = prepare_read_access(&mut intf, key).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
@@ -985,7 +991,7 @@ async fn execute_diagnostic_command(
                     }
                 }
 
-                let block_address = address + block as u16 * 0x08;
+                let block_address = address + block as u16 * (0x10 / address_unit);
                 match intf
                     .read_eeprom(block_address)
                     .with_timeout(DEVICE_TIMEOUT)
@@ -1878,7 +1884,28 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
         return;
     }
 
-    if kind == "eeprom" && end > 0x1ffff {
+    let mut address_unit = 2;
+    if kind == "eeprom" {
+        let reply = run_diag_command(DiagnosticCommand::QueryId).await;
+        let id = core::str::from_utf8(reply.as_bytes())
+            .ok()
+            .and_then(|text| {
+                text.strip_prefix("OK software_id=")?
+                    .split_whitespace()
+                    .next()?
+                    .parse::<u16>()
+                    .ok()
+            });
+        match id {
+            Some(498) => address_unit = 1,
+            Some(_) => (),
+            None => {
+                esp_println::println!("SERDIAG ERR query_software_id failed");
+                return;
+            }
+        }
+    }
+    if kind == "eeprom" && end > 0x10000 * address_unit - 1 {
         esp_println::println!("SERDIAG ERR EEPROM byte offset out of range");
         return;
     }
@@ -1901,9 +1928,8 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
         } else {
             DiagnosticCommand::ReadEeprom16 {
                 key,
-                // EEPROM protocol addresses are 16-bit words on these older
-                // controllers; the serial CLI uses byte offsets for dumps.
-                address: (offset / 2) as u16,
+                // The serial CLI uses byte offsets; ID498 is byte-addressed.
+                address: (offset / address_unit) as u16,
             }
         };
 

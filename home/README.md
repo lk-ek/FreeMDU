@@ -175,3 +175,14 @@ ring wrap, reboot resume, adaptive timeouts, partition boundaries and migration.
 The two independent read-key confirmations remain checksum-validated reads after
 fresh inactivity resets; this functionality does not request full access or
 write appliance memory. The shared registry is `../protocol/read_keys.csv`.
+
+### ID498 EEPROM addressing
+
+ID498 (T4223C, read key `0x2b2c`) uses byte-addressed EEPROM: incrementing
+an `eeprom16` address by one shifts the response by one byte. Other IDs retain
+the existing word-addressed dump behavior. Raw `eeprom16` addresses remain wire
+addresses. Both dump CLIs accept byte offsets.
+
+Start a NEW output file after this fix; do not resume an old ID498 EEPROM dump,
+which contains overlapping blocks. Python uses 16-byte reads for ID498 so it
+also works with older firmware; firmware `eeprom128` now uses the correct stride.

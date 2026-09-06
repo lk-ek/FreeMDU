@@ -580,16 +580,24 @@ def dump_range(
     if (end + 1) % CHUNK_SIZE:
         raise RuntimeError(f"end + 1 must be aligned to 0x{CHUNK_SIZE:x}")
 
+    # ID498 is experimentally confirmed to use byte addresses.
+    software_id = None
+    if kind == "eeprom":
+        software_id = parse_software_id(
+            request_with_transient_retry(host, port, token, "id")
+        )
+    address_unit = 1 if software_id == 498 else 2
+
     # Older Miele controllers address EEPROM in 16-bit words while the read
     # length is still expressed in bytes. The dump CLI intentionally uses byte
     # offsets, so a contiguous block advances the protocol address by half the
     # byte count.
     if kind == "eeprom":
-        if end > 0x1FFFF:
+        if end > 0xFFFF * address_unit + address_unit - 1:
             raise RuntimeError("EEPROM byte end offset is out of range")
 
         def protocol_address(byte_offset: int) -> int:
-            return byte_offset // 2
+            return byte_offset // address_unit
     else:
         def protocol_address(byte_offset: int) -> int:
             return byte_offset
@@ -632,6 +640,9 @@ def dump_range(
 
             remaining = end - byte_offset + 1
             block_size = DUMP_CHUNK_SIZE if remaining >= DUMP_CHUNK_SIZE else CHUNK_SIZE
+            if kind == "eeprom" and software_id == 498:
+                # Compatible with firmware whose eeprom128 still uses word strides.
+                block_size = CHUNK_SIZE
 
             try:
                 data = read_block(host, port, token, kind, key, address, block_size)
