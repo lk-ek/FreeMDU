@@ -14,7 +14,7 @@ use alloc::{
 use anyhow::{Context, Result};
 use core::{
     fmt::Write,
-    sync::atomic::{AtomicBool, Ordering},
+    sync::atomic::{AtomicBool, AtomicU32, Ordering},
 };
 
 use freemdu::embedded_io_async::Read;
@@ -43,6 +43,8 @@ use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Va
 use freemdu_home::{
     OpticalPort,
     accelerometer::{Lis2dh, Metrics, WindowStats},
+    keyscan::{Journal, Phase as ScanPhase, State as ScanState},
+    shared_flash::{FlashMutex, SharedFlash},
 };
 use log::{debug, error, info, warn};
 use mcutie::{
@@ -60,7 +62,6 @@ const DEVICE_PUBLISH_INTERVAL: Duration =
 
 // Timeout for device operations (e.g. connection)
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
-const READ_KEY_CHECK_TIMEOUT_MS: u64 = 100;
 
 // Delay between Wi-Fi reconnection attempts
 const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -103,10 +104,16 @@ const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
 enum DiagnosticCommand {
     QueryId,
     QueryMaxBaud,
-    FindReadKey {
+    ScanStatus,
+    ScanPause,
+    ScanResume,
+    ScanReset,
+    PartitionInstall,
+    ScanStart {
         start: u16,
         end: u16,
-        timeout_ms: u64,
+        timeout_ms: u16,
+        maximum_ms: u16,
     },
     ReadMemory16 {
         key: u16,
@@ -118,7 +125,7 @@ enum DiagnosticCommand {
     },
 }
 
-const DIAG_RESPONSE_CAPACITY: usize = 160;
+const DIAG_RESPONSE_CAPACITY: usize = 512;
 
 #[derive(Clone, Copy)]
 struct DiagnosticResponse {
@@ -153,6 +160,82 @@ impl core::fmt::Write for DiagnosticResponse {
 static DIAG_COMMANDS: Channel<CriticalSectionRawMutex, DiagnosticCommand, 1> = Channel::new();
 static DIAG_RESPONSES: Channel<CriticalSectionRawMutex, DiagnosticResponse, 1> = Channel::new();
 static DIAG_REQUEST_LOCK: Mutex<CriticalSectionRawMutex, ()> = Mutex::new(());
+
+static SCAN_STATE: embassy_sync::blocking_mutex::Mutex<
+    CriticalSectionRawMutex,
+    core::cell::Cell<ScanState>,
+> = embassy_sync::blocking_mutex::Mutex::new(core::cell::Cell::new(ScanState::empty()));
+static OTA_ACTIVE: AtomicBool = AtomicBool::new(false);
+static SCAN_CURRENT: AtomicU32 = AtomicU32::new(0x10000);
+
+struct ScanJob {
+    flash: SharedFlash,
+    journal: Option<Journal<SharedFlash>>,
+    state: ScanState,
+}
+impl ScanJob {
+    fn open(flash: SharedFlash) -> Self {
+        let (journal, state) = match Journal::open(flash) {
+            Ok((journal, state)) => (Some(journal), state),
+            Err(err) => {
+                error!("Key-scan storage unavailable: {err:?}");
+                (
+                    None,
+                    ScanState {
+                        phase: ScanPhase::StorageError,
+                        ..ScanState::empty()
+                    },
+                )
+            }
+        };
+        SCAN_STATE.lock(|s| s.set(state));
+        Self {
+            flash,
+            journal,
+            state,
+        }
+    }
+    fn save(&mut self) -> bool {
+        let saved = self
+            .journal
+            .as_mut()
+            .is_some_and(|journal| journal.save(self.state).is_ok());
+        if !saved {
+            self.state.phase = ScanPhase::StorageError;
+        }
+        SCAN_STATE.lock(|s| s.set(self.state));
+        saved
+    }
+}
+
+fn scan_status() -> DiagnosticResponse {
+    let s = SCAN_STATE.lock(core::cell::Cell::get);
+    let mut response = DiagnosticResponse::new();
+    let _ = write!(
+        &mut response,
+        "OK scan_version=3 state={} software_id={} start=0x{:04x} end=0x{:04x} next=0x{:05x} timeout_ms={} minimum_ms={} maximum_ms={} tested={} errors={} increases={}",
+        s.phase.name(),
+        s.software_id,
+        s.start,
+        s.end,
+        s.next,
+        s.timeout_ms,
+        s.minimum_ms,
+        s.maximum_ms,
+        s.tested,
+        s.errors,
+        s.increases
+    );
+    let current = SCAN_CURRENT.load(Ordering::Relaxed);
+    if current <= 0xffff {
+        let _ = write!(&mut response, " current=0x{current:04x}");
+    }
+    if let Some(key) = s.found {
+        let _ = write!(&mut response, " read_key=0x{key:04x} confirmed=2");
+    }
+    let _ = writeln!(&mut response);
+    response
+}
 
 #[derive(Clone, Copy)]
 struct BridgeChunk {
@@ -263,14 +346,37 @@ async fn mqtt_message_task(
     hostname: String,
     mut port: OpticalPort<'static>,
     mut led: Output<'static>,
+    flash: SharedFlash,
 ) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut id410_trace = Id410Trace::new();
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
+    let mut scan = ScanJob::open(flash);
+    if scan.state.phase == ScanPhase::Running && port.resynchronize().await.is_err() {
+        scan.state.failure();
+        scan.save();
+    }
 
     loop {
+        if scan.state.phase == ScanPhase::Running {
+            // Run one candidate at a time; command/status transport never owns
+            // the job. Closing TCP does not cancel or restart it.
+            if let Ok(BridgeCommand::Connect) = BRIDGE_COMMANDS.try_receive() {
+                BRIDGE_EVENTS.send(BridgeEvent::Disconnected).await;
+            }
+            if let Ok(command) = DIAG_COMMANDS.try_receive() {
+                let response = execute_diagnostic_command(&mut port, command, &mut scan).await;
+                DIAG_RESPONSES.send(response).await;
+            } else {
+                netlog::set_quiet_diagnostic_scan(true);
+                autonomous_scan_step(&mut port, &mut scan).await;
+                netlog::set_quiet_diagnostic_scan(false);
+            }
+            Timer::after(Duration::from_millis(1)).await;
+            continue;
+        }
         // The remote bridge takes exclusive ownership of the optical UART.
         // MQTT polling, diagnostics and ambient-IR reads are suspended while a
         // bridge client is attached, matching the behaviour of the dedicated
@@ -312,7 +418,7 @@ async fn mqtt_message_task(
                 // before ownership was established. Ignore it.
             }
             Either::Second(Either::First(command)) => {
-                let response = execute_diagnostic_command(&mut port, command).await;
+                let response = execute_diagnostic_command(&mut port, command, &mut scan).await;
                 if response.as_bytes().starts_with(b"ERR ") {
                     let _ = port.resynchronize().await;
                 }
@@ -611,10 +717,105 @@ async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
 async fn execute_diagnostic_command(
     port: &mut OpticalPort<'_>,
     command: DiagnosticCommand,
+    scan: &mut ScanJob,
 ) -> DiagnosticResponse {
     let mut response = DiagnosticResponse::new();
+    if scan.state.phase == ScanPhase::Running
+        && !matches!(
+            command,
+            DiagnosticCommand::ScanStatus
+                | DiagnosticCommand::ScanPause
+                | DiagnosticCommand::ScanResume
+                | DiagnosticCommand::ScanReset
+                | DiagnosticCommand::ScanStart { .. }
+        )
+    {
+        return diagnostic_error("ERR scan_busy");
+    }
 
     match command {
+        DiagnosticCommand::ScanStatus => return scan_status(),
+        DiagnosticCommand::ScanPause => {
+            if scan.state.phase == ScanPhase::Running {
+                scan.state.phase = ScanPhase::Paused;
+                scan.save();
+            }
+            return scan_status();
+        }
+        DiagnosticCommand::ScanResume => {
+            if scan.state.phase == ScanPhase::Paused {
+                if port.resynchronize().await.is_err() {
+                    return diagnostic_error("ERR noisy_line");
+                }
+                scan.state.phase = ScanPhase::Running;
+                scan.save();
+            }
+            return scan_status();
+        }
+        DiagnosticCommand::ScanReset => {
+            scan.state = ScanState::empty();
+            scan.save();
+            return scan_status();
+        }
+        DiagnosticCommand::PartitionInstall => {
+            if scan.state.phase == ScanPhase::Running || OTA_ACTIVE.load(Ordering::Relaxed) {
+                return diagnostic_error("ERR busy pause_scan_and_finish_ota_first");
+            }
+            match freemdu_home::keyscan::install_partition(scan.flash) {
+                Ok(()) => {
+                    *scan = ScanJob::open(scan.flash);
+                    return diagnostic_error("OK partition=keyscan installed_and_verified");
+                }
+                Err(err) => {
+                    error!("Partition migration failed: {err:?}");
+                    return diagnostic_error("ERR partition_migration_failed see_usb_log");
+                }
+            }
+        }
+        DiagnosticCommand::ScanStart {
+            start,
+            end,
+            timeout_ms,
+            maximum_ms,
+        } => {
+            if scan.journal.is_none() {
+                return diagnostic_error("ERR scan_storage_unavailable");
+            }
+            // Repeated start is idempotent, including after a lost TCP reply.
+            if scan.state.phase != ScanPhase::Idle {
+                let same = scan.state.start == start
+                    && scan.state.end == end
+                    && scan.state.minimum_ms == timeout_ms
+                    && scan.state.maximum_ms == maximum_ms;
+                if !same {
+                    return diagnostic_error("ERR different_scan use_scan_reset_first");
+                }
+                if scan.state.phase == ScanPhase::Paused {
+                    if port.resynchronize().await.is_err() {
+                        return diagnostic_error("ERR noisy_line");
+                    }
+                    scan.state.phase = ScanPhase::Running;
+                    scan.save();
+                }
+                return scan_status();
+            }
+            if port.resynchronize().await.is_err() {
+                return diagnostic_error("ERR noisy_line");
+            }
+            let id = {
+                let mut intf = MieleInterface::new(&mut *port);
+                match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                    Ok(Ok(id)) => id,
+                    _ => return diagnostic_error("ERR query_software_id timeout"),
+                }
+            };
+            let Some(state) = ScanState::start(id, start, end, timeout_ms, maximum_ms) else {
+                return diagnostic_error("ERR invalid_scan_arguments");
+            };
+            scan.state = state;
+            scan.save();
+            return scan_status();
+        }
         DiagnosticCommand::QueryId => {
             let mut intf = MieleInterface::new(&mut *port);
             match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
@@ -647,21 +848,6 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::FindReadKey {
-            start,
-            end,
-            timeout_ms,
-        } => {
-            // v2 replies must never be interpreted as conclusive wrong-key proof.
-            if start > end || !(100..=2000).contains(&timeout_ms) {
-                return diagnostic_error("ERR invalid_scan_arguments");
-            }
-            netlog::set_quiet_diagnostic_scan(true);
-            let result = scan_read_keys(port, start, end, timeout_ms).await;
-            netlog::set_quiet_diagnostic_scan(false);
-            return result;
-        }
-
         DiagnosticCommand::ReadMemory16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
 
@@ -730,7 +916,7 @@ fn diagnostic_error(message: &str) -> DiagnosticResponse {
 }
 
 // One clean handshake and one read. False means no appliance bytes arrived
-// AFTER all five read-request bytes and their echoes were received correctly.
+// AFTER the separately timed read request and its echo completed correctly.
 async fn probe_read_key(
     port: &mut OpticalPort<'_>,
     expected_id: u16,
@@ -745,17 +931,24 @@ async fn probe_read_key(
             .await
             .map_err(|_| anyhow::anyhow!("diagnostic timeout"))??;
         if id != expected_id {
-            return Err(anyhow::anyhow!("software ID changed: {id}"));
+            return Err(SoftwareIdChanged.into());
         }
         intf.unlock_read_access(key)
             .with_timeout(DEVICE_TIMEOUT)
             .await
             .map_err(|_| anyhow::anyhow!("diagnostic timeout"))??;
     }
+    {
+        let mut intf = MieleInterface::new(&mut *port);
+        intf.begin_read_probe(0)
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("read request/echo timeout"))??;
+    }
     let before = port.progress();
     let result = {
         let mut intf = MieleInterface::new(&mut *port);
-        intf.read_memory::<u8, 1>(0)
+        intf.finish_read_probe()
             .with_timeout(Duration::from_millis(timeout_ms))
             .await
     };
@@ -764,7 +957,7 @@ async fn probe_read_key(
         Ok(Err(err)) => Err(anyhow::anyhow!("read transport/protocol error: {err:?}")),
         Err(_) => {
             let after = port.progress();
-            if after.tx.wrapping_sub(before.tx) == 5 && after.rx == before.rx {
+            if after.tx == before.tx && after.rx == before.rx {
                 Ok(false)
             } else {
                 Err(anyhow::anyhow!("partial read/echo timeout"))
@@ -791,72 +984,94 @@ async fn confirm_read_key(port: &mut OpticalPort<'_>, id: u16, key: u16) -> Resu
     Ok(())
 }
 
-async fn scan_read_keys(
-    port: &mut OpticalPort<'_>,
-    start: u16,
-    end: u16,
-    timeout_ms: u64,
-) -> DiagnosticResponse {
-    if port.resynchronize().await.is_err() {
-        return diagnostic_error("ERR scan_inconclusive noisy_line");
+async fn autonomous_scan_step(port: &mut OpticalPort<'_>, job: &mut ScanJob) {
+    let mut candidate = None;
+    for (index, entry) in KNOWN_READ_KEYS.iter().enumerate() {
+        if index < 32
+            && job.state.known_mask & (1 << index) == 0
+            && entry.key >= job.state.start
+            && entry.key <= job.state.end
+        {
+            candidate = Some((entry.key, Some(index)));
+            break;
+        }
     }
-    let id = {
-        let mut intf = MieleInterface::new(&mut *port);
-        match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
-            Ok(Ok(id)) => id,
-            _ => return diagnostic_error("ERR scan_inconclusive initial_query"),
-        }
-    };
-    for key in start..=end {
-        if key == start || key % 256 == 0 {
-            info!("DIAG read-key scan at 0x{key:04x}");
-        }
-        let mut silent = 0;
-        let mut tested = false;
-        for _ in 0..3 {
-            match probe_read_key(port, id, key, timeout_ms).await {
-                Ok(true) => {
-                    if confirm_read_key(port, id, key).await.is_ok() {
-                        let mut response = DiagnosticResponse::new();
-                        let _ = writeln!(
-                            &mut response,
-                            "OK read_key=0x{key:04x} software_id={id} scan_version=2 confirmed=2"
-                        );
-                        return response;
-                    }
-                    // A failed confirmation remains inconclusive, never negative.
-                    let _ = port.resynchronize().await;
-                    return diagnostic_error("ERR scan_inconclusive confirmation_failed");
-                }
-                Ok(false) => {
-                    silent += 1;
-                    if port.drain_input().await.is_err() {
-                        return diagnostic_error("ERR scan_inconclusive noisy_line");
-                    }
-                    if silent == 2 {
-                        tested = true;
-                        break;
-                    }
-                }
-                Err(err) => {
-                    warn!("Read-key 0x{key:04x}: {err:?}");
-                    if port.resynchronize().await.is_err() {
-                        return diagnostic_error("ERR scan_inconclusive recovery_failed");
-                    }
-                }
+    if candidate.is_none() {
+        while job.state.next <= u32::from(job.state.end) {
+            let key = job.state.next as u16;
+            if KNOWN_READ_KEYS.iter().enumerate().any(|(i, entry)| {
+                i < 32 && entry.key == key && job.state.known_mask & (1 << i) != 0
+            }) {
+                job.state.next += 1;
+            } else {
+                candidate = Some((key, None));
+                break;
             }
         }
-        if !tested {
-            return diagnostic_error("ERR scan_inconclusive transient_optical_error");
+    }
+    let Some((key, known_index)) = candidate else {
+        job.state.phase = ScanPhase::Done;
+        job.save();
+        return;
+    };
+    SCAN_CURRENT.store(u32::from(key), Ordering::Relaxed);
+    let outcome: Result<bool> = async {
+        for _ in 0..2 {
+            if probe_read_key(
+                port,
+                job.state.software_id,
+                key,
+                u64::from(job.state.timeout_ms),
+            )
+            .await?
+            {
+                confirm_read_key(port, job.state.software_id, key).await?;
+                return Ok(true);
+            }
+            // Late bytes or noise are errors, not a negative observation.
+            port.drain_input().await?;
+        }
+        Ok(false)
+    }
+    .await;
+    match outcome {
+        Ok(true) => {
+            job.state.found = Some(key);
+            job.state.phase = ScanPhase::Found;
+        }
+        Ok(false) => {
+            if let Some(i) = known_index {
+                job.state.known_mask |= 1 << i;
+            } else {
+                job.state.next = u32::from(key) + 1;
+            }
+            job.state.tested = job.state.tested.saturating_add(1);
+        }
+        Err(err) => {
+            warn!("Autonomous key 0x{key:04x}: {err:?}");
+            if err.downcast_ref::<SoftwareIdChanged>().is_some() {
+                job.state.errors = job.state.errors.saturating_add(1);
+                job.state.phase = ScanPhase::Paused;
+            } else {
+                job.state.failure();
+            }
+            let _ = port.resynchronize().await;
         }
     }
-    let mut response = DiagnosticResponse::new();
-    let _ = writeln!(
-        &mut response,
-        "NO_RESPONSE start=0x{start:04x} end=0x{end:04x} software_id={id} scan_version=2 timeout_ms={timeout_ms}"
-    );
-    response
+    // Commit each completed candidate, timeout increase, pause or hit. A lost
+    // power supply only repeats an uncommitted candidate.
+    job.save();
+    SCAN_CURRENT.store(0x10000, Ordering::Relaxed);
 }
+
+#[derive(Debug)]
+struct SoftwareIdChanged;
+impl core::fmt::Display for SoftwareIdChanged {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "software ID changed")
+    }
+}
+impl core::error::Error for SoftwareIdChanged {}
 
 async fn prepare_read_access(
     intf: &mut MieleInterface<&mut OpticalPort<'_>>,
@@ -1225,7 +1440,7 @@ async fn connect_to_device<'a, 'b>(
 }
 
 #[embassy_executor::task]
-async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) -> ! {
+async fn ota_server_task(stack: Stack<'static>, flash: SharedFlash) -> ! {
     if OTA_TOKEN == "change-me" || OTA_TOKEN.is_empty() {
         error!("OTA disabled: set a non-default OTA_TOKEN in .cargo/config.toml");
         core::future::pending::<()>().await;
@@ -1308,6 +1523,14 @@ async fn ota_server_task(stack: Stack<'static>, flash: FlashStorage<'static>) ->
             continue;
         }
 
+        struct ActiveOta;
+        impl Drop for ActiveOta {
+            fn drop(&mut self) {
+                OTA_ACTIVE.store(false, Ordering::Relaxed);
+            }
+        }
+        OTA_ACTIVE.store(true, Ordering::Relaxed);
+        let _active = ActiveOta;
         info!("Starting OTA update: {image_size} bytes, CRC32 {target_crc:08x}");
 
         if let Err(err) = ota.ota_begin(image_size as u32, target_crc) {
@@ -1403,7 +1626,9 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
             continue;
         }
 
-        if BRIDGE_ACTIVE.load(Ordering::Relaxed) {
+        if BRIDGE_ACTIVE.load(Ordering::Relaxed)
+            || SCAN_STATE.lock(|s| s.get().phase == ScanPhase::Running)
+        {
             let _ = tcp_write_all(&mut socket, b"ERR bridge busy\n").await;
             socket.close();
             continue;
@@ -1449,6 +1674,11 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
             continue;
         }
 
+        if SCAN_STATE.lock(|s| s.get().phase == ScanPhase::Running) {
+            let _ = tcp_write_all(&mut socket, b"ERR scan busy\n").await;
+            socket.close();
+            continue;
+        }
         BRIDGE_COMMANDS.send(BridgeCommand::Connect).await;
 
         match BRIDGE_EVENTS.receive().await {
@@ -1507,6 +1737,9 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
 }
 
 async fn run_diag_command(command: DiagnosticCommand) -> DiagnosticResponse {
+    if matches!(command, DiagnosticCommand::ScanStatus) {
+        return scan_status();
+    }
     let _guard = DIAG_REQUEST_LOCK.lock().await;
     DIAG_COMMANDS.send(command).await;
     DIAG_RESPONSES.receive().await
@@ -1659,46 +1892,21 @@ async fn handle_serial_diag_line(line: &str) {
                  diag find-read-key START END [TIMEOUT_MS] | diag max-baud | diag probe"
             );
         }
+        Some(
+            name @ ("find-read-key" | "scan-start" | "scan-status" | "scan-pause" | "scan-resume"
+            | "scan-reset" | "partition-install"),
+        ) => {
+            if let Some(command) = parse_scan_command(name, &mut fields) {
+                serial_diag_print_response(&run_diag_command(command).await);
+            } else {
+                esp_println::println!("SERDIAG ERR invalid scan command");
+            }
+        }
         Some("id") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
         }
         Some("max-baud") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryMaxBaud).await);
-        }
-        Some("find-read-key") => {
-            let start = fields.next().and_then(parse_diag_u16);
-            let end = fields.next().and_then(parse_diag_u16);
-            let timeout_ms = fields.next().map_or(READ_KEY_CHECK_TIMEOUT_MS, |value| {
-                value.parse::<u64>().unwrap_or(0)
-            });
-
-            if let (Some(start), Some(end), None) = (start, end, fields.next()) {
-                if start <= end {
-                    esp_println::println!(
-                        "SERKEY BEGIN start=0x{:04x} end=0x{:04x} timeout_ms={} read-only",
-                        start,
-                        end,
-                        timeout_ms
-                    );
-                    let response = run_diag_command(DiagnosticCommand::FindReadKey {
-                        start,
-                        end,
-                        timeout_ms,
-                    })
-                    .await;
-                    match core::str::from_utf8(response.as_bytes()) {
-                        Ok(text) => esp_println::println!("SERKEY {}", text.trim_end()),
-                        Err(_) => esp_println::println!("SERKEY ERR invalid response encoding"),
-                    }
-                    esp_println::println!("SERKEY END");
-                } else {
-                    esp_println::println!("SERDIAG ERR START must be <= END");
-                }
-            } else {
-                esp_println::println!(
-                    "SERDIAG ERR usage: diag find-read-key START END [TIMEOUT_MS]"
-                );
-            }
         }
         Some("probe") if fields.next().is_none() => {
             serial_diag_probe_unknown().await;
@@ -1864,28 +2072,12 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
         }
 
         let command = match fields.next() {
+            Some(
+                name @ ("find-read-key" | "scan-start" | "scan-status" | "scan-pause"
+                | "scan-resume" | "scan-reset" | "partition-install"),
+            ) => parse_scan_command(name, &mut fields),
             Some("id") if fields.next().is_none() => Some(DiagnosticCommand::QueryId),
             Some("max-baud") if fields.next().is_none() => Some(DiagnosticCommand::QueryMaxBaud),
-            Some("find-read-key") => {
-                let start = fields.next().and_then(parse_diag_u16);
-                let end = fields.next().and_then(parse_diag_u16);
-                let timeout_ms = fields.next().map_or(READ_KEY_CHECK_TIMEOUT_MS, |value| {
-                    value.parse::<u64>().unwrap_or(0)
-                });
-
-                if fields.next().is_none() {
-                    start
-                        .zip(end)
-                        .filter(|(start, end)| start <= end)
-                        .map(|(start, end)| DiagnosticCommand::FindReadKey {
-                            start,
-                            end,
-                            timeout_ms,
-                        })
-                } else {
-                    None
-                }
-            }
             Some("mem16") => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u32);
@@ -1947,6 +2139,34 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
             }
         }
     }
+}
+
+fn parse_scan_command(
+    name: &str,
+    fields: &mut core::str::SplitAsciiWhitespace<'_>,
+) -> Option<DiagnosticCommand> {
+    let command = match name {
+        "scan-status" => DiagnosticCommand::ScanStatus,
+        "scan-pause" => DiagnosticCommand::ScanPause,
+        "scan-resume" => DiagnosticCommand::ScanResume,
+        "scan-reset" => DiagnosticCommand::ScanReset,
+        "partition-install" => DiagnosticCommand::PartitionInstall,
+        "scan-start" | "find-read-key" => {
+            let start = fields.next().and_then(parse_diag_u16)?;
+            let end = fields.next().and_then(parse_diag_u16)?;
+            let timeout_ms = fields.next().map_or(Some(100), parse_diag_u16)?;
+            let maximum_ms = fields.next().map_or(Some(500), parse_diag_u16)?;
+            ScanState::start(0, start, end, timeout_ms, maximum_ms)?;
+            DiagnosticCommand::ScanStart {
+                start,
+                end,
+                timeout_ms,
+                maximum_ms,
+            }
+        }
+        _ => return None,
+    };
+    fields.next().is_none().then_some(command)
 }
 
 fn parse_diag_u16(value: &str) -> Option<u16> {
@@ -2073,7 +2293,10 @@ async fn main(spawner: Spawner) {
     let port = freemdu_home::new_optical_port(peripherals.UART1).unwrap();
     let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
     let accelerometer = Lis2dh::new(accel_i2c);
-    let flash = FlashStorage::new(peripherals.FLASH);
+    static FLASH: StaticCell<FlashMutex> = StaticCell::new();
+    let flash = SharedFlash(FLASH.init(FlashMutex::new(core::cell::RefCell::new(
+        FlashStorage::new(peripherals.FLASH),
+    ))));
     let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
     let accel_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
@@ -2086,7 +2309,7 @@ async fn main(spawner: Spawner) {
             .build();
 
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
-    spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led).unwrap());
+    spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led, flash).unwrap());
     spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
     spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());

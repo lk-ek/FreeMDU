@@ -204,7 +204,7 @@ def request_reply(host: str, port: int, token: str, *parts: object) -> str:
     wire = ["FMDUDIAG1", token, *(str(part) for part in parts)]
 
     with connect_with_retry(host, port) as sock:
-        sock.settimeout(None)
+        sock.settimeout(30)
         sock.sendall((" ".join(wire) + "\n").encode("ascii"))
 
         reader = sock.makefile("rb", buffering=0)
@@ -651,6 +651,38 @@ def dump_range(
     )
 
 
+def autonomous_start(host: str, port: int, token: str, start: int, end: int,
+                     timeout_ms: int, maximum_ms: int) -> str:
+    if not (0 <= start <= end <= 0xffff and 40 <= timeout_ms <= maximum_ms <= 2000
+            and timeout_ms % 5 == 0 and maximum_ms % 5 == 0):
+        raise RuntimeError("range invalid or timeouts not multiples of 5 within 40..2000 ms")
+    reply = request(host, port, token, "scan-start", f"0x{start:04x}", f"0x{end:04x}",
+                    timeout_ms, maximum_ms)
+    fields = dict(re.findall(r"([a-z_]+)=([^ ]+)", reply))
+    if fields.get("scan_version") != "3":
+        raise RuntimeError("autonomous scanner requires v3 firmware")
+    if fields.get("state") == "storage_error":
+        raise RuntimeError("ESP scan storage unavailable; see USB log")
+    return reply
+
+
+def watch_scan(host: str, port: int, token: str, interval: float) -> None:
+    if interval < 0.5:
+        raise RuntimeError("watch interval must be at least 0.5 seconds")
+    while True:
+        try:
+            reply = request(host, port, token, "scan-status")
+            print(reply, flush=True)
+            fields = dict(re.findall(r"([a-z_]+)=([^ ]+)", reply))
+            if fields.get("scan_version") != "3":
+                raise RuntimeError("autonomous scanner requires v3 firmware")
+            if fields.get("state") in ("found", "done", "paused", "idle", "storage_error"):
+                return
+        except (OSError, DiagnosticDisconnect) as exc:
+            print(f"status unavailable: {exc}; scan remains on ESP", file=sys.stderr, flush=True)
+        time.sleep(interval)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FreeMDU read-only diagnostic client")
     parser.add_argument("host")
@@ -677,40 +709,19 @@ def main() -> None:
         help="stop after ID/key/RAM/EEPROM baseline instead of prompting for state captures",
     )
 
-    scan = sub.add_parser("find-read-key")
+    scan = sub.add_parser("scan-start", aliases=["find-read-key"],
+                          help="start/resume autonomous ESP job, then disconnect")
     scan.add_argument("start", type=number16)
     scan.add_argument("end", type=number16)
-    scan.add_argument(
-        "--timeout-ms",
-        type=int,
-        default=100,
-        help="RAM-read validation timeout per candidate key (default: 100 ms)",
-    )
-    scan.add_argument(
-        "--chunk-size",
-        type=int,
-        default=64,
-        help="keys per restartable Wi-Fi request (default: 64)",
-    )
-    scan.add_argument(
-        "--state-file",
-        type=Path,
-        default=READ_KEY_SCAN_STATE,
-        help=f"persistent tested-key database (default: {READ_KEY_SCAN_STATE})",
-    )
-    scan.add_argument(
-        "--exclude",
-        type=key_range,
-        action="append",
-        default=[],
-        metavar="START-END",
-        help=(
-            "skip a range for this invocation only (not stored); may be repeated, e.g. "
-            "--exclude 0x0000-0x1fff --exclude 0x4000-0x47ff"
-        ),
-    )
-    scan.add_argument("--recheck", action="store_true",
-                      help="repeat previously silent ranges under the same settings")
+    scan.add_argument("--timeout-ms", type=int, default=100,
+                      help="initial RX-only timeout, 40..2000 ms in steps of 5")
+    scan.add_argument("--max-timeout-ms", type=int, default=500,
+                      help="automatic +5 ms limit; errors at the limit pause the job")
+    status = sub.add_parser("scan-status")
+    status.add_argument("--watch", type=float, nargs="?", const=2.0,
+                        help="poll status every N seconds (default 2); Ctrl+C detaches")
+    for command in ("scan-pause", "scan-resume", "scan-reset", "partition-install"):
+        sub.add_parser(command)
     sub.add_parser("max-baud")
 
     mem = sub.add_parser("mem16")
@@ -758,25 +769,16 @@ def main() -> None:
                 -1 if args.skip_eeprom else int(args.eeprom_end, 0),
                 args.no_interactive,
             )
-        elif args.command == "find-read-key":
-            if not 100 <= args.timeout_ms <= 2000:
-                parser.error("--timeout-ms must be between 100 and 2000")
-            if not 1 <= args.chunk_size <= 0x1000:
-                parser.error("--chunk-size must be between 1 and 4096")
-            print(
-                scan_read_keys(
-                    args.host,
-                    args.port,
-                    token,
-                    int(args.start, 0),
-                    int(args.end, 0),
-                    args.timeout_ms,
-                    args.chunk_size,
-                    args.state_file,
-                    args.exclude,
-                    args.recheck,
-                )
-            )
+        elif args.command in ("find-read-key", "scan-start"):
+            print(autonomous_start(args.host, args.port, token, int(args.start, 0),
+                                   int(args.end, 0), args.timeout_ms, args.max_timeout_ms))
+        elif args.command == "scan-status":
+            if args.watch is None:
+                print(request(args.host, args.port, token, "scan-status"))
+            else:
+                watch_scan(args.host, args.port, token, args.watch)
+        elif args.command in ("scan-pause", "scan-resume", "scan-reset", "partition-install"):
+            print(request(args.host, args.port, token, args.command))
         elif args.command == "max-baud":
             print(request(args.host, args.port, token, "max-baud"))
         elif args.command == "mem16":
@@ -808,4 +810,7 @@ def main() -> None:
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except KeyboardInterrupt:
+        print("Detached. An autonomous scan continues on the ESP.", file=sys.stderr)

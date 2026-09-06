@@ -521,6 +521,30 @@ impl<P: Read + Write> Interface<P> {
         Ok(self.receive().await?.into())
     }
 
+    /// Send a one-byte RAM probe without waiting for the command ACK.
+    /// Call `finish_read_probe` next, or resynchronize after a timeout/error.
+    /// This split allows an RX deadline to exclude transmission and local echo.
+    pub async fn begin_read_probe(&mut self, address: u16) -> Result<(), P::Error> {
+        if self.chunk_size < 4 {
+            return Err(Error::InvalidArgument);
+        }
+        let payload: Payload<4> = Request::new(Command::ReadMemory, address, 1).into();
+        self.write(&payload.0).await?;
+        self.write(&[Self::compute_checksum(&payload.0)]).await
+    }
+
+    /// Receive the command ACK, data and checksum for `begin_read_probe`.
+    pub async fn finish_read_probe(&mut self) -> Result<u8, P::Error> {
+        let mut response = [0xff];
+        self.read(&mut response).await?;
+        match ResponseCode::from_repr(response[0]) {
+            Some(ResponseCode::Success) => Ok(self.receive().await?.into()),
+            Some(ResponseCode::IncorrectChecksum) => Err(Error::IncorrectChecksum),
+            Some(ResponseCode::InvalidCommand) => Err(Error::InvalidCommand),
+            None => Err(Error::InvalidResponse),
+        }
+    }
+
     /// Reads data from the device's EEPROM.
     ///
     /// For older devices, the address must be specified in words, not bytes.
@@ -928,6 +952,28 @@ mod tests {
             "memory contents should be correct"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_read_probe() -> Result<(), Infallible> {
+        let mut deque = VecDeque::from([0x00, 0x42, 0x42]);
+        let mut intf = Interface::new(&mut deque);
+        intf.begin_read_probe(0).await?;
+        assert_eq!(intf.finish_read_probe().await?, 0x42);
+        assert_eq!(deque, [0x30, 0, 0, 1, 0x31, 0]);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_read_probe_bad_checksum() -> Result<(), Infallible> {
+        let mut deque = VecDeque::from([0x00, 0x42, 0x43]);
+        let mut intf = Interface::new(&mut deque);
+        intf.begin_read_probe(0).await?;
+        assert_eq!(
+            intf.finish_read_probe().await,
+            Err(Error::IncorrectChecksum)
+        );
         Ok(())
     }
 

@@ -72,46 +72,103 @@ freemdu_home/b43a45abcdef/start_program/trigger
 
 Some actions require parameters, in which case the published value is used as the argument. Actions without parameters ignore the published value. Due to technical limitations, actions requiring parameters are currently not displayed in Home Assistant, but can still be triggered via MQTT.
 
-## Reliable read-key scan (scanner v2)
+## Autonomous read-key scan (v3)
 
-Update the ESP firmware and `diag.py` together. The client rejects old scanner
-replies rather than saving unverified results. No full-access key is requested
-and no appliance memory is written by this scan.
+Firmware and `diag.py` must both be updated. The scan runs on the ESP without a
+connected host. From `home/`:
 
 ```sh
-python diag.py DEVICE_HOST find-read-key 0x0000 0xffff
-python diag.py DEVICE_HOST find-read-key 0x0000 0xffff --timeout-ms 300
-python diag.py DEVICE_HOST find-read-key 0x0000 0xffff --recheck
-python -m unittest discover -s tests -v
+./diag.py 10.0.42.155 scan-start 0x0000 0xffff --timeout-ms 40 --max-timeout-ms 500
+./diag.py 10.0.42.155 scan-status
+./diag.py 10.0.42.155 scan-status --watch 2
+./diag.py 10.0.42.155 scan-pause
+./diag.py 10.0.42.155 scan-resume
 ```
 
-The scanner forwards UART and echo errors, drains stale input and allows at
-least 3.2 seconds without transmission after broken transactions. Each candidate
-needs two clean handshakes followed by silence before recording `NO_RESPONSE`.
-Partial responses, failed echoes and late bytes remain inconclusive. A hit is
-confirmed twice after separate inactivity resets, using a one-byte read and a
-16-byte checksum-validated RAM read at address zero. RAM values need not match
-between confirmations. This assumes a device supporting reads at address zero;
-a different memory map requires adapting the probe, not excluding every key.
+`find-read-key` is an alias for `scan-start`. Starting identical bounds and
+initial/maximum timeouts is idempotent: it returns the existing job, or resumes
+a paused job, retaining its effective timeout and progress. Different settings
+require an explicit `scan-reset` first. Reset discards this job's results; normal
+start, disconnect and reboot do not. A running job resumes automatically at boot;
+a paused or finished job remains paused/finished. Do not change the appliance
+while a job is active; every handshake checks its saved software ID.
 
-The v2 state file records silent ranges under the software ID, scanner revision,
-method and timeout. Silence is an observation, not proof of an incorrect key.
-Old v1 negative ranges are preserved as legacy evidence but are not reused.
-Changing the timeout or passing `--recheck` repeats previous observations.
-`--exclude` only skips ranges for the current invocation and is not persisted as
-evidence. Known and saved candidates inside the requested range are checked
-first, including during resume. Run only one scan client per state file.
+Status includes state, software ID, current candidate, next sequential candidate,
+tested count, effective/minimum/maximum RX timeout, error and increase counts,
+and the confirmed key if found. Ctrl+C only detaches the watcher. Results remain
+on the ESP and can be retrieved later. MQTT appliance polling and optical bridge
+access pause while scanning; the network stack, OTA and status endpoint remain
+available. Pause/reset take effect after the current candidate finishes.
 
-This conservative scan is slower: two probes plus quiet checks take roughly
-8.4 hours for all 65536 keys at the default 100 ms timeout, including initial
-recovery for 64-key chunks but excluding additional retries and device delays.
-Use bounded ranges to limit the time MQTT polling is suspended. An interrupted
-chunk is repeated; completed chunks resume from the state file. After three
-inconclusive chunk attempts the client stops without recording that chunk.
+Known candidates (including the reported ID1998 key `0x2b67`) are checked once
+per timing configuration. Completed candidates and the known-key mask are
+committed to a CRC-protected flash journal after every key. A torn write is
+ignored; at most the current candidate is repeated after power loss. The old
+`.freemdu-read-key-scan.json` on the computer is not imported or modified.
 
-`../protocol/read_keys.csv` is the shared source for Python and the generated
-Rust registry. Each row records a key, reported software IDs and provenance.
-The additional `0x2b67` candidate is reported for ID1998 in upstream issue #27;
-it is not a confirmed T4223C key. When changing scanner semantics, bump the
-firmware scan revision and the Python method/profile version together so old
-observations cannot silently exclude candidates.
+Timeouts are 40..2000 ms, in multiples of 5. The initial default remains 100 ms;
+`--timeout-ms 40` explicitly selects the faster setting. The RX deadline starts
+AFTER the request and echo have completed, so it excludes transmission time.
+Transport errors, partial replies, late input and failed confirmation increase
+the effective timeout by 5 ms and retry with a new session. Previous silence
+observations are rechecked at the higher timeout rather than permanently
+excluding a potentially correct key. At `--max-timeout-ms`, another error pauses
+the job for inspection. A software-ID change pauses immediately without trying
+unlock on the new device. Full silence after a clean transmission is still not
+proof of a wrong key; it requires two attempts but cannot distinguish a lost
+reply from actual rejection. Silence alone does not increase the timeout.
+
+## OTA partition-table migration
+
+The original 4 MB layout ends `ota_1` at `0x3f0000`, leaving the last 64 KiB free.
+The scanner can use this verified free tail after a normal application OTA,
+without requiring an immediate partition-table change. `partitions.csv/bin` now
+name it `keyscan` (data subtype `0x40`). The journal uses the first 60 KiB; the last
+4 KiB at `0x3ff000` are reserved for a backup of the boot partition-table sector.
+All flash users share one serialized HAL instance; OTA and journal writes cannot
+overlap within a flash operation.
+
+To install the new table over Wi-Fi, first update to this firmware, pause any
+running scan, then run:
+
+```sh
+./diag.py 10.0.42.155 scan-pause
+./diag.py 10.0.42.155 partition-install
+```
+
+Alternatively, on a device without an active saved scan:
+
+```sh
+./ota-upload.py 10.0.42.155 --install-scan-partition
+```
+
+The latter performs normal application OTA, waits for reboot and requests the
+migration. Repeating `partition-install` is a no-op once the target is installed.
+Only the exact supplied original table (CRC checked) or the already-migrated
+table is accepted. Existing app, OTA metadata, NVS and PHY offsets/sizes never
+change. No arbitrary partition-table upload is exposed. The old 4 KiB sector is
+backed up and verified before the primary sector is erased; the replacement is
+read back and verified. Firmware-side I/O errors trigger a best-effort rollback.
+
+**Keep ESP power stable during migration.** The standard bootloader has only one
+partition table. Power loss while rewriting its sector can prevent booting and
+requires USB recovery; the flash backup is not an automatic bootloader fallback.
+The backup's 4096 bytes at `0x3ff000` can be restored to `0x8000` with a USB flash
+tool. Both app slots remain untouched. Application OTA alone cannot repair a
+non-booting partition table. The command changes metadata, not the compiled app,
+and is intentionally separate from ordinary OTA updates.
+
+## Validation
+
+```sh
+python3 -m unittest discover -s tests -v
+cargo test --manifest-path scan-tests/Cargo.toml --target x86_64-unknown-linux-gnu
+```
+
+The host Rust target above applies to x86_64 Linux. Use your native Rust target
+on other hosts (e.g. `aarch64-apple-darwin` on Apple Silicon). The scanner core is
+hardware-independent and tested with a NOR flash model, including torn records,
+ring wrap, reboot resume, adaptive timeouts, partition boundaries and migration.
+The two independent read-key confirmations remain checksum-validated reads after
+fresh inactivity resets; this functionality does not request full access or
+write appliance memory. The shared registry is `../protocol/read_keys.csv`.

@@ -1,6 +1,8 @@
 #![no_std]
 
 pub mod accelerometer;
+pub mod keyscan;
+pub mod shared_flash;
 
 use embedded_io_async::{ErrorType, Read, ReadExactError, Write};
 use esp_hal::{

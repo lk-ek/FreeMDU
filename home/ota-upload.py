@@ -8,6 +8,7 @@ import binascii
 import socket
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 from local_config import load_config_value
@@ -54,6 +55,9 @@ def main() -> int:
         help="path for the generated OTA application image",
     )
     parser.add_argument("--timeout", type=float, default=30.0)
+    parser.add_argument("--install-scan-partition", action="store_true",
+                        help="after firmware reboot, install the additive scan partition table")
+    parser.add_argument("--diag-port", type=int, default=3234)
     args = parser.parse_args()
 
     try:
@@ -138,6 +142,24 @@ def main() -> int:
             raise RuntimeError(f"OTA failed: {reply}")
 
     print("OTA upload accepted and verified; device should reboot now.")
+    if args.install_scan_partition:
+        from diag import request
+        print("Installing the additive scan partition after reboot. Keep ESP power stable.", flush=True)
+        time.sleep(3)
+        for attempt in range(30):
+            try:
+                status = request(args.host, args.diag_port, token, "scan-status")
+                if "scan_version=3" not in status:
+                    raise RuntimeError("partition migration requires the new firmware")
+                # Do not stop an existing persistent job implicitly.
+                if "state=running" in status:
+                    raise RuntimeError("pause the running scan, then use diag.py partition-install")
+                print(request(args.host, args.diag_port, token, "partition-install"))
+                break
+            except OSError:
+                if attempt == 29:
+                    raise
+                time.sleep(2)
     return 0
 
 

@@ -1,0 +1,9 @@
+[package]
+name = "freemdu-scan-tests"
+version = "0.1.0"
+edition = "2024"
+publish = false
+[lib]
+path = "../src/keyscan.rs"
+[dependencies]
+embedded-storage = "0.3.1"
