@@ -86,16 +86,13 @@ impl State {
             ..Self::empty()
         })
     }
-    /// Retry all silence observations when their timing assumption changes.
+    /// Raise the timeout and retry the current candidate without losing progress.
     /// At the cap, pause instead of skipping an untestable key.
     pub fn failure(&mut self) {
         self.errors = self.errors.saturating_add(1);
         if self.timeout_ms < self.maximum_ms {
             self.timeout_ms = self.timeout_ms.saturating_add(5).min(self.maximum_ms);
             self.increases = self.increases.saturating_add(1);
-            self.next = u32::from(self.start);
-            self.known_mask = 0;
-            self.tested = 0;
         } else {
             self.phase = Phase::Paused;
         }
@@ -502,20 +499,35 @@ mod tests {
         );
     }
     #[test]
-    fn raising_timeout_rechecks_silence_and_cap_pauses() {
-        let mut s = State::start(410, 0, 65535, 40, 50).unwrap();
-        s.next = 900;
-        s.known_mask = 31;
-        s.tested = 905;
-        s.failure();
-        assert_eq!(s.timeout_ms, 45);
-        assert_eq!(s.next, 0);
-        assert_eq!(s.known_mask, 0);
-        assert_eq!(s.tested, 0);
-        s.failure();
-        assert_eq!(s.timeout_ms, 50);
-        s.failure();
-        assert_eq!(s.phase, Phase::Paused);
+    fn raising_timeout_preserves_progress_and_cap_pauses_after_restart() {
+        // Cover both a pending known candidate and the sequential sweep.
+        for mask in [3, 31] {
+            let flash = Flash::new();
+            let (mut journal, _) = Journal::open(flash.clone()).unwrap();
+            let mut s = State::start(410, 0, 65535, 40, 50).unwrap();
+            s.next = 900;
+            s.known_mask = mask;
+            s.tested = 905;
+            for (timeout, errors, increases, phase) in [
+                (45, 1, 1, Phase::Running),
+                (50, 2, 2, Phase::Running),
+                (50, 3, 2, Phase::Paused),
+            ] {
+                s.failure();
+                assert_eq!(s.timeout_ms, timeout);
+                assert_eq!(s.errors, errors);
+                assert_eq!(s.increases, increases);
+                assert_eq!(s.phase, phase);
+                assert_eq!(s.next, 900);
+                assert_eq!(s.known_mask, mask);
+                assert_eq!(s.tested, 905);
+                journal.save(s).unwrap();
+                let (reopened, restored) = Journal::open(flash.clone()).unwrap();
+                assert_eq!(restored, s);
+                journal = reopened;
+                s = restored;
+            }
+        }
     }
     #[test]
     fn parameters_reject_overflow_and_non_five_ms_steps() {

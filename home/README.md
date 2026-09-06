@@ -110,9 +110,10 @@ Timeouts are 40..2000 ms, in multiples of 5. The initial default remains 100 ms;
 `--timeout-ms 40` explicitly selects the faster setting. The RX deadline starts
 AFTER the request and echo have completed, so it excludes transmission time.
 Transport errors, partial replies, late input and failed confirmation increase
-the effective timeout by 5 ms and retry with a new session. Previous silence
-observations are rechecked at the higher timeout rather than permanently
-excluding a potentially correct key. At `--max-timeout-ms`, another error pauses
+the effective timeout by 5 ms and retry with a new session. The current candidate is retried; the cursor, completed known candidates, and
+tested count are retained, including across reboot. Earlier silence observations
+are not automatically rechecked. If a full scan finds no key, optionally use
+`scan-reset` followed by `scan-start` with a higher initial timeout for a new pass. At `--max-timeout-ms`, another error pauses
 the job for inspection. A software-ID change pauses immediately without trying
 unlock on the new device. Full silence after a clean transmission is still not
 proof of a wrong key; it requires two attempts but cannot distinguish a lost
