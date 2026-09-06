@@ -748,6 +748,10 @@ def main() -> None:
     mem.add_argument("key", type=number16)
     mem.add_argument("address", type=number32)
 
+    single = sub.add_parser("eeprom1", help="read one EEPROM byte at a raw protocol address")
+    single.add_argument("key", type=number16)
+    single.add_argument("address", type=number16)
+
     eeprom = sub.add_parser("eeprom16")
     eeprom.add_argument("key", type=number16)
     eeprom.add_argument("address", type=number16)
@@ -806,6 +810,13 @@ def main() -> None:
                 args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0)
             )
             print(data.hex())
+        elif args.command == "eeprom1":
+            reply = request(args.host, args.port, token, "eeprom1",
+                            args.key, args.address)
+            match = re.fullmatch(r"OK kind=eeprom address=0x[0-9a-fA-F]{4} data=([0-9a-fA-F]{2})", reply.strip())
+            if match is None:
+                raise RuntimeError(reply)
+            print(match.group(1).lower())
         elif args.command == "eeprom16":
             address = int(args.address, 0)
             if address > 0xFFF0:

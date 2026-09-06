@@ -186,3 +186,9 @@ addresses. Both dump CLIs accept byte offsets.
 Start a NEW output file after this fix; do not resume an old ID498 EEPROM dump,
 which contains overlapping blocks. Python uses 16-byte reads for ID498 so it
 also works with older firmware; firmware `eeprom128` now uses the correct stride.
+
+### EEPROM boundary probe
+
+After updating firmware, `./diag.py HOST eeprom1 KEY ADDRESS` reads exactly one
+byte at the raw protocol address. For ID498, compare addresses `0x00ff` and
+`0x0100` with key `0x2b2c`. USB equivalent: `diag eeprom1 KEY ADDRESS`.

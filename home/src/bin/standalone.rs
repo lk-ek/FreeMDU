@@ -123,6 +123,10 @@ enum DiagnosticCommand {
         key: u16,
         address: u32,
     },
+    ReadEeprom1 {
+        key: u16,
+        address: u16,
+    },
     ReadEeprom16 {
         key: u16,
         address: u16,
@@ -939,6 +943,34 @@ async fn execute_diagnostic_command(
                 let _ = write!(&mut response, "{byte:02x}");
             }
             let _ = writeln!(&mut response);
+        }
+        DiagnosticCommand::ReadEeprom1 { key, address } => {
+            let mut intf = MieleInterface::new(&mut *port);
+
+            if let Err(err) = prepare_read_access(&mut intf, key).await {
+                let _ = writeln!(&mut response, "{err}");
+                return response;
+            }
+
+            match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(data)) => {
+                    let data: [u8; 1] = data;
+                    let _ = write!(
+                        &mut response,
+                        "OK kind=eeprom address=0x{address:04x} data="
+                    );
+                    for byte in data {
+                        let _ = write!(&mut response, "{byte:02x}");
+                    }
+                    let _ = writeln!(&mut response);
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR read_eeprom {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR read_eeprom timeout {err:?}");
+                }
+            }
         }
         DiagnosticCommand::ReadEeprom16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
@@ -2069,6 +2101,18 @@ async fn handle_serial_diag_line(line: &str) {
                 esp_println::println!("SERDIAG ERR usage: diag mem16 KEY ADDR");
             }
         }
+        Some("eeprom1") => {
+            let key = fields.next().and_then(parse_diag_u16);
+            let address = fields.next().and_then(parse_diag_u16);
+
+            if let (Some(key), Some(address), None) = (key, address, fields.next()) {
+                serial_diag_print_response(
+                    &run_diag_command(DiagnosticCommand::ReadEeprom1 { key, address }).await,
+                );
+            } else {
+                esp_println::println!("SERDIAG ERR usage: diag eeprom1 KEY ADDR");
+            }
+        }
         Some("eeprom16") => {
             let key = fields.next().and_then(parse_diag_u16);
             let address = fields.next().and_then(parse_diag_u16);
@@ -2242,6 +2286,17 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
                 if fields.next().is_none() {
                     key.zip(address)
                         .map(|(key, address)| DiagnosticCommand::ReadMemory128 { key, address })
+                } else {
+                    None
+                }
+            }
+            Some("eeprom1") => {
+                let key = fields.next().and_then(parse_diag_u16);
+                let address = fields.next().and_then(parse_diag_u16);
+
+                if fields.next().is_none() {
+                    key.zip(address)
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom1 { key, address })
                 } else {
                     None
                 }
