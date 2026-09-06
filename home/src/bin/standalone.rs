@@ -919,6 +919,9 @@ async fn execute_diagnostic_command(
                         return response;
                     }
                 }
+
+                // Avoid hammering old controllers with back-to-back reads.
+                Timer::after(Duration::from_millis(5)).await;
             }
 
             let _ = write!(
@@ -993,6 +996,9 @@ async fn execute_diagnostic_command(
                         return response;
                     }
                 }
+
+                // Avoid hammering old controllers with back-to-back reads.
+                Timer::after(Duration::from_millis(5)).await;
             }
 
             let _ = write!(
