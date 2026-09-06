@@ -17,6 +17,7 @@ from local_config import load_config_value
 
 
 CHUNK_SIZE = 0x10
+DUMP_CHUNK_SIZE = 0x80
 CONNECT_RETRIES = 20
 CONNECT_RETRY_DELAY = 0.1
 DUMP_RETRY_DELAY = 0.5
@@ -512,8 +513,13 @@ def probe_unknown_device(
 
     print(f"probe: complete -> {run_dir}", file=sys.stderr)
 
-def read_block(host: str, port: int, token: str, kind: str, key: int, address: int) -> bytes:
-    command = "eeprom16" if kind == "eeprom" else "mem16"
+def read_block(
+    host: str, port: int, token: str, kind: str, key: int, address: int, size: int = CHUNK_SIZE
+) -> bytes:
+    if size not in (CHUNK_SIZE, DUMP_CHUNK_SIZE):
+        raise RuntimeError(f"unsupported diagnostic block size: {size}")
+    suffix = size
+    command = f"eeprom{suffix}" if kind == "eeprom" else f"mem{suffix}"
     width = 4 if kind == "eeprom" else 8
     reply = request(
         host,
@@ -536,8 +542,8 @@ def read_block(host: str, port: int, token: str, kind: str, key: int, address: i
     except ValueError as exc:
         raise RuntimeError(f"invalid hex payload: {reply}") from exc
 
-    if len(data) != CHUNK_SIZE:
-        raise RuntimeError(f"expected {CHUNK_SIZE} bytes, got {len(data)}")
+    if len(data) != size:
+        raise RuntimeError(f"expected {size} bytes, got {len(data)}")
     return data
 
 
@@ -569,15 +575,15 @@ def dump_range(
 ) -> None:
     if start > end:
         raise RuntimeError("start must not be greater than end")
-    if start % CHUNK_SIZE:
-        raise RuntimeError(f"start must be aligned to 0x{CHUNK_SIZE:x}")
-    if (end + 1) % CHUNK_SIZE:
-        raise RuntimeError(f"end + 1 must be aligned to 0x{CHUNK_SIZE:x}")
+    if start % DUMP_CHUNK_SIZE:
+        raise RuntimeError(f"start must be aligned to 0x{DUMP_CHUNK_SIZE:x}")
+    if (end + 1) % DUMP_CHUNK_SIZE:
+        raise RuntimeError(f"end + 1 must be aligned to 0x{DUMP_CHUNK_SIZE:x}")
 
     # Older Miele controllers address EEPROM in 16-bit words while the read
     # length is still expressed in bytes. The dump CLI intentionally uses byte
-    # offsets, so a contiguous 16-byte block advances the protocol address by
-    # 8 words rather than 16.
+    # offsets, so a contiguous block advances the protocol address by half the
+    # byte count.
     if kind == "eeprom":
         if end > 0x1FFFF:
             raise RuntimeError("EEPROM byte end offset is out of range")
@@ -598,9 +604,9 @@ def dump_range(
         raise RuntimeError(
             f"existing output is larger than requested dump: {completed} > {total} bytes"
         )
-    if completed % CHUNK_SIZE:
+    if completed % DUMP_CHUNK_SIZE:
         raise RuntimeError(
-            f"existing output size {completed} is not aligned to 0x{CHUNK_SIZE:x}; "
+            f"existing output size {completed} is not aligned to 0x{DUMP_CHUNK_SIZE:x}; "
             "refusing to append to a partial block"
         )
 
@@ -625,11 +631,11 @@ def dump_range(
             )
 
             try:
-                data = read_block(host, port, token, kind, key, address)
+                data = read_block(host, port, token, kind, key, address, DUMP_CHUNK_SIZE)
             except (OSError, DiagnosticDisconnect, DiagnosticTransientError) as exc:
                 # Every block uses a fresh TCP connection. Keep the last fully
-                # written block as the resume point and retry the same address
-                # after connection failures or transient firmware/optical
+                # written 128-byte block as the resume point and retry the same
+                # address after connection failures or transient firmware/optical
                 # timeouts. Ctrl-C can still abort; rerunning the same command
                 # resumes from disk.
                 print(

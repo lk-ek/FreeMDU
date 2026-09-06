@@ -119,7 +119,15 @@ enum DiagnosticCommand {
         key: u16,
         address: u32,
     },
+    ReadMemory128 {
+        key: u16,
+        address: u32,
+    },
     ReadEeprom16 {
+        key: u16,
+        address: u16,
+    },
+    ReadEeprom128 {
         key: u16,
         address: u16,
     },
@@ -876,6 +884,34 @@ async fn execute_diagnostic_command(
                 }
             }
         }
+        DiagnosticCommand::ReadMemory128 { key, address } => {
+            let mut intf = MieleInterface::new(&mut *port);
+
+            if let Err(err) = prepare_read_access(&mut intf, key).await {
+                let _ = writeln!(&mut response, "{err}");
+                return response;
+            }
+
+            match intf.read_memory(address).with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(data)) => {
+                    let data: [u8; 0x80] = data;
+                    let _ = write!(
+                        &mut response,
+                        "OK kind=memory address=0x{address:08x} data="
+                    );
+                    for byte in data {
+                        let _ = write!(&mut response, "{byte:02x}");
+                    }
+                    let _ = writeln!(&mut response);
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR read_memory {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR read_memory timeout {err:?}");
+                }
+            }
+        }
         DiagnosticCommand::ReadEeprom16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
 
@@ -887,6 +923,34 @@ async fn execute_diagnostic_command(
             match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
                 Ok(Ok(data)) => {
                     let data: [u8; 0x10] = data;
+                    let _ = write!(
+                        &mut response,
+                        "OK kind=eeprom address=0x{address:04x} data="
+                    );
+                    for byte in data {
+                        let _ = write!(&mut response, "{byte:02x}");
+                    }
+                    let _ = writeln!(&mut response);
+                }
+                Ok(Err(err)) => {
+                    let _ = writeln!(&mut response, "ERR read_eeprom {err:?}");
+                }
+                Err(err) => {
+                    let _ = writeln!(&mut response, "ERR read_eeprom timeout {err:?}");
+                }
+            }
+        }
+        DiagnosticCommand::ReadEeprom128 { key, address } => {
+            let mut intf = MieleInterface::new(&mut *port);
+
+            if let Err(err) = prepare_read_access(&mut intf, key).await {
+                let _ = writeln!(&mut response, "{err}");
+                return response;
+            }
+
+            match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(data)) => {
+                    let data: [u8; 0x80] = data;
                     let _ = write!(
                         &mut response,
                         "OK kind=eeprom address=0x{address:04x} data="
@@ -2089,6 +2153,17 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
                     None
                 }
             }
+            Some("mem128") => {
+                let key = fields.next().and_then(parse_diag_u16);
+                let address = fields.next().and_then(parse_diag_u32);
+
+                if fields.next().is_none() {
+                    key.zip(address)
+                        .map(|(key, address)| DiagnosticCommand::ReadMemory128 { key, address })
+                } else {
+                    None
+                }
+            }
             Some("eeprom16") => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u16);
@@ -2096,6 +2171,17 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
                 if fields.next().is_none() && address.is_none_or(|address| address <= 0xfff0) {
                     key.zip(address)
                         .map(|(key, address)| DiagnosticCommand::ReadEeprom16 { key, address })
+                } else {
+                    None
+                }
+            }
+            Some("eeprom128") => {
+                let key = fields.next().and_then(parse_diag_u16);
+                let address = fields.next().and_then(parse_diag_u16);
+
+                if fields.next().is_none() && address.is_none_or(|address| address <= 0xff80) {
+                    key.zip(address)
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom128 { key, address })
                 } else {
                     None
                 }
