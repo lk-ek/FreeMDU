@@ -892,25 +892,43 @@ async fn execute_diagnostic_command(
                 return response;
             }
 
-            match intf.read_memory(address).with_timeout(DEVICE_TIMEOUT).await {
-                Ok(Ok(data)) => {
-                    let data: [u8; 0x80] = data;
-                    let _ = write!(
-                        &mut response,
-                        "OK kind=memory address=0x{address:08x} data="
-                    );
-                    for byte in data {
-                        let _ = write!(&mut response, "{byte:02x}");
+            let mut data = [0u8; 0x80];
+            for block in 0..8 {
+                let block_address = address + block as u32 * 0x10;
+                match intf
+                    .read_memory(block_address)
+                    .with_timeout(DEVICE_TIMEOUT)
+                    .await
+                {
+                    Ok(Ok(block_data)) => {
+                        let block_data: [u8; 0x10] = block_data;
+                        data[block * 0x10..(block + 1) * 0x10].copy_from_slice(&block_data);
                     }
-                    let _ = writeln!(&mut response);
-                }
-                Ok(Err(err)) => {
-                    let _ = writeln!(&mut response, "ERR read_memory {err:?}");
-                }
-                Err(err) => {
-                    let _ = writeln!(&mut response, "ERR read_memory timeout {err:?}");
+                    Ok(Err(err)) => {
+                        let _ = writeln!(
+                            &mut response,
+                            "ERR read_memory address=0x{block_address:08x} {err:?}"
+                        );
+                        return response;
+                    }
+                    Err(err) => {
+                        let _ = writeln!(
+                            &mut response,
+                            "ERR read_memory timeout address=0x{block_address:08x} {err:?}"
+                        );
+                        return response;
+                    }
                 }
             }
+
+            let _ = write!(
+                &mut response,
+                "OK kind=memory address=0x{address:08x} data="
+            );
+            for byte in data {
+                let _ = write!(&mut response, "{byte:02x}");
+            }
+            let _ = writeln!(&mut response);
         }
         DiagnosticCommand::ReadEeprom16 { key, address } => {
             let mut intf = MieleInterface::new(&mut *port);
@@ -948,25 +966,43 @@ async fn execute_diagnostic_command(
                 return response;
             }
 
-            match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
-                Ok(Ok(data)) => {
-                    let data: [u8; 0x80] = data;
-                    let _ = write!(
-                        &mut response,
-                        "OK kind=eeprom address=0x{address:04x} data="
-                    );
-                    for byte in data {
-                        let _ = write!(&mut response, "{byte:02x}");
+            let mut data = [0u8; 0x80];
+            for block in 0..8 {
+                let block_address = address + block as u16 * 0x08;
+                match intf
+                    .read_eeprom(block_address)
+                    .with_timeout(DEVICE_TIMEOUT)
+                    .await
+                {
+                    Ok(Ok(block_data)) => {
+                        let block_data: [u8; 0x10] = block_data;
+                        data[block * 0x10..(block + 1) * 0x10].copy_from_slice(&block_data);
                     }
-                    let _ = writeln!(&mut response);
-                }
-                Ok(Err(err)) => {
-                    let _ = writeln!(&mut response, "ERR read_eeprom {err:?}");
-                }
-                Err(err) => {
-                    let _ = writeln!(&mut response, "ERR read_eeprom timeout {err:?}");
+                    Ok(Err(err)) => {
+                        let _ = writeln!(
+                            &mut response,
+                            "ERR read_eeprom address=0x{block_address:04x} {err:?}"
+                        );
+                        return response;
+                    }
+                    Err(err) => {
+                        let _ = writeln!(
+                            &mut response,
+                            "ERR read_eeprom timeout address=0x{block_address:04x} {err:?}"
+                        );
+                        return response;
+                    }
                 }
             }
+
+            let _ = write!(
+                &mut response,
+                "OK kind=eeprom address=0x{address:04x} data="
+            );
+            for byte in data {
+                let _ = write!(&mut response, "{byte:02x}");
+            }
+            let _ = writeln!(&mut response);
         }
     }
 
