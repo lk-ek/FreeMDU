@@ -123,8 +123,10 @@ reply from actual rejection. Silence alone does not increase the timeout.
 The original 4 MB layout ends `ota_1` at `0x3f0000`, leaving the last 64 KiB free.
 The scanner can use this verified free tail after a normal application OTA,
 without requiring an immediate partition-table change. `partitions.csv/bin` now
-name it `keyscan` (data subtype `0x40`). The journal uses the first 60 KiB; the last
-4 KiB at `0x3ff000` are reserved for a backup of the boot partition-table sector.
+name it `keyscan` (custom type `0x40`, subtype `0x00`). Using a custom type avoids
+the unknown-data-subtype panic in esp-idf-part 0.6.0 during `espflash save-image`.
+The journal uses the first 60 KiB; the last 4 KiB at `0x3ff000` are reserved for a
+backup of the boot partition-table sector.
 All flash users share one serialized HAL instance; OTA and journal writes cannot
 overlap within a flash operation.
 

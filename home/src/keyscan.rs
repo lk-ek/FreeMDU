@@ -234,8 +234,8 @@ impl<F: NorFlash> Journal<F> {
             }
             if offset < BASE + SIZE
                 && end > BASE
-                && !(entry[2] == 1
-                    && entry[3] == 0x40
+                && !(entry[2] == 0x40
+                    && entry[3] == 0
                     && offset == BASE
                     && size == SIZE
                     && &entry[12..20] == b"keyscan\0"

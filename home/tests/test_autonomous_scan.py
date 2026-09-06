@@ -53,7 +53,7 @@ class AutonomousTests(unittest.TestCase):
         self.assertEqual(old[:160],new[:160])
         magic,typ,sub,offset,size,name,flags=struct.unpack("<HBBII16sI",new[160:192])
         self.assertEqual((magic,typ,sub,offset,size,name.rstrip(b"\0"),flags),
-                         (0x50aa,1,0x40,0x3f0000,0x10000,b"keyscan",0))
+                         (0x50aa,0x40,0,0x3f0000,0x10000,b"keyscan",0))
         self.assertEqual(new[208:224],hashlib.md5(new[:192]).digest())
         self.assertTrue(all(b == 255 for b in new[224:]))
 
