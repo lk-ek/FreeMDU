@@ -93,8 +93,8 @@ const ID410_READ_KEY: u16 = 0x43ea;
 
 // Read-access keys used by the device implementations currently included in
 // FreeMDU. The generic first-contact probe only tries these known keys and
-// performs reads; it never brute-forces arbitrary keys or writes appliance
-// memory.
+// performs reads and explicitly requested key scans. Full-access scans may
+// HALT the appliance; no scan writes appliance RAM or EEPROM.
 use freemdu::known_read_keys::KNOWN_READ_KEYS;
 
 /// MQTT topic used to report device availability
@@ -110,6 +110,7 @@ enum DiagnosticCommand {
     ScanReset,
     PartitionInstall,
     ScanStart {
+        full_read_key: Option<u16>,
         start: u16,
         end: u16,
         timeout_ms: u16,
@@ -242,7 +243,15 @@ fn scan_status() -> DiagnosticResponse {
     if current <= 0xffff {
         let _ = write!(&mut response, " current=0x{current:04x}");
     }
-    if let Some(key) = s.found {
+    if let Some(read_key) = s.full_read_key {
+        let _ = write!(&mut response, " mode=full read_key=0x{read_key:04x}");
+        if let Some(key) = s.found {
+            let _ = write!(&mut response, " full_key=0x{key:04x} halt_ack=1");
+        }
+        if let Some(key) = s.pending {
+            let _ = write!(&mut response, " pending_key=0x{key:04x}");
+        }
+    } else if let Some(key) = s.found {
         let _ = write!(&mut response, " read_key=0x{key:04x} confirmed=2");
     }
     let _ = writeln!(&mut response);
@@ -372,6 +381,19 @@ async fn mqtt_message_task(
     }
 
     loop {
+        // HALT may have stopped the controller. Suppress automatic MQTT/bridge
+        // traffic until the user explicitly resumes or resets this full scan.
+        if scan.state.full_read_key.is_some()
+            && (scan.state.phase == ScanPhase::Found || scan.state.pending.is_some())
+            && scan.state.phase != ScanPhase::Running
+        {
+            if let Ok(command) = DIAG_COMMANDS.try_receive() {
+                let response = execute_diagnostic_command(&mut port, command, &mut scan).await;
+                DIAG_RESPONSES.send(response).await;
+            }
+            Timer::after(Duration::from_millis(10)).await;
+            continue;
+        }
         if scan.state.phase == ScanPhase::Running {
             // Run one candidate at a time; command/status transport never owns
             // the job. Closing TCP does not cancel or restart it.
@@ -785,6 +807,7 @@ async fn execute_diagnostic_command(
             }
         }
         DiagnosticCommand::ScanStart {
+            full_read_key,
             start,
             end,
             timeout_ms,
@@ -795,7 +818,8 @@ async fn execute_diagnostic_command(
             }
             // Repeated start is idempotent, including after a lost TCP reply.
             if scan.state.phase != ScanPhase::Idle {
-                let same = scan.state.start == start
+                let same = scan.state.full_read_key == full_read_key
+                    && scan.state.start == start
                     && scan.state.end == end
                     && scan.state.minimum_ms == timeout_ms
                     && scan.state.maximum_ms == maximum_ms;
@@ -821,9 +845,15 @@ async fn execute_diagnostic_command(
                     _ => return diagnostic_error("ERR query_software_id timeout"),
                 }
             };
-            let Some(state) = ScanState::start(id, start, end, timeout_ms, maximum_ms) else {
+            let Some(mut state) = ScanState::start(id, start, end, timeout_ms, maximum_ms) else {
                 return diagnostic_error("ERR invalid_scan_arguments");
             };
+            if let Some(read_key) = full_read_key {
+                if !matches!(probe_read_key(port, id, read_key, 1000).await, Ok(true)) {
+                    return diagnostic_error("ERR fixed_read_key_failed");
+                }
+            }
+            state.full_read_key = full_read_key;
             scan.state = state;
             scan.save();
             return scan_status();
@@ -1142,7 +1172,142 @@ async fn confirm_read_key(port: &mut OpticalPort<'_>, id: u16, key: u16) -> Resu
     Ok(())
 }
 
+// Reported full-access candidates from FreeMDU device reports; not ID498 proof.
+const FULL_KEYS: &[u16] = &[
+    0x1f02, 0x4e83, 0x5678, 0x8235, 0x162e, 0x3e3b, 0x703d, 0x902f, 0x6567, 0x5804,
+];
+
+async fn autonomous_full_step(port: &mut OpticalPort<'_>, job: &mut ScanJob, read_key: u16) {
+    let known = FULL_KEYS.iter().enumerate().find(|(i, key)| {
+        job.state.known_mask & (1 << i) == 0 && **key >= job.state.start && **key <= job.state.end
+    });
+    let (key, index) = if let Some((i, key)) = known {
+        (*key, Some(i))
+    } else {
+        while job.state.next <= u32::from(job.state.end)
+            && FULL_KEYS.iter().enumerate().any(|(i, key)| {
+                u32::from(*key) == job.state.next && job.state.known_mask & (1 << i) != 0
+            })
+        {
+            job.state.next += 1;
+        }
+        if job.state.next > u32::from(job.state.end) {
+            job.state.phase = ScanPhase::Done;
+            job.save();
+            return;
+        }
+        (job.state.next as u16, None)
+    };
+    SCAN_CURRENT.store(u32::from(key), Ordering::Relaxed);
+    let prepared: Result<()> = async {
+        port.drain_input().await?;
+        let mut intf = MieleInterface::new(&mut *port);
+        let id = intf
+            .query_software_id()
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("full scan ID timeout"))??;
+        if id != job.state.software_id {
+            return Err(SoftwareIdChanged.into());
+        }
+        intf.unlock_read_access(read_key)
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("read unlock timeout"))??;
+        intf.unlock_full_access(key)
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("full unlock timeout"))??;
+        Ok(())
+    }
+    .await;
+    if let Err(err) = prepared {
+        warn!("Full-key prepare 0x{key:04x}: {err:?}");
+        if err.downcast_ref::<SoftwareIdChanged>().is_some() {
+            job.state.phase = ScanPhase::Paused;
+            job.state.errors = job.state.errors.saturating_add(1);
+        } else {
+            job.state.failure();
+        }
+        job.save();
+        let _ = port.resynchronize().await;
+        return;
+    }
+    // Persist a paused checkpoint BEFORE HALT. A reboot cannot repeat it silently.
+    job.state.pending = Some(key);
+    job.state.phase = ScanPhase::Paused;
+    let saved = job
+        .journal
+        .as_mut()
+        .is_some_and(|journal| journal.save(job.state).is_ok());
+    if !saved {
+        job.state.phase = ScanPhase::StorageError;
+        SCAN_STATE.lock(|s| s.set(job.state));
+        return;
+    }
+    let mut intf = MieleInterface::new(&mut *port);
+    let sent = intf.begin_halt_probe().with_timeout(DEVICE_TIMEOUT).await;
+    drop(intf);
+    let progress = port.progress();
+    let mut intf = MieleInterface::new(&mut *port);
+    let ack = if matches!(sent, Ok(Ok(()))) {
+        Some(
+            intf.finish_halt_probe()
+                .with_timeout(Duration::from_millis(u64::from(job.state.timeout_ms)))
+                .await,
+        )
+    } else {
+        None
+    };
+    if matches!(ack, Some(Ok(Ok(())))) {
+        job.state.found = Some(key);
+        job.state.pending = None;
+        job.state.phase = ScanPhase::Found;
+        job.save();
+        // No further appliance commands after HALT ACK.
+        return;
+    }
+    let clean_silence = matches!(ack, Some(Err(_))) && port.progress().rx == progress.rx;
+    // A lost ACK may mean HALT succeeded. Only continue if the appliance is alive.
+    let alive: Result<()> = async {
+        port.drain_input().await?;
+        let mut intf = MieleInterface::new(&mut *port);
+        let id = intf
+            .query_software_id()
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("post-HALT device unavailable"))??;
+        if id != job.state.software_id {
+            return Err(SoftwareIdChanged.into());
+        }
+        Ok(())
+    }
+    .await;
+    if alive.is_err() {
+        job.state.errors = job.state.errors.saturating_add(1);
+        job.save(); // remains paused with pending_key; never claim a confirmed hit
+        return;
+    }
+    job.state.pending = None;
+    job.state.phase = ScanPhase::Running;
+    if clean_silence {
+        if let Some(i) = index {
+            job.state.known_mask |= 1 << i;
+        } else {
+            job.state.next = u32::from(key) + 1;
+        }
+        job.state.tested = job.state.tested.saturating_add(1);
+    } else {
+        job.state.failure();
+    }
+    job.save();
+}
+
 async fn autonomous_scan_step(port: &mut OpticalPort<'_>, job: &mut ScanJob) {
+    if let Some(read_key) = job.state.full_read_key {
+        autonomous_full_step(port, job, read_key).await;
+        return;
+    }
     let mut candidate = None;
     for (index, entry) in KNOWN_READ_KEYS.iter().enumerate() {
         if index < 32
@@ -2071,8 +2236,8 @@ async fn handle_serial_diag_line(line: &str) {
             );
         }
         Some(
-            name @ ("find-read-key" | "scan-start" | "scan-status" | "scan-pause" | "scan-resume"
-            | "scan-reset" | "partition-install"),
+            name @ ("scan-full-start" | "find-read-key" | "scan-start" | "scan-status"
+            | "scan-pause" | "scan-resume" | "scan-reset" | "partition-install"),
         ) => {
             if let Some(command) = parse_scan_command(name, &mut fields) {
                 serial_diag_print_response(&run_diag_command(command).await);
@@ -2263,8 +2428,8 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
 
         let command = match fields.next() {
             Some(
-                name @ ("find-read-key" | "scan-start" | "scan-status" | "scan-pause"
-                | "scan-resume" | "scan-reset" | "partition-install"),
+                name @ ("scan-full-start" | "find-read-key" | "scan-start" | "scan-status"
+                | "scan-pause" | "scan-resume" | "scan-reset" | "partition-install"),
             ) => parse_scan_command(name, &mut fields),
             Some("id") if fields.next().is_none() => Some(DiagnosticCommand::QueryId),
             Some("max-baud") if fields.next().is_none() => Some(DiagnosticCommand::QueryMaxBaud),
@@ -2374,13 +2539,19 @@ fn parse_scan_command(
         "scan-resume" => DiagnosticCommand::ScanResume,
         "scan-reset" => DiagnosticCommand::ScanReset,
         "partition-install" => DiagnosticCommand::PartitionInstall,
-        "scan-start" | "find-read-key" => {
+        "scan-full-start" | "scan-start" | "find-read-key" => {
+            let full_read_key = if name == "scan-full-start" {
+                Some(fields.next().and_then(parse_diag_u16)?)
+            } else {
+                None
+            };
             let start = fields.next().and_then(parse_diag_u16)?;
             let end = fields.next().and_then(parse_diag_u16)?;
             let timeout_ms = fields.next().map_or(Some(100), parse_diag_u16)?;
             let maximum_ms = fields.next().map_or(Some(500), parse_diag_u16)?;
             ScanState::start(0, start, end, timeout_ms, maximum_ms)?;
             DiagnosticCommand::ScanStart {
+                full_read_key,
                 start,
                 end,
                 timeout_ms,

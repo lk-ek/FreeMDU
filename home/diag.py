@@ -686,6 +686,19 @@ def autonomous_start(host: str, port: int, token: str, start: int, end: int,
     return reply
 
 
+def autonomous_full_start(host, port, token, read_key, start, end, timeout_ms, maximum_ms):
+    if not (0 <= read_key <= 0xffff and 0 <= start <= end <= 0xffff
+            and 40 <= timeout_ms <= maximum_ms <= 2000
+            and timeout_ms % 5 == 0 and maximum_ms % 5 == 0):
+        raise RuntimeError("invalid key, range or timeout")
+    reply = request(host, port, token, "scan-full-start", f"0x{read_key:04x}",
+                    f"0x{start:04x}", f"0x{end:04x}", timeout_ms, maximum_ms)
+    fields = dict(re.findall(r"([a-z_]+)=([^\s]+)", reply))
+    if fields.get("mode") != "full" or fields.get("state") == "storage_error":
+        raise RuntimeError(f"full-access scan was not started: {reply}")
+    return reply
+
+
 def watch_scan(host: str, port: int, token: str, interval: float) -> None:
     if interval < 0.5:
         raise RuntimeError("watch interval must be at least 0.5 seconds")
@@ -737,6 +750,12 @@ def main() -> None:
                       help="initial RX-only timeout, 40..2000 ms in steps of 5")
     scan.add_argument("--max-timeout-ms", type=int, default=500,
                       help="automatic +5 ms limit; errors at the limit pause the job")
+    full = sub.add_parser("scan-full-start", help="autonomous full-access scan using HALT; may stop appliance")
+    full.add_argument("read_key", type=number16)
+    full.add_argument("start", type=number16)
+    full.add_argument("end", type=number16)
+    full.add_argument("--timeout-ms", type=int, default=100)
+    full.add_argument("--max-timeout-ms", type=int, default=500)
     status = sub.add_parser("scan-status")
     status.add_argument("--watch", type=float, nargs="?", const=2.0,
                         help="poll status every N seconds (default 2); Ctrl+C detaches")
@@ -796,6 +815,10 @@ def main() -> None:
         elif args.command in ("find-read-key", "scan-start"):
             print(autonomous_start(args.host, args.port, token, int(args.start, 0),
                                    int(args.end, 0), args.timeout_ms, args.max_timeout_ms))
+        elif args.command == "scan-full-start":
+            print(autonomous_full_start(args.host, args.port, token, int(args.read_key, 0),
+                                        int(args.start, 0), int(args.end, 0),
+                                        args.timeout_ms, args.max_timeout_ms))
         elif args.command == "scan-status":
             if args.watch is None:
                 print(request(args.host, args.port, token, "scan-status"))

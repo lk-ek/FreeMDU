@@ -58,3 +58,19 @@ class AutonomousTests(unittest.TestCase):
         self.assertTrue(all(b == 255 for b in new[224:]))
 
 if __name__ == "__main__": unittest.main()
+
+class FullScanTests(unittest.TestCase):
+    def test_full_scan_passes_fixed_read_key(self):
+        reply = 'OK scan_version=3 state=running mode=full read_key=0x2b2c'
+        with patch.object(diag, 'request', return_value=reply) as req:
+            self.assertEqual(diag.autonomous_full_start('esp',3234,'token',0x2b2c,0,65535,100,500), reply)
+            req.assert_called_once_with('esp',3234,'token','scan-full-start','0x2b2c','0x0000','0xffff',100,500)
+
+    def test_full_scan_rejects_old_firmware_and_bad_parameters(self):
+        with patch.object(diag, 'request', return_value='OK scan_version=3 state=running'):
+            with self.assertRaises(RuntimeError):
+                diag.autonomous_full_start('esp',3234,'token',0x2b2c,0,65535,100,500)
+        with patch.object(diag, 'request') as req:
+            with self.assertRaises(RuntimeError):
+                diag.autonomous_full_start('esp',3234,'token',0x2b2c,0,65535,41,500)
+            req.assert_not_called()

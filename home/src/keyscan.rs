@@ -33,6 +33,8 @@ impl Phase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct State {
     pub phase: Phase,
+    pub full_read_key: Option<u16>,
+    pub pending: Option<u16>,
     pub software_id: u16,
     pub start: u16,
     pub end: u16,
@@ -50,6 +52,8 @@ impl State {
     pub const fn empty() -> Self {
         Self {
             phase: Phase::Idle,
+            full_read_key: None,
+            pending: None,
             software_id: 0,
             start: 0,
             end: 0xffff,
@@ -117,7 +121,11 @@ fn crc(bytes: &[u8]) -> u32 {
 }
 fn encode(state: State, sequence: u32) -> [u8; 128] {
     let mut b = [0xff; 128];
-    b[..4].copy_from_slice(b"FKS3");
+    b[..4].copy_from_slice(if state.full_read_key.is_some() {
+        b"FKS4"
+    } else {
+        b"FKS3"
+    });
     put(&mut b, 4, sequence);
     b[8] = state.phase as u8;
     for (offset, value) in [
@@ -133,6 +141,8 @@ fn encode(state: State, sequence: u32) -> [u8; 128] {
         (48, state.errors),
         (52, state.increases),
         (56, state.tested),
+        (60, state.full_read_key.map_or(0x10000, u32::from)),
+        (64, state.pending.map_or(0x10000, u32::from)),
     ] {
         put(&mut b, offset, value);
     }
@@ -142,7 +152,10 @@ fn encode(state: State, sequence: u32) -> [u8; 128] {
     b
 }
 fn decode(b: &[u8; 128]) -> Option<(u32, State)> {
-    if &b[..4] != b"FKS3" || &b[124..] != b"DONE" || get(b, 120) != crc(&b[..120]) {
+    if (&b[..4] != b"FKS3" && &b[..4] != b"FKS4")
+        || &b[124..] != b"DONE"
+        || get(b, 120) != crc(&b[..120])
+    {
         return None;
     }
     let phase = match b[8] {
@@ -161,6 +174,13 @@ fn decode(b: &[u8; 128]) -> Option<(u32, State)> {
         get(b, 28).try_into().ok()?,
         get(b, 36).try_into().ok()?,
     )?;
+    if &b[..4] == b"FKS4" {
+        s.full_read_key = Some(get(b, 60).try_into().ok()?);
+        s.pending = match get(b, 64) {
+            0x10000 => None,
+            value => Some(value.try_into().ok()?),
+        };
+    }
     s.phase = phase;
     s.next = get(b, 24);
     s.timeout_ms = get(b, 32).try_into().ok()?;
@@ -253,7 +273,7 @@ impl<F: NorFlash> Journal<F> {
                 .read(BASE + slot * RECORD, &mut b)
                 .map_err(Error::Flash)?;
             dirty |= b.iter().any(|v| *v != 0xff);
-            recognized |= &b[..4] == b"FKS3";
+            recognized |= &b[..4] == b"FKS3" || &b[..4] == b"FKS4";
             if let Some((seq, s)) = decode(&b) {
                 if latest
                     .as_ref()
@@ -433,6 +453,34 @@ mod tests {
             Ok(())
         }
     }
+    #[test]
+    fn full_scan_pending_and_hit_survive_restart() {
+        let flash = Flash::new();
+        let (mut journal, _) = Journal::open(flash.clone()).unwrap();
+        let mut state = State::start(498, 0, 65535, 100, 500).unwrap();
+        state.full_read_key = Some(0x2b2c);
+        state.next = 123;
+        state.known_mask = 3;
+        state.pending = Some(123);
+        state.phase = Phase::Paused;
+        journal.save(state).unwrap();
+        assert_eq!(Journal::open(flash.clone()).unwrap().1, state);
+        state.found = state.pending.take();
+        state.phase = Phase::Found;
+        journal.save(state).unwrap();
+        assert_eq!(Journal::open(flash).unwrap().1, state);
+    }
+
+    #[test]
+    fn legacy_read_record_keeps_read_mode() {
+        let state = State::start(498, 0, 65535, 100, 500).unwrap();
+        let mut bytes = encode(state, 1);
+        bytes[60..120].fill(0xff);
+        let sum = crc(&bytes[..120]);
+        put(&mut bytes, 120, sum);
+        assert_eq!(decode(&bytes), Some((1, state)));
+    }
+
     #[test]
     fn cursor_known_keys_and_adapted_timeout_survive_restart() {
         let flash = Flash::new();

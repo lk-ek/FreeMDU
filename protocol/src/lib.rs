@@ -682,6 +682,28 @@ impl<P: Read + Write> Interface<P> {
         self.read(&mut [0x00]).await
     }
 
+    /// Send HALT without waiting for its ACK. May stop normal appliance operation.
+    pub async fn begin_halt_probe(&mut self) -> Result<(), P::Error> {
+        if self.chunk_size < 4 {
+            return Err(Error::InvalidArgument);
+        }
+        let payload: Payload<4> = Request::new(Command::Halt, 0, 0).into();
+        self.write(&payload.0).await?;
+        self.write(&[Self::compute_checksum(&payload.0)]).await
+    }
+
+    /// Read the HALT acknowledgement. Do not repeat HALT after success.
+    pub async fn finish_halt_probe(&mut self) -> Result<(), P::Error> {
+        let mut response = [0xff];
+        self.read(&mut response).await?;
+        match ResponseCode::from_repr(response[0]) {
+            Some(ResponseCode::Success) => Ok(()),
+            Some(ResponseCode::IncorrectChecksum) => Err(Error::IncorrectChecksum),
+            Some(ResponseCode::InvalidCommand) => Err(Error::InvalidCommand),
+            None => Err(Error::InvalidResponse),
+        }
+    }
+
     /// Halts the device's normal operation.
     ///
     /// Causes the device to enter an infinite loop.
@@ -1175,6 +1197,26 @@ mod tests {
             "deque contents should be correct"
         );
 
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn split_halt_probe_rejects_error_ack() {
+        let mut deque = VecDeque::from([0x02]);
+        let mut intf = Interface::new(&mut deque);
+        assert!(matches!(
+            intf.finish_halt_probe().await,
+            Err(Error::InvalidCommand)
+        ));
+    }
+
+    #[tokio::test]
+    async fn split_halt_probe_matches_halt_wire_command() -> Result<(), Infallible> {
+        let mut deque = VecDeque::from([0x00]);
+        let mut intf = Interface::new(&mut deque);
+        intf.begin_halt_probe().await?;
+        intf.finish_halt_probe().await?;
+        assert_eq!(deque, [0x45, 0x00, 0x00, 0x00, 0x45]);
         Ok(())
     }
 
