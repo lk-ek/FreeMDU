@@ -244,3 +244,56 @@ For ID498, `0x0f2f` has produced repeated HALT acknowledgements with read key
 Use a fresh output filename for full-access dumps so previous read-only data
 is not silently reused by dump resume. A found scan need not be reset to issue
 these explicit diagnostics. Pause a running scan first.
+
+## Experimental T4223C / ID498 monitoring
+
+The firmware contains both the unchanged W307/ID410 profile and the new ID498
+profile. The currently attached appliance is detected automatically. This does
+not yet add a second optical UART: simultaneous physical monitoring of both
+machines requires wiring/pin configuration and an additional independent port.
+The dryer entity IDs use `dryer_*`, preserving existing ID410 entity IDs.
+
+ID498 publishes HA sensor entities every five seconds after initial detection
+(which can take DEVICE_PUBLISH_INTERVAL, normally 60 seconds): selected program,
+door, experimental run state, software ID, and raw program/door/run/flag values.
+Every update reads three validated 16-byte blocks once and derives all entities
+from that observation. Unknown selectors, markers and inconsistent door triplets
+remain Unknown; raw values remain visible. Sensor entities are used deliberately
+so unknown is not silently mapped to false. Communication failures use the
+existing device availability mechanism. Monitoring uses read key 0x2b2c only,
+never the full-access key, HALT, writes, or addresses at/above 0x0480.
+
+Mappings from labelled captures:
+- 0x00b6: 0x0f Ende (physical selector), 0x0e Koch/Bunt Schranktrocken+,
+  0x08 Pflegeleicht Schranktrocken+, 0x04 20 min warm, 0x05 15 min kalt.
+- 0x0265..0x0267: 00 00 00 closed; 01 01 01 open (repeated close/open/close).
+- 0x0270: 0xaa running observed; 0x55 not running observed.
+- 0x026a and 0x027e are raw candidate flags, not independently decoded.
+
+No finished notification, remaining time, temperature, anti-crease or natural-end
+claim is made. Manual completion in the fixtures means turning the selector to
+Ende, not automatic completion. Read key 0x2b2c is confirmed; full key 0x0f2f has
+repeated HALT ACKs, not a verified write test. EEPROM is byte-addressed for ID498;
+the tested contiguous ranges are EEPROM 0x0000..0x00ff and memory 0x0000..0x047f.
+Access beyond them can disrupt diagnostics. Fixtures 0..8 follow the sequence:
+Ende, Koch/Bunt, Pflegeleicht, warm, cold, cold door-open, cold started, warm
+started, warm manually ended.
+
+For the 15-minute cold run, clear any stored HALT scan first (retain both keys):
+
+```sh
+./diag.py HOST scan-reset
+./diag.py HOST capture-id498 t4223c-kalt-complete.jsonl --interval 5
+```
+
+Start capture before the program. JSONL records contain wall-clock timestamps,
+acquisition duration and raw blocks at 0x00b0, 0x0260 and 0x0270; failed samples
+are explicit errors. The output must be a new file; Ctrl+C flushes and stops.
+Let the program end naturally without moving the selector; record at least two
+more minutes with the door closed and note LEDs/drum movement. Capture uses the
+existing authenticated diagnostic commands and also works without MQTT. It needs
+the computer to stay connected; gaps are not reconstructed. USB `ID498 SNAP`
+lines provide the same blocks during MQTT polling, with ESP uptime timestamps.
+The current firmware intentionally has no TCP log service.
+Full snapshots can still be collected separately up to inclusive address 0x047f.
+ID410 polling and the existing ID410 trace remain unchanged.

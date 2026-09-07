@@ -375,6 +375,7 @@ async fn mqtt_message_task(
     flash: SharedFlash,
 ) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
+    let mut published_id = 0u16;
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut id410_trace = Id410Trace::new();
     let mut connected = false;
@@ -465,6 +466,7 @@ async fn mqtt_message_task(
             }
             Either::Second(Either::Second(Either::First(MqttMessage::Connected))) => {
                 connected = true;
+                published_id = 0; // resend dryer discovery after broker reconnect
                 MQTT_CONNECTED.store(true, Ordering::Relaxed);
                 ticker.reset();
             }
@@ -485,8 +487,18 @@ async fn mqtt_message_task(
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
-                let state = match publish_device(&mut port, &hostname).await {
-                    Ok(()) => AvailabilityState::Online,
+                let state = match publish_device(&mut port, &hostname, published_id).await {
+                    Ok(id) => {
+                        if id != published_id {
+                            published_id = id;
+                            ticker = Ticker::every(if id == 498 {
+                                Duration::from_secs(5)
+                            } else {
+                                DEVICE_PUBLISH_INTERVAL
+                            });
+                        }
+                        AvailabilityState::Online
+                    }
                     Err(err) => {
                         error!("Failed to publish device: {err:#}");
                         let _ = port.resynchronize().await;
@@ -1201,7 +1213,7 @@ async fn confirm_read_key(port: &mut OpticalPort<'_>, id: u16, key: u16) -> Resu
 
 // Reported full-access candidates from FreeMDU device reports; not ID498 proof.
 const FULL_KEYS: &[u16] = &[
-    0x1f02, 0x4e83, 0x5678, 0x8235, 0x162e, 0x3e3b, 0x703d, 0x902f, 0x6567, 0x5804,
+    0x1f02, 0x4e83, 0x5678, 0x8235, 0x162e, 0x3e3b, 0x703d, 0x902f, 0x6567, 0x5804, 0x0f2f,
 ];
 
 async fn autonomous_full_step(port: &mut OpticalPort<'_>, job: &mut ScanJob, read_key: u16) {
@@ -1637,9 +1649,30 @@ async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -
         .map_err(|err| anyhow::anyhow!("Failed to publish LIS2DH value {id}: {err:?}"))
 }
 
-async fn publish_device(port: &mut OpticalPort<'_>, hostname: &str) -> Result<()> {
+async fn publish_device(
+    port: &mut OpticalPort<'_>,
+    hostname: &str,
+    previous_id: u16,
+) -> Result<u16> {
     let mut dev = connect_to_device(port).await?;
+    let id = dev.software_id();
     let dev_kind = dev.kind().to_string();
+    let dryer = if id == 498 {
+        let snapshot = device::id498::Snapshot::read(dev.interface())
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+            .map_err(|_| anyhow::anyhow!("ID498 snapshot timeout"))??;
+        info!(
+            "ID498 SNAP ms={} b0={:02x?} d260={:02x?} r270={:02x?}",
+            embassy_time::Instant::now().as_millis(),
+            snapshot.program,
+            snapshot.door,
+            snapshot.run
+        );
+        Some(snapshot)
+    } else {
+        None
+    };
     let props = dev
         .properties()
         .iter()
@@ -1652,18 +1685,23 @@ async fn publish_device(port: &mut OpticalPort<'_>, hostname: &str) -> Result<()
 
     // Query properties first, as publishing them immediately might lead to timeout
     for prop in props.clone() {
-        let val = dev
-            .query_property(prop)
-            .with_timeout(DEVICE_TIMEOUT)
-            .await
-            .map_err(|err| anyhow::anyhow!("Failed to query property: {err:?}"))??;
+        let val = if let Some(snapshot) = dryer {
+            snapshot.value::<core::convert::Infallible>(prop)?
+        } else {
+            dev.query_property(prop)
+                .with_timeout(DEVICE_TIMEOUT)
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to query property: {err:?}"))??
+        };
 
         info!("Queried property {prop:?} with value {val:?}");
         vals.push(val);
     }
 
     for (prop, val) in props.zip(vals) {
-        publish_property(prop, &dev_kind, hostname).await?;
+        if id != 498 || previous_id != id {
+            publish_property(prop, &dev_kind, hostname).await?;
+        }
         publish_property_value(prop, &val).await?;
         info!("Published property: {prop:?}");
     }
@@ -1678,7 +1716,7 @@ async fn publish_device(port: &mut OpticalPort<'_>, hostname: &str) -> Result<()
         }
     }
 
-    Ok(())
+    Ok(id)
 }
 
 async fn publish_property(prop: &Property, dev: &str, hostname: &str) -> Result<()> {

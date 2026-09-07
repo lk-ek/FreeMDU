@@ -16,6 +16,7 @@ pub mod id360;
 pub mod id410;
 pub mod id419;
 pub mod id469;
+pub mod id498;
 pub mod id517;
 pub mod id605;
 pub mod id629;
@@ -455,6 +456,7 @@ pub async fn connect<'a, P: 'a + Read + Write>(
         id410::compatible_software_ids!() => {
             Ok(Box::new(id410::WashingMachine::initialize(intf, id).await?) as Box<dyn Device<P>>)
         }
+        498 => Ok(Box::new(id498::TumbleDryer::initialize(intf, id).await?) as Box<dyn Device<P>>),
         id419::compatible_software_ids!() => {
             Ok(Box::new(id419::WashingMachine::initialize(intf, id).await?) as Box<dyn Device<P>>)
         }

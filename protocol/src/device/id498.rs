@@ -1,0 +1,278 @@
+//! Experimental, read-only T4223C support based on labelled ID498 captures.
+//! No natural-end, remaining-time, temperature or actuator interpretation yet.
+use crate::device::{
+    Action, Device, DeviceKind, Error, Interface, Property, PropertyKind, Result, Value, private,
+};
+use alloc::{boxed::Box, format, string::ToString};
+use embedded_io_async::{Read, Write};
+
+/// Confirmed diagnostic read key. Full access is never used by monitoring.
+pub const READ_KEY: u16 = 0x2b2c;
+/// Repeated HALT acknowledgement in field tests; not a verified write test.
+pub const FULL_KEY: u16 = 0x0f2f;
+
+/// Decode only program selector positions observed on the T4223C.
+pub fn program(raw: u8) -> &'static str {
+    match raw {
+        0x0f => "Ende",
+        0x0e => "Koch/Bunt Schranktrocken+",
+        0x08 => "Pflegeleicht Schranktrocken+",
+        0x04 => "20 min warm",
+        0x05 => "15 min kalt",
+        _ => "Unknown",
+    }
+}
+/// Door triplet interpretation; disagreement remains unknown.
+pub fn door(raw: [u8; 3]) -> &'static str {
+    match raw {
+        [0, 0, 0] => "Closed",
+        [1, 1, 1] => "Open",
+        _ => "Unknown",
+    }
+}
+/// This is not a finished/ready detector: normal completion is not validated.
+pub fn running(raw: u8) -> &'static str {
+    match raw {
+        0xaa => "Running",
+        0x55 => "Not running",
+        _ => "Unknown",
+    }
+}
+
+/// HA identifiers are namespaced so ID410 identifiers remain unchanged.
+pub const PROPERTIES: &[Property] = &[
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_program",
+        name: "Dryer selected program",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_door",
+        name: "Dryer door",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_run_state",
+        name: "Dryer run state (experimental)",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_program_raw",
+        name: "Dryer program raw",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_door_raw",
+        name: "Dryer door triplet raw",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_run_raw",
+        name: "Dryer run marker raw",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_flags_raw",
+        name: "Dryer flags 026a/027e raw",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_software_id",
+        name: "Dryer software ID",
+        unit: None,
+    },
+];
+
+/// Three 16-byte reads form one short observation; not an atomic MCU snapshot.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Block at 0x00b0; selector at offset 6.
+    pub program: [u8; 16],
+    /// Block at 0x0260; door triplet at offsets 5..8.
+    pub door: [u8; 16],
+    /// Block at 0x0270; running marker at offset 0.
+    pub run: [u8; 16],
+}
+impl Snapshot {
+    /// Read only addresses already validated by labelled dumps.
+    pub async fn read<P: Read + Write>(intf: &mut Interface<P>) -> Result<Self, P::Error> {
+        Ok(Self {
+            program: intf.read_memory(0x00b0).await?,
+            door: intf.read_memory(0x0260).await?,
+            run: intf.read_memory(0x0270).await?,
+        })
+    }
+    /// Interpret one property, retaining unknown values in the raw entities.
+    pub fn value<E>(&self, prop: &Property) -> Result<Value, E> {
+        Ok(match prop.id {
+            "dryer_program" => program(self.program[6]).to_string().into(),
+            "dryer_door" => door([self.door[5], self.door[6], self.door[7]])
+                .to_string()
+                .into(),
+            "dryer_run_state" => running(self.run[0]).to_string().into(),
+            "dryer_program_raw" => format!("0x{:02x}", self.program[6]).into(),
+            "dryer_door_raw" => format!(
+                "{:02x} {:02x} {:02x}",
+                self.door[5], self.door[6], self.door[7]
+            )
+            .into(),
+            "dryer_run_raw" => format!("0x{:02x}", self.run[0]).into(),
+            "dryer_flags_raw" => format!("{:02x} {:02x}", self.door[10], self.run[14]).into(),
+            "dryer_software_id" => 498u32.into(),
+            _ => return Err(Error::UnknownProperty),
+        })
+    }
+}
+
+/// Read-only tumble dryer profile; ID410 remains a separate device profile.
+pub struct TumbleDryer<P: Read + Write> {
+    intf: Interface<P>,
+}
+impl<P: Read + Write> TumbleDryer<P> {
+    pub(crate) async fn initialize(mut intf: Interface<P>, _id: u16) -> Result<Self, P::Error> {
+        intf.unlock_read_access(READ_KEY).await?;
+        Ok(Self { intf })
+    }
+}
+#[async_trait::async_trait(?Send)]
+impl<P: Read + Write> Device<P> for TumbleDryer<P> {
+    async fn connect(port: P) -> Result<Self, P::Error> {
+        let mut intf = Interface::new(port);
+        let id = intf.query_software_id().await?;
+        if id != 498 {
+            return Err(Error::UnknownSoftwareId(id));
+        }
+        Self::initialize(intf, id).await
+    }
+    fn interface(&mut self) -> &mut Interface<P> {
+        &mut self.intf
+    }
+    fn software_id(&self) -> u16 {
+        498
+    }
+    fn kind(&self) -> DeviceKind {
+        DeviceKind::TumbleDryer
+    }
+    fn properties(&self) -> &'static [Property] {
+        PROPERTIES
+    }
+    fn actions(&self) -> &'static [Action] {
+        &[]
+    }
+    async fn query_property(&mut self, prop: &Property) -> Result<Value, P::Error> {
+        Snapshot::read(&mut self.intf).await?.value(prop)
+    }
+    async fn trigger_action(&mut self, _: &Action, _: Option<&str>) -> Result<(), P::Error> {
+        Err(Error::UnknownAction)
+    }
+}
+impl<P: Read + Write> private::Sealed for TumbleDryer<P> {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn labelled_captures_match_decoder() {
+        let cases: &[(&[u8], u8, &str, &str)] = &[
+            (
+                include_bytes!("../../tests/fixtures/id498/0.bin"),
+                15,
+                "Closed",
+                "Not running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/1.bin"),
+                14,
+                "Closed",
+                "Not running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/2.bin"),
+                8,
+                "Closed",
+                "Not running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/3.bin"),
+                4,
+                "Closed",
+                "Not running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/4.bin"),
+                5,
+                "Closed",
+                "Not running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/5.bin"),
+                5,
+                "Open",
+                "Not running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/6.bin"),
+                5,
+                "Closed",
+                "Running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/7.bin"),
+                4,
+                "Closed",
+                "Running",
+            ),
+            (
+                include_bytes!("../../tests/fixtures/id498/8.bin"),
+                15,
+                "Closed",
+                "Not running",
+            ),
+        ];
+        for (bytes, selector, expected_door, expected_run) in cases {
+            assert_eq!(bytes.len(), 0x480);
+            let snap = Snapshot {
+                program: bytes[0xb0..0xc0].try_into().unwrap(),
+                door: bytes[0x260..0x270].try_into().unwrap(),
+                run: bytes[0x270..0x280].try_into().unwrap(),
+            };
+            assert_eq!(snap.program[6], *selector);
+            assert_ne!(program(*selector), "Unknown");
+            assert_eq!(
+                door([snap.door[5], snap.door[6], snap.door[7]]),
+                *expected_door
+            );
+            assert_eq!(running(snap.run[0]), *expected_run);
+            for property in PROPERTIES {
+                assert!(snap.value::<core::convert::Infallible>(property).is_ok());
+            }
+        }
+    }
+    #[test]
+    fn unknown_is_never_finished_or_closed() {
+        assert_eq!(program(0xff), "Unknown");
+        assert_eq!(door([0, 1, 0]), "Unknown");
+        assert_eq!(door([2, 2, 2]), "Unknown");
+        assert_eq!(running(0), "Unknown");
+        assert!(!PROPERTIES.iter().any(|p| p.id.contains("finished")));
+    }
+    #[test]
+    fn repeated_door_toggle() {
+        for (triplet, expected) in [
+            ([0, 0, 0], "Closed"),
+            ([1, 1, 1], "Open"),
+            ([0, 0, 0], "Closed"),
+        ] {
+            assert_eq!(door(triplet), expected);
+            assert_eq!(running(0x55), "Not running");
+        }
+    }
+}

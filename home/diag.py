@@ -704,6 +704,36 @@ def autonomous_full_start(host, port, token, read_key, start, end, timeout_ms, m
     return reply
 
 
+def capture_id498(host, port, token, output, interval):
+    if interval < 5:
+        raise RuntimeError("capture interval must be at least 5 seconds")
+    if parse_software_id(request_with_transient_retry(host, port, token, "id")) != 498:
+        raise RuntimeError("capture requires software ID498")
+    # Never append snapshots to an existing run with unrelated state labels.
+    with output.open("x") as handle:
+        try:
+            while True:
+                started = time.monotonic()
+                record = {"time_unix": time.time(), "software_id": 498}
+                try:
+                    if parse_software_id(request(host, port, token, "id")) != 498:
+                        raise RuntimeError("software ID changed; sample discarded")
+                    blocks = {}
+                    for address in (0x00b0, 0x0260, 0x0270):
+                        blocks[f"0x{address:04x}"] = read_block(
+                            host, port, token, "memory", 0x2b2c, address).hex()
+                    record["blocks"] = blocks
+                except (OSError, RuntimeError) as exc:
+                    record["error"] = str(exc)
+                record["duration_s"] = time.monotonic() - started
+                handle.write(json.dumps(record) + "\n")
+                handle.flush()
+                print(json.dumps(record), flush=True)
+                time.sleep(max(0, interval - (time.monotonic() - started)))
+        except KeyboardInterrupt:
+            print(f"Capture stopped; samples saved to {output}", file=sys.stderr)
+
+
 def watch_scan(host: str, port: int, token: str, interval: float) -> None:
     if interval < 0.5:
         raise RuntimeError("watch interval must be at least 0.5 seconds")
@@ -761,6 +791,9 @@ def main() -> None:
     full.add_argument("end", type=number16)
     full.add_argument("--timeout-ms", type=int, default=100)
     full.add_argument("--max-timeout-ms", type=int, default=500)
+    capture = sub.add_parser("capture-id498", help="record raw dryer observations as JSONL")
+    capture.add_argument("output", type=Path)
+    capture.add_argument("--interval", type=float, default=5)
     status = sub.add_parser("scan-status")
     status.add_argument("--watch", type=float, nargs="?", const=2.0,
                         help="poll status every N seconds (default 2); Ctrl+C detaches")
@@ -829,6 +862,8 @@ def main() -> None:
             print(autonomous_full_start(args.host, args.port, token, int(args.read_key, 0),
                                         int(args.start, 0), int(args.end, 0),
                                         args.timeout_ms, args.max_timeout_ms))
+        elif args.command == "capture-id498":
+            capture_id498(args.host, args.port, token, args.output, args.interval)
         elif args.command == "scan-status":
             if args.watch is None:
                 print(request(args.host, args.port, token, "scan-status"))
