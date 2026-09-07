@@ -1,5 +1,5 @@
 //! Experimental, read-only T4223C support based on labelled ID498 captures.
-//! No natural-end, remaining-time, temperature or actuator interpretation yet.
+//! Motion and post-run interpretations are hypotheses, not physical feedback.
 use crate::device::{
     Action, Device, DeviceKind, Error, Interface, Property, PropertyKind, Result, Value, private,
 };
@@ -17,6 +17,9 @@ pub fn program(raw: u8) -> &'static str {
         0x0f => "Ende",
         0x0e => "Koch/Bunt Schranktrocken+",
         0x08 => "Pflegeleicht Schranktrocken+",
+        0x09 => "Pflegeleicht Schranktrocken",
+        0x0d => "Pflegeleicht Schranktrocken / Schonen",
+        0x0c => "Pflegeleicht Buegelfeucht",
         0x04 => "20 min warm",
         0x05 => "15 min kalt",
         _ => "Unknown",
@@ -39,8 +42,58 @@ pub fn running(raw: u8) -> &'static str {
     }
 }
 
+/// Inferred motor command, not measured drum movement or absolute direction.
+pub fn motion(raw: u8) -> &'static str {
+    match raw {
+        0 => "Off / pause",
+        1 => "Direction A (inferred)",
+        2 => "Direction B (inferred)",
+        _ => "Unknown",
+    }
+}
+/// Stateless observations deliberately cannot assert that a cycle completed.
+pub fn phase(selector: u8, run: u8, motor: u8) -> &'static str {
+    match (selector, run, motor) {
+        (_, 0xaa, 0..=2) => "Program active",
+        (0x0f, 0x55, 0) => "Selector at Ende",
+        (_, 0x55, 1..=2) => "Inactive with motor command (possible anti-crease)",
+        (_, 0x55, 0) => "Inactive / waiting / post-run",
+        _ => "Unknown",
+    }
+}
+
 /// HA identifiers are namespaced so ID410 identifiers remain unchanged.
 pub const PROPERTIES: &[Property] = &[
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_motion",
+        name: "Dryer motor command (inferred)",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_phase",
+        name: "Dryer observed phase (experimental)",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_post_run_raw",
+        name: "Dryer marker 0260 raw",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_motion_raw",
+        name: "Dryer motor marker 027e raw",
+        unit: None,
+    },
+    Property {
+        kind: PropertyKind::Operation,
+        id: "dryer_transition_raw",
+        name: "Dryer transition marker 027f raw",
+        unit: None,
+    },
     Property {
         kind: PropertyKind::Operation,
         id: "dryer_program",
@@ -113,6 +166,14 @@ impl Snapshot {
     /// Interpret one property, retaining unknown values in the raw entities.
     pub fn value<E>(&self, prop: &Property) -> Result<Value, E> {
         Ok(match prop.id {
+            "dryer_motion" => motion(self.run[14]).to_string().into(),
+            "dryer_phase" => phase(self.program[6], self.run[0], self.run[14])
+                .to_string()
+                .into(),
+            "dryer_post_run_raw" => format!("0x{:02x}", self.door[0]).into(),
+            "dryer_motion_raw" => format!("0x{:02x}", self.run[14]).into(),
+            "dryer_transition_raw" => format!("0x{:02x}", self.run[15]).into(),
+
             "dryer_program" => program(self.program[6]).to_string().into(),
             "dryer_door" => door([self.door[5], self.door[6], self.door[7]])
                 .to_string()
@@ -263,6 +324,18 @@ mod tests {
         assert_eq!(door([2, 2, 2]), "Unknown");
         assert_eq!(running(0), "Unknown");
         assert!(!PROPERTIES.iter().any(|p| p.id.contains("finished")));
+    }
+    #[test]
+    fn post_run_motion_does_not_restart_program() {
+        assert_eq!(phase(5, 0xaa, 0), "Program active");
+        assert_eq!(
+            phase(5, 0x55, 1),
+            "Inactive with motor command (possible anti-crease)"
+        );
+        assert_eq!(phase(5, 0x55, 0), "Inactive / waiting / post-run");
+        assert_eq!(phase(15, 0x55, 0), "Selector at Ende");
+        assert_eq!(phase(5, 0, 1), "Unknown");
+        assert_eq!(motion(3), "Unknown");
     }
     #[test]
     fn repeated_door_toggle() {

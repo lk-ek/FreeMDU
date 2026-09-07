@@ -297,3 +297,25 @@ lines provide the same blocks during MQTT polling, with ESP uptime timestamps.
 The current firmware intentionally has no TCP log service.
 Full snapshots can still be collected separately up to inclusive address 0x047f.
 ID410 polling and the existing ID410 trace remain unchanged.
+
+### ID498 cold-run observations (2026-09-07)
+
+Additional selector positions inferred from the sequential knob sweep: 09 =
+Pflegeleicht Schranktrocken, 0d = Schranktrocken/Schonen, 0c = Buegelfeucht.
+Existing entity identifiers and the ID410 profile are unchanged.
+
+New HA text sensors: `dryer_motion` interprets 027e as off/pause (0), direction A
+(1) or direction B (2). This is a suspected command, not physical motion feedback.
+`dryer_phase` separates program active (0270=aa) from inactive states (55).
+Motor commands with 55 are labelled possible anti-crease; they never imply a new
+program start. Inactive without motor command cannot distinguish waiting from
+completion. Unknown markers remain Unknown. No finished event or countdown is
+emitted from this single run.
+
+Raw sensors `dryer_post_run_raw` (0260), `dryer_motion_raw` (027e) and
+`dryer_transition_raw` (027f) expose the supporting observations. The 0260 marker
+returned to zero after briefly becoming one; it is not a latched completion flag.
+In the uploaded cold run, aa changed to 55 about 13m12s after the first aa sample;
+subsequent motor markers 1 and 2 occurred with 55. Physical direction and the
+anti-crease interpretation remain unverified. Existing `dryer_run_state` refers
+to the program marker, including its pauses, not drum movement.
