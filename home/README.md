@@ -192,3 +192,55 @@ also works with older firmware; firmware `eeprom128` now uses the correct stride
 After updating firmware, `./diag.py HOST eeprom1 KEY ADDRESS` reads exactly one
 byte at the raw protocol address. For ID498, compare addresses `0x00ff` and
 `0x0100` with key `0x2b2c`. USB equivalent: `diag eeprom1 KEY ADDRESS`.
+
+## Autonomous full-access key scan (HALT test)
+
+Use only with an idle appliance that you can power-cycle. The full-access scan
+uses the supplied read key, tries known full-access candidates first, and tests
+HALT once per attempt. It performs no RAM/EEPROM writes. A HALT acknowledgement
+stops the scan immediately and stores `full_key` with `halt_ack=1`; this is a
+single acknowledgement, not an independently confirmed write test.
+
+```sh
+./diag.py HOST scan-reset
+./diag.py HOST scan-full-start 0x2b2c 0x0000 0xffff --timeout-ms 100
+./diag.py HOST scan-status --watch 10
+```
+
+`scan-reset` discards the previous scan result: retain the known read key first.
+The usual pause/resume/status commands apply. Repeating start requires identical
+mode, read key, range and initial timeout settings. Errors retain the candidate
+and increase the timeout by 5 ms, pausing at the limit. The RX timeout excludes
+HALT transmission and echo. A silent HALT is only counted negative after the
+same software ID responds again; partial responses are retried as errors.
+
+Before HALT the candidate is saved as a paused checkpoint. If the ESP restarts
+there, or the appliance stops responding after HALT, status shows `pending_key`
+and the scan stays paused. This is an uncertain result, not a confirmed key.
+Power-cycle/check the appliance before explicitly resuming. No automatic MQTT
+or bridge traffic is issued while a full-access hit or paused pending test is
+held; explicit diagnostic commands remain available. If the acknowledgement was
+lost but the device stays responsive, a candidate can still be missed.
+
+Full scans use FKS4 journal records; existing FKS3 read-scan records remain
+readable. Do not downgrade firmware with a full-access job stored: old firmware
+cannot interpret that job. Reset the job first if a downgrade is necessary.
+
+## Read with full diagnostic access
+
+`mem16`, `eeprom1`, `eeprom16`, `dump-memory` and `dump-eeprom` accept
+`--full-key KEY`. Every session unlocks read access first and full access second,
+including renewed sessions inside 128-byte firmware reads. Only reads follow:
+these commands do not send HALT or write appliance memory. Updated firmware is
+required; distinct `full-*` wire commands prevent silent read-only fallback.
+For ID498, `0x0f2f` has produced repeated HALT acknowledgements with read key
+`0x2b2c`; additional readable ranges or write capability are not yet verified.
+
+```sh
+./diag.py HOST mem16 0x2b2c 0x0480 --full-key 0x0f2f
+./diag.py HOST eeprom1 0x2b2c 0x0100 --full-key 0x0f2f
+```
+
+Use a fresh output filename for full-access dumps so previous read-only data
+is not silently reused by dump resume. A found scan need not be reset to issue
+these explicit diagnostics. Pause a running scan first.

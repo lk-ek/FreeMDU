@@ -514,12 +514,14 @@ def probe_unknown_device(
     print(f"probe: complete -> {run_dir}", file=sys.stderr)
 
 def read_block(
-    host: str, port: int, token: str, kind: str, key: int, address: int, size: int = CHUNK_SIZE
+    host: str, port: int, token: str, kind: str, key: int, address: int, size: int = CHUNK_SIZE, full_key: int | None = None
 ) -> bytes:
-    if size not in (CHUNK_SIZE, DUMP_CHUNK_SIZE):
+    if size not in (1, CHUNK_SIZE, DUMP_CHUNK_SIZE) or (size == 1 and kind != "eeprom"):
         raise RuntimeError(f"unsupported diagnostic block size: {size}")
     suffix = size
     command = f"eeprom{suffix}" if kind == "eeprom" else f"mem{suffix}"
+    if full_key is not None:
+        command = "full-" + command
     width = 4 if kind == "eeprom" else 8
     reply = request(
         host,
@@ -528,6 +530,7 @@ def read_block(
         command,
         f"0x{key:04x}",
         f"0x{address:0{width}x}",
+        *([] if full_key is None else [f"0x{full_key:04x}"]),
     )
 
     expected = f"OK kind={kind} address=0x{address:0{width}x} data="
@@ -572,6 +575,7 @@ def dump_range(
     start: int,
     end: int,
     output: Path,
+    full_key: int | None = None,
 ) -> None:
     if start > end:
         raise RuntimeError("start must not be greater than end")
@@ -645,7 +649,8 @@ def dump_range(
                 block_size = CHUNK_SIZE
 
             try:
-                data = read_block(host, port, token, kind, key, address, block_size)
+                data = read_block(host, port, token, kind, key, address, block_size,
+                                  **({} if full_key is None else {"full_key": full_key}))
             except (OSError, DiagnosticDisconnect, DiagnosticTransientError) as exc:
                 # Every block uses a fresh TCP connection. Keep the last fully
                 # written block as the resume point and retry the same
@@ -790,7 +795,12 @@ def main() -> None:
     dump_eeprom.add_argument("--start", type=number32, default="0x0000", help="byte offset")
     dump_eeprom.add_argument("--end", type=number32, required=True, help="inclusive byte offset")
 
+    for command_parser in (mem, single, eeprom, dump_mem, dump_eeprom):
+        command_parser.add_argument("--full-key", type=number16,
+                                    help="unlock full access after the read key; only reads follow")
+
     args = parser.parse_args()
+    full_key = int(args.full_key, 0) if getattr(args, "full_key", None) is not None else None
 
     try:
         token = args.token or load_config_value("OTA_TOKEN")
@@ -830,33 +840,29 @@ def main() -> None:
             print(request(args.host, args.port, token, "max-baud"))
         elif args.command == "mem16":
             data = read_block(
-                args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0)
+                args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0), full_key=full_key
             )
             print(data.hex())
         elif args.command == "eeprom1":
-            reply = request(args.host, args.port, token, "eeprom1",
-                            args.key, args.address)
-            match = re.fullmatch(r"OK kind=eeprom address=0x[0-9a-fA-F]{4} data=([0-9a-fA-F]{2})", reply.strip())
-            if match is None:
-                raise RuntimeError(reply)
-            print(match.group(1).lower())
+            print(read_block(args.host, args.port, token, "eeprom", int(args.key, 0),
+                             int(args.address, 0), 1, full_key=full_key).hex())
         elif args.command == "eeprom16":
             address = int(args.address, 0)
             if address > 0xFFF0:
                 parser.error("eeprom16 address must be <= 0xfff0")
             data = read_block(
-                args.host, args.port, token, "eeprom", int(args.key, 0), address
+                args.host, args.port, token, "eeprom", int(args.key, 0), address, full_key=full_key
             )
             print(data.hex())
         elif args.command == "dump-memory":
             dump_range(
                 args.host, args.port, token, "memory", int(args.key, 0),
-                int(args.start, 0), int(args.end, 0), args.output,
+                int(args.start, 0), int(args.end, 0), args.output, full_key=full_key,
             )
         elif args.command == "dump-eeprom":
             dump_range(
                 args.host, args.port, token, "eeprom", int(args.key, 0),
-                int(args.start, 0), int(args.end, 0), args.output,
+                int(args.start, 0), int(args.end, 0), args.output, full_key=full_key,
             )
     except (OSError, RuntimeError) as exc:
         print(f"error: {exc}", file=sys.stderr)

@@ -117,22 +117,27 @@ enum DiagnosticCommand {
         maximum_ms: u16,
     },
     ReadMemory16 {
+        full_key: Option<u16>,
         key: u16,
         address: u32,
     },
     ReadMemory128 {
+        full_key: Option<u16>,
         key: u16,
         address: u32,
     },
     ReadEeprom1 {
+        full_key: Option<u16>,
         key: u16,
         address: u16,
     },
     ReadEeprom16 {
+        full_key: Option<u16>,
         key: u16,
         address: u16,
     },
     ReadEeprom128 {
+        full_key: Option<u16>,
         key: u16,
         address: u16,
     },
@@ -787,6 +792,7 @@ async fn execute_diagnostic_command(
             return scan_status();
         }
         DiagnosticCommand::ScanReset => {
+            SCAN_CURRENT.store(0x10000, Ordering::Relaxed);
             scan.state = ScanState::empty();
             scan.save();
             return scan_status();
@@ -853,6 +859,7 @@ async fn execute_diagnostic_command(
                     return diagnostic_error("ERR fixed_read_key_failed");
                 }
             }
+            SCAN_CURRENT.store(0x10000, Ordering::Relaxed);
             state.full_read_key = full_read_key;
             scan.state = state;
             scan.save();
@@ -890,10 +897,14 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::ReadMemory16 { key, address } => {
+        DiagnosticCommand::ReadMemory16 {
+            full_key,
+            key,
+            address,
+        } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -918,10 +929,14 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::ReadMemory128 { key, address } => {
+        DiagnosticCommand::ReadMemory128 {
+            full_key,
+            key,
+            address,
+        } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -929,7 +944,7 @@ async fn execute_diagnostic_command(
             let mut data = [0u8; 0x80];
             for block in 0..8 {
                 if block == 4 {
-                    if let Err(err) = prepare_read_access(&mut intf, key).await {
+                    if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                         let _ = writeln!(&mut response, "{err}");
                         return response;
                     }
@@ -974,10 +989,14 @@ async fn execute_diagnostic_command(
             }
             let _ = writeln!(&mut response);
         }
-        DiagnosticCommand::ReadEeprom1 { key, address } => {
+        DiagnosticCommand::ReadEeprom1 {
+            full_key,
+            key,
+            address,
+        } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -1002,10 +1021,14 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::ReadEeprom16 { key, address } => {
+        DiagnosticCommand::ReadEeprom16 {
+            full_key,
+            key,
+            address,
+        } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -1030,7 +1053,11 @@ async fn execute_diagnostic_command(
                 }
             }
         }
-        DiagnosticCommand::ReadEeprom128 { key, address } => {
+        DiagnosticCommand::ReadEeprom128 {
+            full_key,
+            key,
+            address,
+        } => {
             let mut intf = MieleInterface::new(&mut *port);
 
             let address_unit = match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
@@ -1039,7 +1066,7 @@ async fn execute_diagnostic_command(
                 _ => return diagnostic_error("ERR query_software_id failed"),
             };
 
-            if let Err(err) = prepare_read_access(&mut intf, key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -1047,7 +1074,7 @@ async fn execute_diagnostic_command(
             let mut data = [0u8; 0x80];
             for block in 0..8 {
                 if block == 4 {
-                    if let Err(err) = prepare_read_access(&mut intf, key).await {
+                    if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
                         let _ = writeln!(&mut response, "{err}");
                         return response;
                     }
@@ -1399,6 +1426,7 @@ impl core::error::Error for SoftwareIdChanged {}
 async fn prepare_read_access(
     intf: &mut MieleInterface<&mut OpticalPort<'_>>,
     key: u16,
+    full_key: Option<u16>,
 ) -> Result<(), &'static str> {
     match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
         Ok(Ok(id)) => debug!("DIAG connected to software ID {id}"),
@@ -1426,7 +1454,19 @@ async fn prepare_read_access(
             warn!("DIAG unlock_read_access timeout: {err:?}");
             Err("ERR unlock_read_access timeout")
         }
+    }?;
+    if let Some(full_key) = full_key {
+        match intf
+            .unlock_full_access(full_key)
+            .with_timeout(DEVICE_TIMEOUT)
+            .await
+        {
+            Ok(Ok(())) => (),
+            Ok(Err(_)) => return Err("ERR unlock_full_access"),
+            Err(_) => return Err("ERR unlock_full_access timeout"),
+        }
     }
+    Ok(())
 }
 
 #[embassy_executor::task]
@@ -2119,11 +2159,13 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
     while offset <= end {
         let command = if kind == "memory" {
             DiagnosticCommand::ReadMemory16 {
+                full_key: None,
                 key,
                 address: offset,
             }
         } else {
             DiagnosticCommand::ReadEeprom16 {
+                full_key: None,
                 key,
                 // The serial CLI uses byte offsets; ID498 is byte-addressed.
                 address: (offset / address_unit) as u16,
@@ -2180,7 +2222,12 @@ async fn serial_diag_probe_unknown() {
     let mut selected_key = None;
     for candidate in KNOWN_READ_KEYS {
         let key = candidate.key;
-        let response = run_diag_command(DiagnosticCommand::ReadMemory16 { key, address: 0 }).await;
+        let response = run_diag_command(DiagnosticCommand::ReadMemory16 {
+            full_key: None,
+            key,
+            address: 0,
+        })
+        .await;
 
         if response.as_bytes().starts_with(b"OK ") {
             esp_println::println!("SERPROBE READ_KEY key=0x{:04x} result=ok", key);
@@ -2260,7 +2307,12 @@ async fn handle_serial_diag_line(line: &str) {
 
             if let (Some(key), Some(address), None) = (key, address, fields.next()) {
                 serial_diag_print_response(
-                    &run_diag_command(DiagnosticCommand::ReadMemory16 { key, address }).await,
+                    &run_diag_command(DiagnosticCommand::ReadMemory16 {
+                        full_key: None,
+                        key,
+                        address,
+                    })
+                    .await,
                 );
             } else {
                 esp_println::println!("SERDIAG ERR usage: diag mem16 KEY ADDR");
@@ -2272,7 +2324,12 @@ async fn handle_serial_diag_line(line: &str) {
 
             if let (Some(key), Some(address), None) = (key, address, fields.next()) {
                 serial_diag_print_response(
-                    &run_diag_command(DiagnosticCommand::ReadEeprom1 { key, address }).await,
+                    &run_diag_command(DiagnosticCommand::ReadEeprom1 {
+                        full_key: None,
+                        key,
+                        address,
+                    })
+                    .await,
                 );
             } else {
                 esp_println::println!("SERDIAG ERR usage: diag eeprom1 KEY ADDR");
@@ -2284,7 +2341,12 @@ async fn handle_serial_diag_line(line: &str) {
 
             if let (Some(key), Some(address), None) = (key, address, fields.next()) {
                 serial_diag_print_response(
-                    &run_diag_command(DiagnosticCommand::ReadEeprom16 { key, address }).await,
+                    &run_diag_command(DiagnosticCommand::ReadEeprom16 {
+                        full_key: None,
+                        key,
+                        address,
+                    })
+                    .await,
                 );
             } else {
                 esp_println::println!("SERDIAG ERR usage: diag eeprom16 KEY WORD_ADDR");
@@ -2433,57 +2495,137 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
             ) => parse_scan_command(name, &mut fields),
             Some("id") if fields.next().is_none() => Some(DiagnosticCommand::QueryId),
             Some("max-baud") if fields.next().is_none() => Some(DiagnosticCommand::QueryMaxBaud),
-            Some("mem16") => {
+            Some(name @ ("mem16" | "full-mem16")) => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u32);
+                let full_key = if name.starts_with("full-") {
+                    match fields.next().and_then(parse_diag_u16) {
+                        Some(key) => Some(key),
+                        None => {
+                            let _ = tcp_write_all(&mut socket, b"ERR missing full key\n").await;
+                            socket.close();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 if fields.next().is_none() {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadMemory16 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadMemory16 {
+                            full_key,
+                            key,
+                            address,
+                        })
                 } else {
                     None
                 }
             }
-            Some("mem128") => {
+            Some(name @ ("mem128" | "full-mem128")) => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u32);
+                let full_key = if name.starts_with("full-") {
+                    match fields.next().and_then(parse_diag_u16) {
+                        Some(key) => Some(key),
+                        None => {
+                            let _ = tcp_write_all(&mut socket, b"ERR missing full key\n").await;
+                            socket.close();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 if fields.next().is_none() {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadMemory128 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadMemory128 {
+                            full_key,
+                            key,
+                            address,
+                        })
                 } else {
                     None
                 }
             }
-            Some("eeprom1") => {
+            Some(name @ ("eeprom1" | "full-eeprom1")) => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u16);
+                let full_key = if name.starts_with("full-") {
+                    match fields.next().and_then(parse_diag_u16) {
+                        Some(key) => Some(key),
+                        None => {
+                            let _ = tcp_write_all(&mut socket, b"ERR missing full key\n").await;
+                            socket.close();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 if fields.next().is_none() {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadEeprom1 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom1 {
+                            full_key,
+                            key,
+                            address,
+                        })
                 } else {
                     None
                 }
             }
-            Some("eeprom16") => {
+            Some(name @ ("eeprom16" | "full-eeprom16")) => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u16);
+                let full_key = if name.starts_with("full-") {
+                    match fields.next().and_then(parse_diag_u16) {
+                        Some(key) => Some(key),
+                        None => {
+                            let _ = tcp_write_all(&mut socket, b"ERR missing full key\n").await;
+                            socket.close();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 if fields.next().is_none() && address.is_none_or(|address| address <= 0xfff0) {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadEeprom16 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom16 {
+                            full_key,
+                            key,
+                            address,
+                        })
                 } else {
                     None
                 }
             }
-            Some("eeprom128") => {
+            Some(name @ ("eeprom128" | "full-eeprom128")) => {
                 let key = fields.next().and_then(parse_diag_u16);
                 let address = fields.next().and_then(parse_diag_u16);
+                let full_key = if name.starts_with("full-") {
+                    match fields.next().and_then(parse_diag_u16) {
+                        Some(key) => Some(key),
+                        None => {
+                            let _ = tcp_write_all(&mut socket, b"ERR missing full key\n").await;
+                            socket.close();
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                };
 
                 if fields.next().is_none() && address.is_none_or(|address| address <= 0xff80) {
                     key.zip(address)
-                        .map(|(key, address)| DiagnosticCommand::ReadEeprom128 { key, address })
+                        .map(|(key, address)| DiagnosticCommand::ReadEeprom128 {
+                            full_key,
+                            key,
+                            address,
+                        })
                 } else {
                     None
                 }
