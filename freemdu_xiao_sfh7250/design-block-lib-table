@@ -1,0 +1,4 @@
+(design_block_lib_table
+	(version 7)
+	(lib (name "freemdu_library") (type "KiCad") (uri "${KIPRJMOD}/freemdu_library.kicad_blocks") (options "") (descr "freemdu"))
+)

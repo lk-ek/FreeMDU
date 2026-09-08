@@ -1,0 +1,4 @@
+(fp_lib_table
+  (version 7)
+  (lib (name "FreeMDU_Optics")(type "KiCad")(uri "${KIPRJMOD}/footprints/FreeMDU_Optics.pretty")(options "")(descr "Local FreeMDU optical footprints"))
+)

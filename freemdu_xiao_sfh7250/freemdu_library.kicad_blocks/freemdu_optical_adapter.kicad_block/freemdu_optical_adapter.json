@@ -1,0 +1,9 @@
+{
+"description": "",
+"keywords": "",
+"fields": {
+"FREEMDU_IR_TX": "IR_TX",
+"FREEMDU_IR_RX_RAW": "IR_RX_RAW",
+"FREEMDU_IR_RX": "IR_RX_D4"
+}
+}
