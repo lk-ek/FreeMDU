@@ -319,3 +319,24 @@ In the uploaded cold run, aa changed to 55 about 13m12s after the first aa sampl
 subsequent motor markers 1 and 2 occurred with 55. Physical direction and the
 anti-crease interpretation remain unverified. Existing `dryer_run_state` refers
 to the program marker, including its pauses, not drum movement.
+
+
+## ID498 validation update (2026-09-08)
+
+The annotated capture confirms: opening the door while running changes aa to 55;
+closing it leaves 55 and the appliance waits for Start; pressing Start returns aa.
+Turning the selector to Ende also changes aa to 55. Selecting cold again without
+Start leaves 55. Consequently 55 is not a completion indication. Closed-door idle,
+interrupted and post-run states are deliberately not distinguished without history.
+An open door with 55 is shown as Door open / inactive; conflicting samples remain
+Unknown. No inferred finished, paused-cycle or anti-crease event is emitted.
+
+Additional annotated selector positions: 01 Koch/Bunt Schranktrocken/Schonen,
+03 Koch/Bunt Buegelfeucht, 02 Mangelfeucht, 06 Glaetten, 07 Finish Wolle.
+Koch/Bunt Schranktrocken WITHOUT plus was not captured unambiguously and remains
+unmapped. Some reads took 6–12 seconds and overlapped selector changes; no mapping
+is invented for the missing position. All three blocks are sequential, so an
+individual snapshot may contain values from opposite sides of a transition.
+
+Direction and anti-crease interpretations above remain research hypotheses.
+The motion entity now reports Marker 0/1/2 only; its existing identifier is retained.

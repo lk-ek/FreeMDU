@@ -14,14 +14,19 @@ pub const FULL_KEY: u16 = 0x0f2f;
 /// Decode only program selector positions observed on the T4223C.
 pub fn program(raw: u8) -> &'static str {
     match raw {
-        0x0f => "Ende",
-        0x0e => "Koch/Bunt Schranktrocken+",
-        0x08 => "Pflegeleicht Schranktrocken+",
-        0x09 => "Pflegeleicht Schranktrocken",
-        0x0d => "Pflegeleicht Schranktrocken / Schonen",
-        0x0c => "Pflegeleicht Buegelfeucht",
-        0x04 => "20 min warm",
-        0x05 => "15 min kalt",
+        15 => "Ende",
+        14 => "Koch/Bunt Schranktrocken+",
+        1 => "Koch/Bunt Schranktrocken / Schonen",
+        3 => "Koch/Bunt Buegelfeucht",
+        2 => "Koch/Bunt Mangelfeucht",
+        6 => "Glaetten",
+        7 => "Finish Wolle",
+        8 => "Pflegeleicht Schranktrocken+",
+        9 => "Pflegeleicht Schranktrocken",
+        13 => "Pflegeleicht Schranktrocken / Schonen",
+        12 => "Pflegeleicht Buegelfeucht",
+        4 => "20 min warm",
+        5 => "15 min kalt",
         _ => "Unknown",
     }
 }
@@ -42,12 +47,12 @@ pub fn running(raw: u8) -> &'static str {
     }
 }
 
-/// Inferred motor command, not measured drum movement or absolute direction.
+/// Raw direction marker; physical movement is not verified.
 pub fn motion(raw: u8) -> &'static str {
     match raw {
-        0 => "Off / pause",
-        1 => "Direction A (inferred)",
-        2 => "Direction B (inferred)",
+        0 => "Marker 0",
+        1 => "Marker 1",
+        2 => "Marker 2",
         _ => "Unknown",
     }
 }
@@ -55,9 +60,18 @@ pub fn motion(raw: u8) -> &'static str {
 pub fn phase(selector: u8, run: u8, motor: u8) -> &'static str {
     match (selector, run, motor) {
         (_, 0xaa, 0..=2) => "Program active",
-        (0x0f, 0x55, 0) => "Selector at Ende",
-        (_, 0x55, 1..=2) => "Inactive with motor command (possible anti-crease)",
-        (_, 0x55, 0) => "Inactive / waiting / post-run",
+        (15, 0x55, 0) => "Selector at Ende",
+        (_, 0x55, 1..=2) => "Inactive / waiting / interrupted / post-run",
+        (_, 0x55, 0) => "Inactive / waiting / interrupted / post-run",
+        _ => "Unknown",
+    }
+}
+
+/// A closed door with an inactive marker does not prove readiness or completion.
+pub fn observed_phase(selector: u8, run: u8, motor: u8, triplet: [u8; 3]) -> &'static str {
+    match (door(triplet), run) {
+        ("Open", 0x55) => "Door open / inactive",
+        ("Closed", _) => phase(selector, run, motor),
         _ => "Unknown",
     }
 }
@@ -67,7 +81,7 @@ pub const PROPERTIES: &[Property] = &[
     Property {
         kind: PropertyKind::Operation,
         id: "dryer_motion",
-        name: "Dryer motor command (inferred)",
+        name: "Dryer direction marker (raw)",
         unit: None,
     },
     Property {
@@ -167,7 +181,10 @@ impl Snapshot {
     pub fn value<E>(&self, prop: &Property) -> Result<Value, E> {
         Ok(match prop.id {
             "dryer_motion" => motion(self.run[14]).to_string().into(),
-            "dryer_phase" => phase(self.program[6], self.run[0], self.run[14])
+            "dryer_phase" => observed_phase(
+                self.program[6], self.run[0], self.run[14],
+                [self.door[5], self.door[6], self.door[7]],
+            )
                 .to_string()
                 .into(),
             "dryer_post_run_raw" => format!("0x{:02x}", self.door[0]).into(),
@@ -326,13 +343,24 @@ mod tests {
         assert!(!PROPERTIES.iter().any(|p| p.id.contains("finished")));
     }
     #[test]
+    fn validated_interruption_and_selectors() {
+        assert_eq!(observed_phase(5, 0x55, 0, [1, 1, 1]), "Door open / inactive");
+        assert_eq!(observed_phase(5, 0x55, 0, [0, 0, 0]), "Inactive / waiting / interrupted / post-run");
+        assert_eq!(observed_phase(5, 0xaa, 1, [0, 0, 0]), "Program active");
+        assert_eq!(observed_phase(5, 0xaa, 1, [1, 1, 1]), "Unknown");
+        assert_eq!(observed_phase(5, 0x55, 0, [0, 1, 0]), "Unknown");
+        for (raw, label) in [(1, "Koch/Bunt Schranktrocken / Schonen"), (3, "Koch/Bunt Buegelfeucht"), (2, "Koch/Bunt Mangelfeucht"), (6, "Glaetten"), (7, "Finish Wolle")] {
+            assert_eq!(program(raw), label);
+        }
+    }
+    #[test]
     fn post_run_motion_does_not_restart_program() {
         assert_eq!(phase(5, 0xaa, 0), "Program active");
         assert_eq!(
             phase(5, 0x55, 1),
-            "Inactive with motor command (possible anti-crease)"
+            "Inactive / waiting / interrupted / post-run"
         );
-        assert_eq!(phase(5, 0x55, 0), "Inactive / waiting / post-run");
+        assert_eq!(phase(5, 0x55, 0), "Inactive / waiting / interrupted / post-run");
         assert_eq!(phase(15, 0x55, 0), "Selector at Ende");
         assert_eq!(phase(5, 0, 1), "Unknown");
         assert_eq!(motion(3), "Unknown");
