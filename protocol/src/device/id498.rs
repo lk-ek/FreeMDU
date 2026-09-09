@@ -186,9 +186,14 @@ impl Snapshot {
                 .into(),
             "dryer_run_state" => running(self.run[0]).to_string().into(),
             "dryer_motion" => motion(self.run[14]).to_string().into(),
-            "dryer_phase" => observed_phase(self.program[6], self.run[0], self.run[14], [self.door[5], self.door[6], self.door[7]])
-                .to_string()
-                .into(),
+            "dryer_phase" => observed_phase(
+                self.program[6],
+                self.run[0],
+                self.run[14],
+                [self.door[5], self.door[6], self.door[7]],
+            )
+            .to_string()
+            .into(),
             "dryer_program_raw" => format!("0x{:02x}", self.program[6]).into(),
             "dryer_door_raw" => format!(
                 "{:02x} {:02x} {:02x}",
@@ -343,12 +348,24 @@ mod tests {
     }
     #[test]
     fn validated_interruption_and_selectors() {
-        assert_eq!(observed_phase(5, 0x55, 0, [1, 1, 1]), "Door open / inactive");
-        assert_eq!(observed_phase(5, 0x55, 0, [0, 0, 0]), "Inactive / waiting / interrupted / post-run");
+        assert_eq!(
+            observed_phase(5, 0x55, 0, [1, 1, 1]),
+            "Door open / inactive"
+        );
+        assert_eq!(
+            observed_phase(5, 0x55, 0, [0, 0, 0]),
+            "Inactive / waiting / interrupted / post-run"
+        );
         assert_eq!(observed_phase(5, 0xaa, 1, [0, 0, 0]), "Program active");
         assert_eq!(observed_phase(5, 0xaa, 1, [1, 1, 1]), "Unknown");
         assert_eq!(observed_phase(5, 0x55, 0, [0, 1, 0]), "Unknown");
-        for (raw, label) in [(1, "Koch/Bunt Schranktrocken / Schonen"), (3, "Koch/Bunt Buegelfeucht"), (2, "Koch/Bunt Mangelfeucht"), (6, "Glaetten"), (7, "Finish Wolle")] {
+        for (raw, label) in [
+            (1, "Koch/Bunt Schranktrocken / Schonen"),
+            (3, "Koch/Bunt Buegelfeucht"),
+            (2, "Koch/Bunt Mangelfeucht"),
+            (6, "Glaetten"),
+            (7, "Finish Wolle"),
+        ] {
             assert_eq!(program(raw), label);
         }
     }
@@ -363,6 +380,9 @@ mod tests {
             phase(5, 0x55, 1),
             "Inactive / waiting / interrupted / post-run"
         );
-        assert_eq!(phase(5, 0x55, 0), "Inactive / waiting / interrupted / post-run");
+        assert_eq!(
+            phase(5, 0x55, 0),
+            "Inactive / waiting / interrupted / post-run"
+        );
     }
 }
