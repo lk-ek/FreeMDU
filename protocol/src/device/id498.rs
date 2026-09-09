@@ -16,6 +16,7 @@ macro_rules! compatible_software_ids {
 pub(super) use compatible_software_ids;
 
 /// Decode observed selector positions; unsupported positions remain unknown.
+#[must_use]
 pub fn program(raw: u8) -> &'static str {
     match raw {
         15 => "Ende",
@@ -35,6 +36,7 @@ pub fn program(raw: u8) -> &'static str {
     }
 }
 /// Require agreement between all three observed door bytes.
+#[must_use]
 pub fn door(raw: [u8; 3]) -> &'static str {
     match raw {
         [0, 0, 0] => "Closed",
@@ -43,6 +45,7 @@ pub fn door(raw: [u8; 3]) -> &'static str {
     }
 }
 /// Program marker, not actual drum movement or a completion indication.
+#[must_use]
 pub fn running(raw: u8) -> &'static str {
     match raw {
         0xaa => "Running",
@@ -51,6 +54,7 @@ pub fn running(raw: u8) -> &'static str {
     }
 }
 /// Raw marker labels: physical movement and direction remain unverified.
+#[must_use]
 pub fn motion(raw: u8) -> &'static str {
     match raw {
         0 => "Marker 0",
@@ -60,16 +64,17 @@ pub fn motion(raw: u8) -> &'static str {
     }
 }
 /// Stateless phase interpretation cannot distinguish all inactive states.
+#[must_use]
 pub fn phase(selector: u8, run: u8, motor: u8) -> &'static str {
     match (selector, run, motor) {
         (_, 0xaa, 0..=2) => "Program active",
         (15, 0x55, 0) => "Selector at Ende",
-        (_, 0x55, 1..=2) => "Inactive / waiting / interrupted / post-run",
-        (_, 0x55, 0) => "Inactive / waiting / interrupted / post-run",
+        (_, 0x55, 0..=2) => "Inactive / waiting / interrupted / post-run",
         _ => "Unknown",
     }
 }
 /// A closed door with an inactive marker does not prove readiness or completion.
+#[must_use]
 pub fn observed_phase(selector: u8, run: u8, motor: u8, triplet: [u8; 3]) -> &'static str {
     match (door(triplet), run) {
         ("Open", 0x55) => "Door open / inactive",
