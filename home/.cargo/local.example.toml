@@ -4,13 +4,15 @@
 # configuration such as alternate GPIO assignments.
 
 [env]
-# Example XIAO ESP32-C3 optical interface overrides:
-PIN_OPTICAL_RX = "3"
-PIN_OPTICAL_TX = "4"
-
-# Add any other local pin/config overrides here as needed.
-# PIN_ACCEL_SDA = "6"
-# PIN_ACCEL_SCL = "7"
+# XIAO ESP32-C3 defaults in config.toml: dryer D3/D4 (GPIO5/6),
+# washer D6/D7 (GPIO21/20). Override these for another board.
+# PIN_OPTICAL_TX = "5"
+# PIN_OPTICAL_RX = "6"
+# PIN_OPTICAL2_TX = "21"
+# PIN_OPTICAL2_RX = "20"
+# Accelerometer: set these to its actual, distinct SDA/SCL pins.
+# PIN_ACCEL_SDA = "3"
+# PIN_ACCEL_SCL = "4"
 
 WIFI_SSID = ""
 WIFI_PASSWORD = ""

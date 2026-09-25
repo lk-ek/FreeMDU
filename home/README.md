@@ -12,7 +12,16 @@ The firmware currently supports only the Espressif **ESP32-C3** and **ESP32-C6**
 
 Because $R_P$ determines the phototransistor's sensitivity, an appropriate resistance must be selected. In most cases, a value of approximately $`47\,\text{k}\Omega`$ works well.
 
-By default, the firmware uses the `UART1` peripheral for infrared communication, with pin `0` as RX and `1` as TX. Pin `10` can be connected to an active-low status LED. All pin assignments can be modified in the [`.cargo/config.toml`](.cargo/config.toml) file.
+The standalone firmware uses two independent optical UARTs on a XIAO ESP32-C3:
+
+| Appliance | UART | TX | RX | GPIO TX/RX |
+| --- | --- | --- | --- | --- |
+| Dryer (IR) | UART1 | D3 | D4 | 5 / 6 |
+| Washer (IR2) | UART0 | D6 | D7 | 21 / 20 |
+
+Pin `10` drives the active-low status LED. The accelerometer defaults to D1/D2 (GPIO3/4); set `PIN_ACCEL_SDA` and `PIN_ACCEL_SCL` in your ignored `.cargo/local.toml` to match its actual wiring. Do not assign a GPIO to both an optical port and the accelerometer. On other boards, override all pin numbers in `.cargo/local.toml` using the board's GPIO map (XIAO ESP32-C6 uses different GPIO numbers for the same D labels).
+
+The USB bridge firmware continues to use UART1 (dryer). The standalone diagnostic TCP/USB console, autonomous key scan and remote optical bridge also target UART1. Normal MQTT polling and Home Assistant entities operate on both UARTs independently; the ID410 RAM trace targets the washer on UART0.
 
 ### Firmware modes
 
@@ -47,27 +56,29 @@ In bridge mode, connect the microcontroller to your desktop computer via USB. It
 Device properties are published to MQTT topics in the following format:
 
 ```
-freemdu_home/<DEV>/<PROP>/value
+freemdu_home/<DEV>/<CHANNEL>/<PROP>/value
 ```
 
-The `<DEV>` placeholder represents the device's hardware address and `<PROP>` is the property ID. For example:
+The `<DEV>` placeholder represents the ESP's hardware address, `<CHANNEL>` is `dryer` or `washer`, and `<PROP>` is the property ID. For example:
 
 ```
-freemdu_home/b43a45abcdef/program_options/value
+freemdu_home/b43a45abcdef/dryer/program_options/value
 ```
+
+Older Home Assistant discovery entries from the single-port firmware may need removing once after this topic migration. Each channel publishes its own availability (`dryer/status` and `washer/status`), in addition to the gateway status.
 
 ### Triggering actions
 
 Device actions are triggered by publishing values to MQTT topics with the following format:
 
 ```
-freemdu_home/<DEV>/<ACTION>/trigger
+freemdu_home/<DEV>/<CHANNEL>/<ACTION>/trigger
 ```
 
-The `<DEV>` placeholder represents the device's hardware address and `<ACTION>` is the action ID. For example:
+The `<DEV>` placeholder represents the ESP's hardware address, `<CHANNEL>` is `dryer` or `washer`, and `<ACTION>` is the action ID. For example:
 
 ```
-freemdu_home/b43a45abcdef/start_program/trigger
+freemdu_home/b43a45abcdef/washer/start_program/trigger
 ```
 
 Some actions require parameters, in which case the published value is used as the argument. Actions without parameters ignore the published value. Due to technical limitations, actions requiring parameters are currently not displayed in Home Assistant, but can still be triggered via MQTT.

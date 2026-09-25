@@ -6,8 +6,14 @@ target = ""
 ESP_LOG = "info"
 
 PIN_LED_STATUS = "10"
-PIN_OPTICAL_RX = "0"
-PIN_OPTICAL_TX = "1"
+# XIAO ESP32-C3: dryer on D3/D4, washer on D6/D7.
+PIN_OPTICAL_TX = "5"
+PIN_OPTICAL_RX = "6"
+PIN_OPTICAL2_TX = "21"
+PIN_OPTICAL2_RX = "20"
+# Accelerometer must not share optical GPIOs (adapt to your actual wiring).
+PIN_ACCEL_SDA = "3"
+PIN_ACCEL_SCL = "4"
 
 WIFI_SSID = ""
 WIFI_PASSWORD = ""

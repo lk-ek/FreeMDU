@@ -99,6 +99,16 @@ use freemdu::known_read_keys::KNOWN_READ_KEYS;
 
 /// MQTT topic used to report device availability
 const STATUS_TOPIC: Topic<&str> = Topic::Device("status");
+const DRYER: &str = "dryer";
+const WASHER: &str = "washer";
+const DRYER_STATUS: Topic<&str> = Topic::Device("dryer/status");
+const WASHER_STATUS: Topic<&str> = Topic::Device("washer/status");
+
+struct DeviceAction {
+    id: String,
+    param: String,
+}
+static WASHER_ACTIONS: Channel<CriticalSectionRawMutex, DeviceAction, 4> = Channel::new();
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticCommand {
@@ -376,8 +386,6 @@ async fn mqtt_message_task(
 ) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
     let mut published_id = 0u16;
-    let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
-    let mut id410_trace = Id410Trace::new();
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
     let mut scan = ScanJob::open(flash);
@@ -429,10 +437,7 @@ async fn mqtt_message_task(
                     receiver.receive(),
                     select::select(
                         ticker.next(),
-                        select::select(
-                            trace_ticker.next(),
-                            port.debug_read_activity(&mut ir_debug_buf),
-                        ),
+                        port.debug_read_activity(&mut ir_debug_buf),
                     ),
                 ),
             ),
@@ -450,7 +455,6 @@ async fn mqtt_message_task(
 
                 BRIDGE_ACTIVE.store(false, Ordering::Relaxed);
                 ticker.reset();
-                trace_ticker.reset();
                 info!("Remote optical bridge released UART");
             }
             Either::First(_) => {
@@ -479,15 +483,24 @@ async fn mqtt_message_task(
                 payload,
             )))) => {
                 if let Ok(param) = str::from_utf8(&payload)
-                    && let Some((id, "trigger")) = topic.split_once('/')
-                    && let Err(err) = trigger_action(&mut port, id, param).await
+                    && let Some((channel, rest)) = topic.split_once('/')
+                    && let Some((id, "trigger")) = rest.split_once('/')
                 {
-                    error!("Failed to trigger action: {err:#}");
-                    let _ = port.resynchronize().await;
+                    if channel == WASHER {
+                        WASHER_ACTIONS.send(DeviceAction {
+                            id: id.to_string(),
+                            param: param.to_string(),
+                        }).await;
+                    } else if channel == DRYER {
+                        if let Err(err) = trigger_action(&mut port, id, param).await {
+                            error!("Failed to trigger dryer action: {err:#}");
+                            let _ = port.resynchronize().await;
+                        }
+                    }
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
-                let state = match publish_device(&mut port, &hostname, published_id).await {
+                let state = match publish_device(&mut port, &hostname, DRYER, published_id).await {
                     Ok(id) => {
                         if id != published_id {
                             published_id = id;
@@ -507,32 +520,85 @@ async fn mqtt_message_task(
                     }
                 };
 
-                if let Err(err) = STATUS_TOPIC.with_bytes(&state).publish().await {
-                    error!("Failed to publish status: {err:?}");
+                if let Err(err) = DRYER_STATUS.with_bytes(&state).publish().await {
+                    error!("Failed to publish dryer status: {err:?}");
+                }
+                if let Err(err) = STATUS_TOPIC.with_bytes(&AvailabilityState::Online).publish().await {
+                    error!("Failed to publish gateway status: {err:?}");
                 }
             }
-            Either::Second(Either::Second(Either::Second(Either::Second(Either::First(()))))) => {
-                if let Err(err) = trace_id410_memory(&mut port, &mut id410_trace).await {
-                    warn!("ID410 TRACE sweep failed: {err:#}");
-                    let _ = port.resynchronize().await;
-                }
-            }
-            Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(Ok(
-                len,
-            )))))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Ok(len))))) => {
                 if len != 0 {
                     debug!("OPT AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
                 }
             }
-            Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(
-                Err(err),
-            ))))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Err(err))))) => {
                 debug!("OPT AMBIENT UART activity/error: {err:?}");
             }
             _ => {}
         }
 
         led.set_level((!connected).into());
+    }
+}
+
+#[embassy_executor::task]
+async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
+    let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
+    let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
+    let mut trace = Id410Trace::new();
+    let mut published_id = 0_u16;
+    let mut was_connected = false;
+    let mut ir_debug_buf = [0_u8; 8];
+    loop {
+        let connected = MQTT_CONNECTED.load(Ordering::Relaxed);
+        if connected && !was_connected {
+            published_id = 0;
+            ticker.reset();
+        }
+        was_connected = connected;
+        match select::select(
+            WASHER_ACTIONS.receive(),
+            select::select(ticker.next(), select::select(trace_ticker.next(), port.debug_read_activity(&mut ir_debug_buf))),
+        ).await {
+            Either::First(action) => {
+                if let Err(err) = trigger_action(&mut port, &action.id, &action.param).await {
+                    error!("Failed to trigger washer action: {err:#}");
+                    let _ = port.resynchronize().await;
+                }
+            }
+            Either::Second(Either::First(())) if connected => {
+                let state = match publish_device(&mut port, &hostname, WASHER, published_id).await {
+                    Ok(id) => {
+                        published_id = id;
+                        AvailabilityState::Online
+                    }
+                    Err(err) => {
+                        error!("Failed to publish washer: {err:#}");
+                        let _ = port.resynchronize().await;
+                        AvailabilityState::Offline
+                    }
+                };
+                if let Err(err) = WASHER_STATUS.with_bytes(&state).publish().await {
+                    error!("Failed to publish washer status: {err:?}");
+                }
+            }
+            Either::Second(Either::Second(Either::First(()))) => {
+                if let Err(err) = trace_id410_memory(&mut port, &mut trace).await {
+                    warn!("ID410 TRACE sweep failed: {err:#}");
+                    let _ = port.resynchronize().await;
+                }
+            }
+            Either::Second(Either::Second(Either::Second(Ok(len)))) => {
+                if len != 0 {
+                    debug!("OPT2 AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
+                }
+            }
+            Either::Second(Either::Second(Either::Second(Err(err)))) => {
+                debug!("OPT2 AMBIENT UART activity/error: {err:?}");
+            }
+            _ => {}
+        }
     }
 }
 
@@ -1652,6 +1718,7 @@ async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -
 async fn publish_device(
     port: &mut OpticalPort<'_>,
     hostname: &str,
+    channel: &'static str,
     previous_id: u16,
 ) -> Result<u16> {
     let mut dev = connect_to_device(port).await?;
@@ -1700,16 +1767,16 @@ async fn publish_device(
 
     for (prop, val) in props.zip(vals) {
         if id != 498 || previous_id != id {
-            publish_property(prop, &dev_kind, hostname).await?;
+            publish_property(prop, &dev_kind, hostname, channel).await?;
         }
-        publish_property_value(prop, &val).await?;
+        publish_property_value(prop, &val, channel).await?;
         info!("Published property: {prop:?}");
     }
 
     for action in actions {
         // There's no suitable HA component for actions with parameters
         if action.params.is_none() {
-            publish_action(action, &dev_kind, hostname).await?;
+            publish_action(action, &dev_kind, hostname, channel).await?;
             info!("Published action: {action:?}");
         } else {
             info!("Skipped action due to parameters: {action:?}");
@@ -1719,8 +1786,9 @@ async fn publish_device(
     Ok(id)
 }
 
-async fn publish_property(prop: &Property, dev: &str, hostname: &str) -> Result<()> {
-    let unique_id = format!("{}_{}", hostname, prop.id);
+async fn publish_property(prop: &Property, dev: &str, hostname: &str, channel: &'static str) -> Result<()> {
+    let unique_id = format!("{}_{}_{}", hostname, channel, prop.id);
+    let status = if channel == DRYER { DRYER_STATUS } else { WASHER_STATUS };
 
     Entity {
         device: HaDevice {
@@ -1731,8 +1799,8 @@ async fn publish_property(prop: &Property, dev: &str, hostname: &str) -> Result<
         object_id: &unique_id,
         unique_id: Some(&unique_id),
         name: prop.name,
-        availability: AvailabilityTopics::All([STATUS_TOPIC]),
-        state_topic: Some(Topic::Device(format!("{}/value", prop.id)).as_ref()),
+        availability: AvailabilityTopics::All([STATUS_TOPIC, status]),
+        state_topic: Some(Topic::Device(format!("{channel}/{}/value", prop.id)).as_ref()),
         command_topic: None,
         component: Sensor {
             device_class: None,
@@ -1745,8 +1813,8 @@ async fn publish_property(prop: &Property, dev: &str, hostname: &str) -> Result<
     .map_err(|err| anyhow::anyhow!("Failed to publish HA sensor: {err:?}"))
 }
 
-async fn publish_property_value(prop: &Property, val: &Value) -> Result<()> {
-    let topic = Topic::Device(format!("{}/value", prop.id));
+async fn publish_property_value(prop: &Property, val: &Value, channel: &str) -> Result<()> {
+    let topic = Topic::Device(format!("{channel}/{}/value", prop.id));
 
     match *val {
         Value::Number(num) => topic.with_display(num).publish().await,
@@ -1779,8 +1847,9 @@ async fn publish_property_value(prop: &Property, val: &Value) -> Result<()> {
     .map_err(|err| anyhow::anyhow!("Failed to publish property value: {err:?}"))
 }
 
-async fn publish_action(action: &Action, dev: &str, hostname: &str) -> Result<()> {
-    let unique_id = format!("{}_{}", hostname, action.id);
+async fn publish_action(action: &Action, dev: &str, hostname: &str, channel: &'static str) -> Result<()> {
+    let unique_id = format!("{}_{}_{}", hostname, channel, action.id);
+    let status = if channel == DRYER { DRYER_STATUS } else { WASHER_STATUS };
 
     Entity {
         device: HaDevice {
@@ -1791,9 +1860,9 @@ async fn publish_action(action: &Action, dev: &str, hostname: &str) -> Result<()
         object_id: &unique_id,
         unique_id: Some(&unique_id),
         name: action.name,
-        availability: AvailabilityTopics::All([STATUS_TOPIC]),
+        availability: AvailabilityTopics::All([STATUS_TOPIC, status]),
         state_topic: None,
-        command_topic: Some(Topic::Device(format!("{}/trigger", action.id)).as_ref()),
+        command_topic: Some(Topic::Device(format!("{channel}/{}/trigger", action.id)).as_ref()),
         component: Button { device_class: None },
     }
     .publish_discovery()
@@ -2865,6 +2934,7 @@ async fn main(spawner: Spawner) {
 
     let led = freemdu_home::new_status_led();
     let port = freemdu_home::new_optical_port(peripherals.UART1).unwrap();
+    let port2 = freemdu_home::new_optical_port2(peripherals.UART0).unwrap();
     let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
     let accelerometer = Lis2dh::new(accel_i2c);
     static FLASH: StaticCell<FlashMutex> = StaticCell::new();
@@ -2873,17 +2943,19 @@ async fn main(spawner: Spawner) {
     ))));
     let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
     let accel_hostname = hostname.clone();
+    let washer_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
         init_network(peripherals.WIFI, &hostname).unwrap();
     let (mqtt_receiver, mqtt_task) =
         McutieBuilder::new(net_stack, "freemdu_home", env!("MQTT_HOSTNAME"))
             .with_authentication(env!("MQTT_USERNAME"), env!("MQTT_PASSWORD"))
-            .with_subscriptions([Topic::Device("+/trigger")])
+            .with_subscriptions([Topic::Device("+/+/trigger")])
             .with_last_will(STATUS_TOPIC.with_bytes(AvailabilityState::Offline))
             .build();
 
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led, flash).unwrap());
+    spawner.spawn(washer_task(port2, washer_hostname).unwrap());
     spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
     spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());

@@ -216,11 +216,17 @@ pub fn new_status_led<'a>() -> Output<'a> {
 }
 
 pub fn new_optical_port<'a>(uart: impl Instance + 'a) -> Result<OpticalPort<'a>, ConfigError> {
-    const PIN_RX: u8 = num_from_env!("PIN_OPTICAL_RX", u8);
-    const PIN_TX: u8 = num_from_env!("PIN_OPTICAL_TX", u8);
-    let rx = Input::new(unsafe { AnyPin::steal(PIN_RX) }, InputConfig::default());
+    new_optical_port_on_pins(uart, num_from_env!("PIN_OPTICAL_RX", u8), num_from_env!("PIN_OPTICAL_TX", u8))
+}
+
+pub fn new_optical_port2<'a>(uart: impl Instance + 'a) -> Result<OpticalPort<'a>, ConfigError> {
+    new_optical_port_on_pins(uart, num_from_env!("PIN_OPTICAL2_RX", u8), num_from_env!("PIN_OPTICAL2_TX", u8))
+}
+
+fn new_optical_port_on_pins<'a>(uart: impl Instance + 'a, rx_pin: u8, tx_pin: u8) -> Result<OpticalPort<'a>, ConfigError> {
+    let rx = Input::new(unsafe { AnyPin::steal(rx_pin) }, InputConfig::default());
     let tx = Output::new(
-        unsafe { AnyPin::steal(PIN_TX) },
+        unsafe { AnyPin::steal(tx_pin) },
         Level::Low,
         OutputConfig::default(),
     );
