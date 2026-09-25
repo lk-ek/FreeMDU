@@ -435,10 +435,7 @@ async fn mqtt_message_task(
                 DIAG_COMMANDS.receive(),
                 select::select(
                     receiver.receive(),
-                    select::select(
-                        ticker.next(),
-                        port.debug_read_activity(&mut ir_debug_buf),
-                    ),
+                    select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
                 ),
             ),
         )
@@ -487,10 +484,12 @@ async fn mqtt_message_task(
                     && let Some((id, "trigger")) = rest.split_once('/')
                 {
                     if channel == WASHER {
-                        WASHER_ACTIONS.send(DeviceAction {
-                            id: id.to_string(),
-                            param: param.to_string(),
-                        }).await;
+                        WASHER_ACTIONS
+                            .send(DeviceAction {
+                                id: id.to_string(),
+                                param: param.to_string(),
+                            })
+                            .await;
                     } else if channel == DRYER {
                         if let Err(err) = trigger_action(&mut port, id, param).await {
                             error!("Failed to trigger dryer action: {err:#}");
@@ -523,7 +522,11 @@ async fn mqtt_message_task(
                 if let Err(err) = DRYER_STATUS.with_bytes(&state).publish().await {
                     error!("Failed to publish dryer status: {err:?}");
                 }
-                if let Err(err) = STATUS_TOPIC.with_bytes(&AvailabilityState::Online).publish().await {
+                if let Err(err) = STATUS_TOPIC
+                    .with_bytes(&AvailabilityState::Online)
+                    .publish()
+                    .await
+                {
                     error!("Failed to publish gateway status: {err:?}");
                 }
             }
@@ -559,8 +562,16 @@ async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
         was_connected = connected;
         match select::select(
             WASHER_ACTIONS.receive(),
-            select::select(ticker.next(), select::select(trace_ticker.next(), port.debug_read_activity(&mut ir_debug_buf))),
-        ).await {
+            select::select(
+                ticker.next(),
+                select::select(
+                    trace_ticker.next(),
+                    port.debug_read_activity(&mut ir_debug_buf),
+                ),
+            ),
+        )
+        .await
+        {
             Either::First(action) => {
                 if let Err(err) = trigger_action(&mut port, &action.id, &action.param).await {
                     error!("Failed to trigger washer action: {err:#}");
@@ -1786,9 +1797,18 @@ async fn publish_device(
     Ok(id)
 }
 
-async fn publish_property(prop: &Property, dev: &str, hostname: &str, channel: &'static str) -> Result<()> {
+async fn publish_property(
+    prop: &Property,
+    dev: &str,
+    hostname: &str,
+    channel: &'static str,
+) -> Result<()> {
     let unique_id = format!("{}_{}_{}", hostname, channel, prop.id);
-    let status = if channel == DRYER { DRYER_STATUS } else { WASHER_STATUS };
+    let status = if channel == DRYER {
+        DRYER_STATUS
+    } else {
+        WASHER_STATUS
+    };
 
     Entity {
         device: HaDevice {
@@ -1847,9 +1867,18 @@ async fn publish_property_value(prop: &Property, val: &Value, channel: &str) -> 
     .map_err(|err| anyhow::anyhow!("Failed to publish property value: {err:?}"))
 }
 
-async fn publish_action(action: &Action, dev: &str, hostname: &str, channel: &'static str) -> Result<()> {
+async fn publish_action(
+    action: &Action,
+    dev: &str,
+    hostname: &str,
+    channel: &'static str,
+) -> Result<()> {
     let unique_id = format!("{}_{}_{}", hostname, channel, action.id);
-    let status = if channel == DRYER { DRYER_STATUS } else { WASHER_STATUS };
+    let status = if channel == DRYER {
+        DRYER_STATUS
+    } else {
+        WASHER_STATUS
+    };
 
     Entity {
         device: HaDevice {
