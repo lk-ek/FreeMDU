@@ -2746,7 +2746,7 @@
 		)
 		(uuid "195f1bd4-6e07-44b0-a38f-bd4452c5ce1d")
 	)
-	(text "Preferred schematic, IR-LED is sinked through NMOS;\nPhotodiode uses a Schmitt-Trigger to obtain clean signal"
+	(text "Preferred schematic, IR-LED is sinked through NMOS;\nPhototransistor uses a Schmitt-Trigger to obtain clean signal"
 		(exclude_from_sim no)
 		(at 155.956 74.168 0)
 		(effects
@@ -2792,6 +2792,18 @@
 		(diameter 0)
 		(color 0 0 0 0)
 		(uuid "5c3af675-6107-42b7-b220-f19e05cb1a9c")
+	)
+	(junction
+		(at 180.34 55.88)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "7b0f1d43-e155-4449-8875-b89ee0caab23")
+	)
+	(junction
+		(at 180.34 92.71)
+		(diameter 0)
+		(color 0 0 0 0)
+		(uuid "8d978eb0-4416-4692-929b-2ab532341198")
 	)
 	(junction
 		(at 111.76 44.45)
@@ -2931,7 +2943,17 @@
 	)
 	(wire
 		(pts
-			(xy 176.53 92.71) (xy 184.15 92.71)
+			(xy 180.34 55.88) (xy 180.34 57.15)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "10254b77-431b-4bb5-a293-7eff6188fa27")
+	)
+	(wire
+		(pts
+			(xy 176.53 92.71) (xy 180.34 92.71)
 		)
 		(stroke
 			(width 0)
@@ -3001,6 +3023,16 @@
 	)
 	(wire
 		(pts
+			(xy 180.34 64.77) (xy 180.34 66.04)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "1de030f3-07f3-4be3-8fb5-7e2c6f37a3c9")
+	)
+	(wire
+		(pts
 			(xy 46.99 60.96) (xy 36.83 60.96)
 		)
 		(stroke
@@ -3011,7 +3043,7 @@
 	)
 	(wire
 		(pts
-			(xy 191.77 60.96) (xy 191.77 63.5)
+			(xy 191.77 60.96) (xy 191.77 66.04)
 		)
 		(stroke
 			(width 0)
@@ -3091,7 +3123,7 @@
 	)
 	(wire
 		(pts
-			(xy 191.77 97.79) (xy 191.77 100.33)
+			(xy 191.77 97.79) (xy 191.77 102.87)
 		)
 		(stroke
 			(width 0)
@@ -3148,6 +3180,16 @@
 			(type default)
 		)
 		(uuid "3e883a75-3ce3-4e28-aca1-c7b2934a1443")
+	)
+	(wire
+		(pts
+			(xy 180.34 92.71) (xy 180.34 93.98)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "3f14e08d-bc6c-464c-8db2-6ac1719084e6")
 	)
 	(wire
 		(pts
@@ -3291,6 +3333,16 @@
 	)
 	(wire
 		(pts
+			(xy 180.34 55.88) (xy 184.15 55.88)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6a3ed0df-b088-4e37-9a3d-0eaebd902276")
+	)
+	(wire
+		(pts
 			(xy 76.2 85.09) (xy 76.2 88.9)
 		)
 		(stroke
@@ -3298,6 +3350,16 @@
 			(type default)
 		)
 		(uuid "6a8339e6-2b76-4936-95b1-151965c59f1f")
+	)
+	(wire
+		(pts
+			(xy 180.34 92.71) (xy 184.15 92.71)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "6d5fedb2-747e-460e-a2f7-b07498716f56")
 	)
 	(wire
 		(pts
@@ -3401,7 +3463,7 @@
 	)
 	(wire
 		(pts
-			(xy 176.53 55.88) (xy 184.15 55.88)
+			(xy 176.53 55.88) (xy 180.34 55.88)
 		)
 		(stroke
 			(width 0)
@@ -3598,6 +3660,16 @@
 			(type default)
 		)
 		(uuid "bb362c08-5a0d-43bb-bb55-f620265b2e47")
+	)
+	(wire
+		(pts
+			(xy 180.34 101.6) (xy 180.34 102.87)
+		)
+		(stroke
+			(width 0)
+			(type default)
+		)
+		(uuid "bd20e256-5547-4bf9-a267-867274fc28d4")
 	)
 	(wire
 		(pts
@@ -4129,7 +4201,7 @@
 	)
 	(symbol
 		(lib_id "power:GND")
-		(at 191.77 100.33 0)
+		(at 191.77 102.87 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -4140,7 +4212,7 @@
 		(fields_autoplaced yes)
 		(uuid "06ab1b76-406f-4137-ac52-30c815f743cf")
 		(property "Reference" "#PWR021"
-			(at 191.77 106.68 0)
+			(at 191.77 109.22 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4151,7 +4223,7 @@
 			)
 		)
 		(property "Value" "GND"
-			(at 194.31 101.5999 0)
+			(at 194.31 104.1399 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -4162,7 +4234,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 191.77 100.33 0)
+			(at 191.77 102.87 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4173,7 +4245,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 191.77 100.33 0)
+			(at 191.77 102.87 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -4184,7 +4256,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 191.77 100.33 0)
+			(at 191.77 102.87 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5114,6 +5186,110 @@
 		)
 	)
 	(symbol
+		(lib_id "Device:R")
+		(at 180.34 97.79 180)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "28d5c978-6790-4286-b13e-776f29c94fe8")
+		(property "Reference" "R9"
+			(at 182.88 96.5199 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Value" "47k"
+			(at 182.88 99.0599 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Footprint" "Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder"
+			(at 180.34 97.79 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 180.34 97.79 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "IR LED current limiting resistor"
+			(at 180.34 97.79 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Supplier" "LOCAL"
+			(at 180.34 97.79 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Part_Number" ""
+			(at 180.34 97.79 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "a5edc869-3eb8-46ea-967e-31c0c6052407")
+		)
+		(pin "2"
+			(uuid "262f95b5-ef44-47f3-bf85-11b8f5690f05")
+		)
+		(instances
+			(project "freemdu_optical_adapter"
+				(path "/96e00cc6-9295-4b2c-b48b-c48be94600db"
+					(reference "R9")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
 		(lib_id "power:+5V")
 		(at 116.84 43.18 0)
 		(mirror y)
@@ -5188,6 +5364,164 @@
 			(project "freemdu_optical_adapter"
 				(path "/96e00cc6-9295-4b2c-b48b-c48be94600db"
 					(reference "#PWR07")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 180.34 102.87 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "2cb489dc-651b-48df-b7c8-e4fa4acfccf0")
+		(property "Reference" "#PWR026"
+			(at 180.34 109.22 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 182.88 104.1399 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" ""
+			(at 180.34 102.87 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 180.34 102.87 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
+			(at 180.34 102.87 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "173ee2eb-0dbf-44c1-aa93-0dc7092f64c8")
+		)
+		(instances
+			(project "freemdu_optical_adapter"
+				(path "/96e00cc6-9295-4b2c-b48b-c48be94600db"
+					(reference "#PWR026")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "power:GND")
+		(at 180.34 66.04 0)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "309f002b-1315-41c4-9790-c4639178869e")
+		(property "Reference" "#PWR023"
+			(at 180.34 72.39 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Value" "GND"
+			(at 182.88 67.3099 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify left)
+			)
+		)
+		(property "Footprint" ""
+			(at 180.34 66.04 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 180.34 66.04 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
+			(at 180.34 66.04 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "90647c48-8d15-40a7-ac4c-a02d211b10ae")
+		)
+		(instances
+			(project "freemdu_optical_adapter"
+				(path "/96e00cc6-9295-4b2c-b48b-c48be94600db"
+					(reference "#PWR023")
 					(unit 1)
 				)
 			)
@@ -5652,7 +5986,7 @@
 	)
 	(symbol
 		(lib_id "power:GND")
-		(at 191.77 63.5 0)
+		(at 191.77 66.04 0)
 		(unit 1)
 		(body_style 1)
 		(exclude_from_sim no)
@@ -5663,7 +5997,7 @@
 		(fields_autoplaced yes)
 		(uuid "45fb00b0-23e3-4741-acfd-cbf2bd461cc3")
 		(property "Reference" "#PWR04"
-			(at 191.77 69.85 0)
+			(at 191.77 72.39 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5674,7 +6008,7 @@
 			)
 		)
 		(property "Value" "GND"
-			(at 194.31 64.7699 0)
+			(at 194.31 67.3099 0)
 			(show_name no)
 			(do_not_autoplace no)
 			(effects
@@ -5685,7 +6019,7 @@
 			)
 		)
 		(property "Footprint" ""
-			(at 191.77 63.5 0)
+			(at 191.77 66.04 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5696,7 +6030,7 @@
 			)
 		)
 		(property "Datasheet" ""
-			(at 191.77 63.5 0)
+			(at 191.77 66.04 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -5707,7 +6041,7 @@
 			)
 		)
 		(property "Description" "Power symbol creates a global label with name \"GND\" , ground"
-			(at 191.77 63.5 0)
+			(at 191.77 66.04 0)
 			(hide yes)
 			(show_name no)
 			(do_not_autoplace no)
@@ -7255,6 +7589,110 @@
 			(project "freemdu_optical_adapter"
 				(path "/96e00cc6-9295-4b2c-b48b-c48be94600db"
 					(reference "R4")
+					(unit 1)
+				)
+			)
+		)
+	)
+	(symbol
+		(lib_id "Device:R")
+		(at 180.34 60.96 180)
+		(unit 1)
+		(body_style 1)
+		(exclude_from_sim no)
+		(in_bom yes)
+		(on_board yes)
+		(in_pos_files yes)
+		(dnp no)
+		(fields_autoplaced yes)
+		(uuid "864ed052-a3f5-4559-ab39-80da9ada86ce")
+		(property "Reference" "R6"
+			(at 182.88 59.6899 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Value" "47k"
+			(at 182.88 62.2299 0)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+				(justify right)
+			)
+		)
+		(property "Footprint" "Resistor_SMD:R_0805_2012Metric_Pad1.20x1.40mm_HandSolder"
+			(at 180.34 60.96 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Datasheet" ""
+			(at 180.34 60.96 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Description" "IR LED current limiting resistor"
+			(at 180.34 60.96 0)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Supplier" "LOCAL"
+			(at 180.34 60.96 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(property "Part_Number" ""
+			(at 180.34 60.96 90)
+			(hide yes)
+			(show_name no)
+			(do_not_autoplace no)
+			(effects
+				(font
+					(size 1.27 1.27)
+				)
+			)
+		)
+		(pin "1"
+			(uuid "a8113379-2f1c-469a-802f-02785e6590c3")
+		)
+		(pin "2"
+			(uuid "619d8c70-3631-4dbc-823b-60fbaabc7ccc")
+		)
+		(instances
+			(project "freemdu_optical_adapter"
+				(path "/96e00cc6-9295-4b2c-b48b-c48be94600db"
+					(reference "R6")
 					(unit 1)
 				)
 			)
