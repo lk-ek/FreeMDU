@@ -1,4 +1,4 @@
-# FreeMDU [![Build Status](https://img.shields.io/github/actions/workflow/status/medusalix/FreeMDU/ci.yml)](https://github.com/medusalix/FreeMDU/actions/workflows/ci.yml)
+# FreeMDU
 
 <p align="center">
   <img src="demo.gif" alt="Demo">
@@ -39,6 +39,8 @@ The following table lists the software IDs and device/board combinations that ha
 | 629         | W 2446         | EDPL 126-B | Mitsubishi M38079MF-308FP | *Check inlet (PC)* indicator | 🟢 Fully supported |
 | 2088        | W 3241         | EDPL 162-B | Mitsubishi M38079EFFP     | *Check inlet (PC)* indicator | 🟢 Fully supported |
 | 2895        | W 3164         | EDPL 151-B | Mitsubishi M38079MF-322FP | *Check inlet (PC)* indicator | 🟢 Fully supported |
+| 410         | W 307          | —          | —                         | Optical diagnostic port      | Experimental Home Assistant monitoring |
+| 498         | T 4223 C       | —          | —                         | Optical diagnostic port      | Experimental read-only monitoring |
 
 If your appliance is not listed here but has a model number similar to one of the above, it might already be compatible. In all other cases, determining the **software ID** is the first step toward adding support for new devices.
 
@@ -46,7 +48,48 @@ Details for adding support for new devices will be provided soon.
 
 ## Getting started
 
-Before using any FreeMDU components, make sure you have the [Rust toolchain](https://rust-lang.org/tools/install) installed on your system.
+Before using FreeMDU, install the [Rust toolchain](https://rust-lang.org/tools/install).
+
+### Dual optical ESP32-C3 firmware
+
+The standalone firmware can monitor the W307 (software ID **410**) and T4223C
+(software ID **498**) on two independent IR ports at 2400-8E1. The ports are
+electrically separate; **either appliance can use either port**. The detected
+software ID selects the MQTT/HA role: ID 410 publishes `washer/...`, ID 498
+publishes `dryer/...`. Unknown IDs are reported in the log and are not assigned
+one of those topics. MQTT actions and availability follow the same mapping;
+the read-only ID410 RAM trace follows the washer's port.
+
+| Port | UART | XIAO ESP32-C3 TX / RX | GPIO TX / RX |
+| --- | --- | --- | --- |
+| IR | UART1 | D3 / D4 | 5 / 6 |
+| IR2 | UART0 | D6 / D7 | 21 / 20 |
+
+The USB bridge, remote bridge, key scan and general diagnostics use IR/UART1.
+`diag ir-test`, `diag baud-sweep` and `diag burst-test` accept `IR` or `IR2`.
+Local echo tests verify the transceivers; a machine reply must be checked with
+the actual appliance connected. See [Home](home/README.md) for the optical
+circuit, configuration, diagnostic commands and firmware details.
+
+From `home/`, copy `.cargo/local.example.toml` to `.cargo/local.toml` and enter
+Wi-Fi/MQTT credentials there. The ignored local file also carries board-specific
+GPIO settings. The default TX and RX inversion is the original FreeMDU polarity;
+for LEDs wired as GPIO current sinks set both `OPTICAL_TX_INVERTED = "false"`
+and `OPTICAL2_TX_INVERTED = "false"` under `[env]` before flashing. The RX
+inversion remains `"true"` with the documented phototransistor/Schmitt circuit.
+
+```sh
+cd home
+./cargo-local run --features esp32c3 --target riscv32imc-unknown-none-elf --release --bin standalone
+```
+
+The configured runner flashes over USB and starts the serial monitor; terminate
+serial diagnostics with Ctrl-J. The LIS2DH accelerometer is optional for
+optical communication, but a missing chip produces initialization errors in
+the log. On the current receiver boards, both ports passed repeated local
+2400-baud burst tests and a single-byte sweep through 4800 baud; 9600 baud has
+not passed reliably. These tests do not establish simultaneous appliance
+communication.
 
 Next, you'll need to build a [communication adapter](home/README.md#getting-started) to interface with your Miele device. Once the adapter is ready, choose the appropriate use case from the options below:
 

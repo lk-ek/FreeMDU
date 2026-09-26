@@ -4,8 +4,8 @@
 # configuration such as alternate GPIO assignments.
 
 [env]
-# XIAO ESP32-C3 defaults in config.toml: dryer D3/D4 (GPIO5/6),
-# washer D6/D7 (GPIO21/20). Override these for another board.
+# XIAO ESP32-C3 defaults: IR D3/D4 (GPIO5/6), IR2 D6/D7 (GPIO21/20).
+# Either appliance can use either port; the software ID selects its MQTT role.
 # PIN_OPTICAL_TX = "5"
 # PIN_OPTICAL_RX = "6"
 # PIN_OPTICAL2_TX = "21"
@@ -19,6 +19,8 @@
 # Accelerometer: set these to its actual, distinct SDA/SCL pins.
 # PIN_ACCEL_SDA = "3"
 # PIN_ACCEL_SCL = "4"
+# ACCEL_SAMPLE_HZ = "50"
+# ACCEL_PUBLISH_INTERVAL = "10"
 
 WIFI_SSID = ""
 WIFI_PASSWORD = ""

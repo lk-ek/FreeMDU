@@ -57,20 +57,26 @@ one-based byte position on a failure. It stops after five failed trials and
 prints `SEROPT ... BURST END ok=N fail=M`. This checks the local optical path;
 it does not verify a reply from an appliance.
 
-| Appliance | UART | TX | RX | GPIO TX/RX |
+| Port | UART | TX | RX | GPIO TX/RX |
 | --- | --- | --- | --- | --- |
-| Dryer (IR) | UART1 | D3 | D4 | 5 / 6 |
-| Washer (IR2) | UART0 | D6 | D7 | 21 / 20 |
+| IR | UART1 | D3 | D4 | 5 / 6 |
+| IR2 | UART0 | D6 | D7 | 21 / 20 |
 
 Pin `10` drives the active-low status LED. The accelerometer defaults to D1/D2 (GPIO3/4); set `PIN_ACCEL_SDA` and `PIN_ACCEL_SCL` in your ignored `.cargo/local.toml` to match its actual wiring. Do not assign a GPIO to both an optical port and the accelerometer. On other boards, override all pin numbers in `.cargo/local.toml` using the board's GPIO map (XIAO ESP32-C6 uses different GPIO numbers for the same D labels).
 
-The USB bridge firmware continues to use UART1 (dryer). The standalone diagnostic TCP/USB console, autonomous key scan and remote optical bridge also target UART1. Normal MQTT polling and Home Assistant entities operate on both UARTs independently; the ID410 RAM trace targets the washer on UART0.
+Both optical UARTs poll independently. After each successful software-ID query,
+ID 410 publishes to `washer/...` and ID 498 to `dryer/...` on either port;
+availability and MQTT action routing follow that mapping. Unrecognized IDs
+are logged and do not publish under either appliance's topics. The ID410 RAM
+trace follows ID 410 on either port. USB bridge firmware, the standalone
+diagnostic TCP/USB console, the autonomous key scan, and the remote optical
+bridge still target UART1 (IR).
 
 ### Firmware modes
 
 The firmware can be built in one of two modes depending on your use case. In **bridge mode**, the firmware simply forwards all data between the USB-UART connection and the infrared transceiver. This allows desktop tools, such as the [FreeMDU TUI](../tui), to communicate with the connected device for diagnostics or testing.
 
-In **standalone mode**, the firmware connects to a Wi-Fi network and periodically publishes operational properties and actions from the connected Miele device via MQTT. This mode is intended for integration into home automation systems such as Home Assistant. No desktop connection is required, but the Wi-Fi and MQTT configuration must be specified in the [`.cargo/config.toml`](.cargo/config.toml) file before flashing the firmware.
+In **standalone mode**, the firmware independently polls two optical ports and publishes ID 410 and ID 498 under device-specific MQTT topics for Home Assistant. Put credentials and device-specific settings in the ignored `.cargo/local.toml` (copy [`.cargo/local.example.toml`](.cargo/local.example.toml)); tracked defaults are in [`.cargo/config.toml`](.cargo/config.toml).
 
 ### Flashing the firmware
 
@@ -83,10 +89,10 @@ cargo install espflash --locked
 2. Use the following command to build and flash the firmware:
 
 ```shell
-cargo run --features esp32c6 --target riscv32imac-unknown-none-elf --release --bin <MODE>
+./cargo-local run --features esp32c3 --target riscv32imc-unknown-none-elf --release --bin standalone
 ```
 
-Replace `<MODE>` with the desired firmware mode (`bridge` or `standalone`). For the ESP32-C3, substitute `esp32c3` and `riscv32imc-unknown-none-elf`.
+Run this from `home/`. The configured runner flashes over USB and opens the serial monitor; press Ctrl-J to submit a `diag` command. For ESP32-C6 use `esp32c6` and `riscv32imac-unknown-none-elf`. The `bridge` binary uses IR/UART1 only.
 
 ## Usage
 
@@ -301,11 +307,11 @@ these explicit diagnostics. Pause a running scan first.
 
 ## Experimental T4223C / ID498 monitoring
 
-The firmware contains both the unchanged W307/ID410 profile and the new ID498
-profile. The currently attached appliance is detected automatically. This does
-not yet add a second optical UART: simultaneous physical monitoring of both
-machines requires wiring/pin configuration and an additional independent port.
-The dryer entity IDs use `dryer_*`, preserving existing ID410 entity IDs.
+The firmware contains both the W307/ID410 profile and the ID498 profile.
+Standalone mode uses two independent optical UARTs. Either machine can be
+connected to either port: ID 410 uses `washer/...` MQTT topics, and ID 498 uses
+`dryer/...`. The dryer entity IDs use `dryer_*`, preserving existing ID410
+entity IDs.
 
 ID498 publishes HA sensor entities every five seconds after initial detection
 (which can take DEVICE_PUBLISH_INTERVAL, normally 60 seconds): selected program,

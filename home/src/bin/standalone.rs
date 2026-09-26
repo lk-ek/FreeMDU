@@ -104,18 +104,60 @@ const WASHER: &str = "washer";
 const DRYER_STATUS: Topic<&str> = Topic::Device("dryer/status");
 const WASHER_STATUS: Topic<&str> = Topic::Device("washer/status");
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ApplianceRole {
+    Dryer,
+    Washer,
+}
+
+impl ApplianceRole {
+    fn from_software_id(id: u16) -> Option<Self> {
+        match id {
+            498 => Some(Self::Dryer),
+            410 => Some(Self::Washer),
+            _ => None,
+        }
+    }
+
+    fn channel(self) -> &'static str {
+        match self {
+            Self::Dryer => DRYER,
+            Self::Washer => WASHER,
+        }
+    }
+
+    fn software_id(self) -> u32 {
+        match self {
+            Self::Dryer => 498,
+            Self::Washer => 410,
+        }
+    }
+
+    fn status(self) -> Topic<&'static str> {
+        match self {
+            Self::Dryer => DRYER_STATUS,
+            Self::Washer => WASHER_STATUS,
+        }
+    }
+}
+
+// The actual appliance on each optical UART is learned after its ID query.
+static IR_SOFTWARE_ID: AtomicU32 = AtomicU32::new(0);
+static IR2_SOFTWARE_ID: AtomicU32 = AtomicU32::new(0);
+
 struct DeviceAction {
+    software_id: u32,
     id: String,
     param: String,
 }
-enum WasherCommand {
+enum Port2Command {
     Action(DeviceAction),
     OpticalTest,
     BaudSweep,
     BurstTest,
 }
-static WASHER_ACTIONS: Channel<CriticalSectionRawMutex, WasherCommand, 4> = Channel::new();
-static WASHER_TEST_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
+static PORT2_ACTIONS: Channel<CriticalSectionRawMutex, Port2Command, 4> = Channel::new();
+static PORT2_TEST_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticCommand {
@@ -395,7 +437,10 @@ async fn mqtt_message_task(
     flash: SharedFlash,
 ) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
+    let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
+    let mut trace = Id410Trace::new();
     let mut published_id = 0u16;
+    let mut published_role = None;
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
     let mut scan = ScanJob::open(flash);
@@ -445,7 +490,13 @@ async fn mqtt_message_task(
                 DIAG_COMMANDS.receive(),
                 select::select(
                     receiver.receive(),
-                    select::select(ticker.next(), port.debug_read_activity(&mut ir_debug_buf)),
+                    select::select(
+                        ticker.next(),
+                        select::select(
+                            trace_ticker.next(),
+                            port.debug_read_activity(&mut ir_debug_buf),
+                        ),
+                    ),
                 ),
             ),
         )
@@ -477,13 +528,15 @@ async fn mqtt_message_task(
             }
             Either::Second(Either::Second(Either::First(MqttMessage::Connected))) => {
                 connected = true;
-                published_id = 0; // resend dryer discovery after broker reconnect
+                published_id = 0; // resend discovery after broker reconnect
                 MQTT_CONNECTED.store(true, Ordering::Relaxed);
                 ticker.reset();
             }
             Either::Second(Either::Second(Either::First(MqttMessage::Disconnected))) => {
                 connected = false;
                 MQTT_CONNECTED.store(false, Ordering::Relaxed);
+                IR_SOFTWARE_ID.store(0, Ordering::Relaxed);
+                IR2_SOFTWARE_ID.store(0, Ordering::Relaxed);
             }
             Either::Second(Either::Second(Either::First(MqttMessage::Publish(
                 Topic::Device(topic),
@@ -491,27 +544,54 @@ async fn mqtt_message_task(
             )))) => {
                 if let Ok(param) = str::from_utf8(&payload)
                     && let Some((channel, rest)) = topic.split_once('/')
-                    && let Some((id, "trigger")) = rest.split_once('/')
+                    && let Some((action_id, "trigger")) = rest.split_once('/')
                 {
-                    if channel == WASHER {
-                        WASHER_ACTIONS
-                            .send(WasherCommand::Action(DeviceAction {
-                                id: id.to_string(),
+                    let target = match channel {
+                        DRYER => Some(498),
+                        WASHER => Some(410),
+                        _ => None,
+                    };
+                    if target.is_some_and(|software_id| {
+                        IR_SOFTWARE_ID.load(Ordering::Relaxed) == software_id
+                    }) {
+                        if let Err(err) =
+                            trigger_action(&mut port, target.unwrap() as u16, action_id, param)
+                                .await
+                        {
+                            error!("Failed to trigger IR action: {err:#}");
+                            let _ = port.resynchronize().await;
+                        }
+                    } else if target.is_some_and(|software_id| {
+                        IR2_SOFTWARE_ID.load(Ordering::Relaxed) == software_id
+                    }) {
+                        PORT2_ACTIONS
+                            .send(Port2Command::Action(DeviceAction {
+                                software_id: target.unwrap(),
+                                id: action_id.to_string(),
                                 param: param.to_string(),
                             }))
                             .await;
-                    } else if channel == DRYER {
-                        if let Err(err) = trigger_action(&mut port, id, param).await {
-                            error!("Failed to trigger dryer action: {err:#}");
-                            let _ = port.resynchronize().await;
-                        }
                     }
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
-                let state = match publish_device(&mut port, &hostname, DRYER, published_id).await {
-                    Ok(id) => {
+                match publish_device(&mut port, &hostname, published_id).await {
+                    Ok((id, role)) => {
+                        if let Some(previous) = published_role
+                            && previous != role
+                            && IR2_SOFTWARE_ID.load(Ordering::Relaxed) != previous.software_id()
+                        {
+                            let _ = previous
+                                .status()
+                                .with_bytes(&AvailabilityState::Offline)
+                                .publish()
+                                .await;
+                        }
+                        IR_SOFTWARE_ID.store(u32::from(id), Ordering::Relaxed);
+                        published_role = Some(role);
                         if id != published_id {
+                            info!("IR identified software ID {id} as {}", role.channel());
+                            trace = Id410Trace::new();
                             published_id = id;
                             ticker = Ticker::every(if id == 498 {
                                 Duration::from_secs(5)
@@ -519,18 +599,29 @@ async fn mqtt_message_task(
                                 DEVICE_PUBLISH_INTERVAL
                             });
                         }
-                        AvailabilityState::Online
+                        if let Err(err) = role
+                            .status()
+                            .with_bytes(&AvailabilityState::Online)
+                            .publish()
+                            .await
+                        {
+                            error!("Failed to publish IR status: {err:?}");
+                        }
                     }
                     Err(err) => {
-                        error!("Failed to publish device: {err:#}");
+                        error!("Failed to publish IR device: {err:#}");
+                        IR_SOFTWARE_ID.store(0, Ordering::Relaxed);
                         let _ = port.resynchronize().await;
-
-                        AvailabilityState::Offline
+                        if let Some(role) = published_role
+                            && IR2_SOFTWARE_ID.load(Ordering::Relaxed) != role.software_id()
+                        {
+                            let _ = role
+                                .status()
+                                .with_bytes(&AvailabilityState::Offline)
+                                .publish()
+                                .await;
+                        }
                     }
-                };
-
-                if let Err(err) = DRYER_STATUS.with_bytes(&state).publish().await {
-                    error!("Failed to publish dryer status: {err:?}");
                 }
                 if let Err(err) = STATUS_TOPIC
                     .with_bytes(&AvailabilityState::Online)
@@ -540,12 +631,24 @@ async fn mqtt_message_task(
                     error!("Failed to publish gateway status: {err:?}");
                 }
             }
-            Either::Second(Either::Second(Either::Second(Either::Second(Ok(len))))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Either::First(())))))
+                if connected && published_id == 410 =>
+            {
+                if let Err(err) = trace_id410_memory(&mut port, &mut trace).await {
+                    warn!("ID410 TRACE IR sweep failed: {err:#}");
+                    let _ = port.resynchronize().await;
+                }
+            }
+            Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(Ok(
+                len,
+            )))))) => {
                 if len != 0 {
                     debug!("OPT AMBIENT RX {len}B {:x?}", &ir_debug_buf[..len]);
                 }
             }
-            Either::Second(Either::Second(Either::Second(Either::Second(Err(err))))) => {
+            Either::Second(Either::Second(Either::Second(Either::Second(Either::Second(
+                Err(err),
+            ))))) => {
                 debug!("OPT AMBIENT UART activity/error: {err:?}");
             }
             _ => {}
@@ -556,11 +659,12 @@ async fn mqtt_message_task(
 }
 
 #[embassy_executor::task]
-async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
+async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut trace = Id410Trace::new();
     let mut published_id = 0_u16;
+    let mut published_role = None;
     let mut was_connected = false;
     let mut ir_debug_buf = [0_u8; 8];
     loop {
@@ -571,7 +675,7 @@ async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
         }
         was_connected = connected;
         match select::select(
-            WASHER_ACTIONS.receive(),
+            PORT2_ACTIONS.receive(),
             select::select(
                 ticker.next(),
                 select::select(
@@ -583,45 +687,85 @@ async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
         .await
         {
             Either::First(command) => match command {
-                WasherCommand::Action(action) => {
-                    if let Err(err) = trigger_action(&mut port, &action.id, &action.param).await {
-                        error!("Failed to trigger washer action: {err:#}");
-                        let _ = port.resynchronize().await;
+                Port2Command::Action(action) => {
+                    if IR2_SOFTWARE_ID.load(Ordering::Relaxed) == action.software_id {
+                        if let Err(err) = trigger_action(
+                            &mut port,
+                            action.software_id as u16,
+                            &action.id,
+                            &action.param,
+                        )
+                        .await
+                        {
+                            error!("Failed to trigger IR2 action: {err:#}");
+                            let _ = port.resynchronize().await;
+                        }
                     }
                 }
-                WasherCommand::OpticalTest => {
-                    WASHER_TEST_RESULTS
+                Port2Command::OpticalTest => {
+                    PORT2_TEST_RESULTS
                         .send(serial_optical_test(&mut port, "IR2").await)
                         .await;
                 }
-                WasherCommand::BaudSweep => {
-                    WASHER_TEST_RESULTS
+                Port2Command::BaudSweep => {
+                    PORT2_TEST_RESULTS
                         .send(serial_baud_sweep(&mut port, "IR2").await)
                         .await;
                 }
-                WasherCommand::BurstTest => {
-                    WASHER_TEST_RESULTS
+                Port2Command::BurstTest => {
+                    PORT2_TEST_RESULTS
                         .send(serial_burst_test(&mut port, "IR2").await)
                         .await;
                 }
             },
             Either::Second(Either::First(())) if connected => {
-                let state = match publish_device(&mut port, &hostname, WASHER, published_id).await {
-                    Ok(id) => {
+                match publish_device(&mut port, &hostname, published_id).await {
+                    Ok((id, role)) => {
+                        if let Some(previous) = published_role
+                            && previous != role
+                            && IR_SOFTWARE_ID.load(Ordering::Relaxed) != previous.software_id()
+                        {
+                            let _ = previous
+                                .status()
+                                .with_bytes(&AvailabilityState::Offline)
+                                .publish()
+                                .await;
+                        }
+                        if id != published_id {
+                            info!("IR2 identified software ID {id} as {}", role.channel());
+                            trace = Id410Trace::new();
+                        }
                         published_id = id;
-                        AvailabilityState::Online
+                        published_role = Some(role);
+                        IR2_SOFTWARE_ID.store(u32::from(id), Ordering::Relaxed);
+                        if let Err(err) = role
+                            .status()
+                            .with_bytes(&AvailabilityState::Online)
+                            .publish()
+                            .await
+                        {
+                            error!("Failed to publish IR2 status: {err:?}");
+                        }
                     }
                     Err(err) => {
-                        error!("Failed to publish washer: {err:#}");
+                        error!("Failed to publish IR2 device: {err:#}");
+                        IR2_SOFTWARE_ID.store(0, Ordering::Relaxed);
                         let _ = port.resynchronize().await;
-                        AvailabilityState::Offline
+                        if let Some(role) = published_role
+                            && IR_SOFTWARE_ID.load(Ordering::Relaxed) != role.software_id()
+                        {
+                            let _ = role
+                                .status()
+                                .with_bytes(&AvailabilityState::Offline)
+                                .publish()
+                                .await;
+                        }
                     }
-                };
-                if let Err(err) = WASHER_STATUS.with_bytes(&state).publish().await {
-                    error!("Failed to publish washer status: {err:?}");
                 }
             }
-            Either::Second(Either::Second(Either::First(()))) => {
+            Either::Second(Either::Second(Either::First(())))
+                if connected && published_id == 410 =>
+            {
                 if let Err(err) = trace_id410_memory(&mut port, &mut trace).await {
                     warn!("ID410 TRACE sweep failed: {err:#}");
                     let _ = port.resynchronize().await;
@@ -1777,11 +1921,13 @@ async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -
 async fn publish_device(
     port: &mut OpticalPort<'_>,
     hostname: &str,
-    channel: &'static str,
     previous_id: u16,
-) -> Result<u16> {
+) -> Result<(u16, ApplianceRole)> {
     let mut dev = connect_to_device(port).await?;
     let id = dev.software_id();
+    let role = ApplianceRole::from_software_id(id)
+        .ok_or_else(|| anyhow::anyhow!("unsupported appliance software ID {id}"))?;
+    let channel = role.channel();
     let dev_kind = dev.kind().to_string();
     let dryer = if id == 498 {
         let snapshot = device::id498::Snapshot::read(dev.interface())
@@ -1842,7 +1988,7 @@ async fn publish_device(
         }
     }
 
-    Ok(id)
+    Ok((id, role))
 }
 
 async fn publish_property(
@@ -1947,8 +2093,19 @@ async fn publish_action(
     .map_err(|err| anyhow::anyhow!("Failed to publish HA button: {err:?}"))
 }
 
-async fn trigger_action(port: &mut OpticalPort<'_>, id: &str, param: &str) -> Result<()> {
+async fn trigger_action(
+    port: &mut OpticalPort<'_>,
+    expected_id: u16,
+    id: &str,
+    param: &str,
+) -> Result<()> {
     let mut dev = connect_to_device(port).await?;
+    if dev.software_id() != expected_id {
+        return Err(anyhow::anyhow!(
+            "action for software ID {expected_id} rejected: connected device is {}",
+            dev.software_id()
+        ));
+    }
 
     let Some(action) = dev.actions().iter().find(|action| action.id == id) else {
         return Err(anyhow::anyhow!("Failed to find action with id {id}"));
@@ -2616,8 +2773,8 @@ async fn handle_serial_diag_line(line: &str) {
                 serial_diag_print_response(&run_diag_command(DiagnosticCommand::OpticalTest).await);
             }
             (Some("IR2"), None) => {
-                WASHER_ACTIONS.send(WasherCommand::OpticalTest).await;
-                let ok = WASHER_TEST_RESULTS.receive().await;
+                PORT2_ACTIONS.send(Port2Command::OpticalTest).await;
+                let ok = PORT2_TEST_RESULTS.receive().await;
                 esp_println::println!(
                     "SERDIAG {} ir2_test_complete",
                     if ok { "OK" } else { "ERR" }
@@ -2630,8 +2787,8 @@ async fn handle_serial_diag_line(line: &str) {
                 serial_diag_print_response(&run_diag_command(DiagnosticCommand::BaudSweep).await);
             }
             (Some("IR2"), None) => {
-                WASHER_ACTIONS.send(WasherCommand::BaudSweep).await;
-                let passed = WASHER_TEST_RESULTS.receive().await;
+                PORT2_ACTIONS.send(Port2Command::BaudSweep).await;
+                let passed = PORT2_TEST_RESULTS.receive().await;
                 esp_println::println!(
                     "SERDIAG {} baud_sweep_{}",
                     if passed { "OK" } else { "ERR" },
@@ -2645,8 +2802,8 @@ async fn handle_serial_diag_line(line: &str) {
                 serial_diag_print_response(&run_diag_command(DiagnosticCommand::BurstTest).await);
             }
             (Some("IR2"), None) => {
-                WASHER_ACTIONS.send(WasherCommand::BurstTest).await;
-                let passed = WASHER_TEST_RESULTS.receive().await;
+                PORT2_ACTIONS.send(Port2Command::BurstTest).await;
+                let passed = PORT2_TEST_RESULTS.receive().await;
                 esp_println::println!(
                     "SERDIAG {} burst_test_{}",
                     if passed { "OK" } else { "ERR" },
@@ -3196,7 +3353,7 @@ async fn main(spawner: Spawner) {
     ))));
     let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
     let accel_hostname = hostname.clone();
-    let washer_hostname = hostname.clone();
+    let port2_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
         init_network(peripherals.WIFI, &hostname).unwrap();
     let (mqtt_receiver, mqtt_task) =
@@ -3208,7 +3365,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led, flash).unwrap());
-    spawner.spawn(washer_task(port2, washer_hostname).unwrap());
+    spawner.spawn(port2_task(port2, port2_hostname).unwrap());
     spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
     spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
