@@ -857,7 +857,7 @@
         "uuid": "96e00cc6-9295-4b2c-b48b-c48be94600db"
       }
     ],
-    "used_designators": "#FLG1-3,U2-4,R2-8,C1-4,Q1-2,#PWR1-29,J1-7",
+    "used_designators": "#FLG1-3,U2-4,R2-9,C1-4,Q1-3,#PWR1-29,J1-7",
     "variants": [
       {
         "description": "Use THT-Variant of the Xiao ESP32C3",
