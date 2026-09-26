@@ -31,7 +31,7 @@ The two ports poll independently. The protocol library queries each appliance's 
 
 The current MQTT namespace supports **one washer and one dryer**. Two devices of the same kind would use the same topics and entity IDs; use a separate gateway or extend the namespace before connecting that pair. The protocol library and TUI support additional kinds, such as dishwashers, without standalone MQTT channels.
 
-The ID410 read-only RAM trace runs only for software ID 410, on either port. The ID498 snapshot optimization and five-second polling run only for software ID 498. Other supported washers and dryers use their profile's normal `Operation` properties at `DEVICE_PUBLISH_INTERVAL` (default 60 seconds). These device-specific features do not imply equivalent addresses or semantics on another software ID.
+The ID410 read-only RAM trace is disabled by default; `ID410_TRACE_ENABLED = "true"` enables it on either port for diagnostics. The ID498 snapshot optimization and five-second polling run only for software ID 498. Other supported washers and dryers use their profile's normal `Operation` properties at `DEVICE_PUBLISH_INTERVAL` (default 60 seconds). A failed polling cycle is retried once after the optical session has been resynchronized. These device-specific features do not imply equivalent addresses or semantics on another software ID.
 
 In standalone mode, Home Assistant MQTT discovery registers the properties and actions reported by the selected device implementation. Operation properties are published under:
 

@@ -94,6 +94,13 @@ const BRIDGE_CHUNK_SIZE: usize = 32;
 // matching the diagnostic path that has proven reliable on the W307.
 const ID410_TRACE_INTERVAL: Duration =
     Duration::from_secs(freemdu_home::num_from_env!("ID410_TRACE_INTERVAL", u64));
+fn id410_trace_enabled() -> bool {
+    match option_env!("ID410_TRACE_ENABLED") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => panic!("ID410_TRACE_ENABLED must be 'true' or 'false'"),
+    }
+}
 const ID410_TRACE_RAM_SIZE: usize = 0x400;
 const ID410_TRACE_BLOCK_SIZE: usize = 16;
 const ID410_TRACE_BLOCK_TIMEOUT: Duration = Duration::from_secs(2);
@@ -589,7 +596,7 @@ async fn mqtt_message_task(
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
-                match publish_device(&mut port, &hostname, published_id).await {
+                match publish_device_with_retry(&mut port, &hostname, published_id).await {
                     Ok((id, role)) => {
                         if let Some(previous) = published_role
                             && previous != role
@@ -648,7 +655,7 @@ async fn mqtt_message_task(
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::Second(Either::First(())))))
-                if connected && published_id == 410 =>
+                if connected && id410_trace_enabled() && published_id == 410 =>
             {
                 if let Err(err) = trace_id410_memory(&mut port, &mut trace).await {
                     warn!("ID410 TRACE IR sweep failed: {err:#}");
@@ -735,7 +742,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
                 }
             },
             Either::Second(Either::First(())) if connected => {
-                match publish_device(&mut port, &hostname, published_id).await {
+                match publish_device_with_retry(&mut port, &hostname, published_id).await {
                     Ok((id, role)) => {
                         if let Some(previous) = published_role
                             && previous != role
@@ -787,7 +794,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
                 }
             }
             Either::Second(Either::Second(Either::First(())))
-                if connected && published_id == 410 =>
+                if connected && id410_trace_enabled() && published_id == 410 =>
             {
                 if let Err(err) = trace_id410_memory(&mut port, &mut trace).await {
                     warn!("ID410 TRACE sweep failed: {err:#}");
@@ -1939,6 +1946,23 @@ async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -
         .publish()
         .await
         .map_err(|err| anyhow::anyhow!("Failed to publish LIS2DH value {id}: {err:?}"))
+}
+
+async fn publish_device_with_retry(
+    port: &mut OpticalPort<'_>,
+    hostname: &str,
+    previous_id: u16,
+) -> Result<(u16, ApplianceRole)> {
+    match publish_device(port, hostname, previous_id).await {
+        Ok(result) => Ok(result),
+        Err(first_error) => {
+            warn!("Device polling failed ({first_error:#}); retrying once after resynchronization");
+            port.resynchronize().await?;
+            publish_device(port, hostname, previous_id)
+                .await
+                .with_context(|| format!("first polling attempt failed: {first_error:#}"))
+        }
+    }
 }
 
 async fn publish_device(
