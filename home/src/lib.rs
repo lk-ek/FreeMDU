@@ -300,6 +300,8 @@ pub fn new_optical_port<'a>(uart: impl Instance + 'a) -> Result<OpticalPort<'a>,
         uart,
         num_from_env!("PIN_OPTICAL_RX", u8),
         num_from_env!("PIN_OPTICAL_TX", u8),
+        optical_inverted(option_env!("OPTICAL_RX_INVERTED")),
+        optical_inverted(option_env!("OPTICAL_TX_INVERTED")),
     )
 }
 
@@ -308,31 +310,43 @@ pub fn new_optical_port2<'a>(uart: impl Instance + 'a) -> Result<OpticalPort<'a>
         uart,
         num_from_env!("PIN_OPTICAL2_RX", u8),
         num_from_env!("PIN_OPTICAL2_TX", u8),
+        optical_inverted(option_env!("OPTICAL2_RX_INVERTED")),
+        optical_inverted(option_env!("OPTICAL2_TX_INVERTED")),
     )
+}
+
+fn optical_inverted(value: Option<&str>) -> bool {
+    match value {
+        None | Some("true") => true, // Original FreeMDU polarity.
+        Some("false") => false,
+        Some(_) => panic!("optical inversion must be 'true' or 'false'"),
+    }
 }
 
 fn new_optical_port_on_pins<'a>(
     uart: impl Instance + 'a,
     rx_pin: u8,
     tx_pin: u8,
+    rx_inverted: bool,
+    tx_inverted: bool,
 ) -> Result<OpticalPort<'a>, ConfigError> {
     let rx = Input::new(unsafe { AnyPin::steal(rx_pin) }, InputConfig::default());
     let tx = Output::new(
         unsafe { AnyPin::steal(tx_pin) },
-        // The IR LED is wired from 3V3 through its current-limiting resistor
-        // to this GPIO. High is the idle/off state, including before UART
-        // takes ownership of the pin.
-        Level::High,
+        // Match the UART idle level before the peripheral takes the pin:
+        // inverted TX idles low (original FreeMDU); direct GPIO LED idles high.
+        if tx_inverted { Level::Low } else { Level::High },
         OutputConfig::default(),
     );
     let cfg = Config::default()
         .with_baudrate(2400)
         .with_parity(Parity::Even);
     let uart = Uart::new(uart, cfg)?
-        .with_rx(rx.peripheral_input().with_input_inverter(true))
-        // UART idle is high. A low start/data bit sinks current through the
-        // LED; the receiver still needs inversion for its phototransistor.
-        .with_tx(tx.into_peripheral_output())
+        .with_rx(rx.peripheral_input().with_input_inverter(rx_inverted))
+        .with_tx(
+            tx.into_peripheral_output()
+                .with_output_inverter(tx_inverted),
+        )
         .into_async();
 
     Ok(OpticalPort(uart, OpticalProgress::default()))

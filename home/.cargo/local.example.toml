@@ -10,6 +10,12 @@
 # PIN_OPTICAL_RX = "6"
 # PIN_OPTICAL2_TX = "21"
 # PIN_OPTICAL2_RX = "20"
+# Original FreeMDU (inverted TX and RX) is the default. For a direct GPIO
+# current-sink LED on either port, set that port's TX inversion to false.
+# OPTICAL_TX_INVERTED = "false"
+# OPTICAL_RX_INVERTED = "true"
+# OPTICAL2_TX_INVERTED = "false"
+# OPTICAL2_RX_INVERTED = "true"
 # Accelerometer: set these to its actual, distinct SDA/SCL pins.
 # PIN_ACCEL_SDA = "3"
 # PIN_ACCEL_SCL = "4"

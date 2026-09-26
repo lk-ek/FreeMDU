@@ -14,14 +14,22 @@ Because $R_P$ determines the phototransistor's sensitivity, an appropriate resis
 
 The standalone firmware uses two independent optical UARTs on a XIAO ESP32-C3:
 
-Both TX pins drive the SFH 7250 emitter directly as active-low current sinks:
-3V3 -> 100 ohm -> IR LED anode -> IR LED cathode -> GPIO TX. The TX GPIO
-rests high (LED off) and goes low for a transmitted start or data bit. For a
-board built with a low-side MOSFET, remove each MOSFET and bridge its gate pad
-to its LED-side pad; leave the GND pad unconnected. If the existing 100-ohm
-gate resistor is replaced with 0 ohm, the 100-ohm LED resistor still limits
-current to roughly 16–18 mA at 3.3 V. Apply this modification to both TX
-channels if both are to use direct GPIO drive.
+The default optical polarity matches original FreeMDU: both TX and RX signals
+are inverted. Each channel can be configured independently with
+`OPTICAL_TX_INVERTED`, `OPTICAL_RX_INVERTED`, `OPTICAL2_TX_INVERTED` and
+`OPTICAL2_RX_INVERTED` in `.cargo/local.toml` (the tracked defaults are
+`"true"`). The TX GPIO starts at the corresponding UART idle level.
+
+For the direct GPIO current-sink emitter wiring, set both
+`OPTICAL_TX_INVERTED = "false"` and `OPTICAL2_TX_INVERTED = "false"` in the
+ignored `.cargo/local.toml`; keep the RX inversion `"true"` with the shown
+phototransistor/Schmitt receiver. The direct wiring is 3V3 -> 100 ohm -> IR
+LED anode -> IR LED cathode -> GPIO TX. The TX pin then rests high (LED off)
+and sinks current on transmitted low bits. For a board built with a low-side
+MOSFET, remove each MOSFET and bridge its gate pad to its LED-side pad; leave
+the GND pad unconnected. If the existing 100-ohm gate resistor is replaced
+with 0 ohm, the 100-ohm LED resistor still limits current to roughly 16–18 mA
+at 3.3 V. Configure each channel according to its actual wiring.
 
 To test each LED and receiver without an appliance, enter `diag ir-test IR`
 or `diag ir-test IR2` in the USB serial console (terminate with Ctrl-J). The
