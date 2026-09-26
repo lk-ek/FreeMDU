@@ -2008,24 +2008,67 @@ async fn publish_device(
 
     // Query properties first, as publishing them immediately might lead to timeout
     for prop in props.clone() {
-        let val = if let Some(snapshot) = dryer {
-            snapshot.value::<core::convert::Infallible>(prop)?
+        let val: Result<Value> = if let Some(snapshot) = dryer {
+            Ok(snapshot.value::<core::convert::Infallible>(prop)?)
         } else {
-            dev.query_property(prop)
-                .with_timeout(DEVICE_TIMEOUT)
-                .await
-                .map_err(|err| anyhow::anyhow!("Failed to query property: {err:?}"))??
+            match dev.query_property(prop).with_timeout(DEVICE_TIMEOUT).await {
+                Ok(Ok(value)) => Ok(value),
+                Ok(Err(err)) => Err(anyhow::anyhow!("Property {} failed: {err:?}", prop.id)),
+                Err(err) => Err(anyhow::anyhow!("Property {} timed out: {err:?}", prop.id)),
+            }
         };
 
-        info!("Queried property {prop:?} with value {val:?}");
-        vals.push(val);
+        match val {
+            Ok(val) => {
+                info!("Queried property {prop:?} with value {val:?}");
+                vals.push(Some(val));
+            }
+            Err(err) => {
+                warn!(
+                    "Failed to query {}: {err:#}; recovering remaining properties",
+                    prop.id
+                );
+                vals.push(None);
+                break;
+            }
+        }
+    }
+    // The failed optical exchange may have left the protocol out of sync.
+    // Release the current session before retrying each missing property in a
+    // fresh session; one broken property must not hide the other entities.
+    drop(dev);
+    for prop in props.clone().skip(vals.len()) {
+        vals.push(None);
+    }
+    for (prop, val) in props.clone().zip(vals.iter_mut()) {
+        if val.is_none() {
+            match query_property_fresh(port, id, prop).await {
+                Ok(value) => *val = Some(value),
+                Err(err) => warn!(
+                    "Failed to query {} after resynchronization: {err:#}",
+                    prop.id
+                ),
+            }
+        }
+    }
+
+    if !vals.iter().any(Option::is_some) {
+        return Err(anyhow::anyhow!("No device properties could be read"));
     }
 
     for (prop, val) in props.zip(vals) {
         if id != 498 || previous_id != id {
             publish_property(prop, &dev_kind, hostname, channel).await?;
         }
-        publish_property_value(prop, &val, channel).await?;
+        if let Some(val) = val {
+            publish_property_value(prop, &val, channel).await?;
+        } else {
+            Topic::Device(format!("{channel}/{}/value", prop.id))
+                .with_display("unknown")
+                .publish()
+                .await
+                .map_err(|err| anyhow::anyhow!("Failed to mark {} unknown: {err:?}", prop.id))?;
+        }
         info!("Published property: {prop:?}");
     }
 
@@ -2040,6 +2083,23 @@ async fn publish_device(
     }
 
     Ok((id, role))
+}
+
+async fn query_property_fresh(
+    port: &mut OpticalPort<'_>,
+    expected_id: u16,
+    prop: &Property,
+) -> Result<Value> {
+    port.resynchronize().await?;
+    let mut dev = connect_to_device(port).await?;
+    if dev.software_id() != expected_id {
+        return Err(anyhow::anyhow!("Device changed during polling"));
+    }
+    dev.query_property(prop)
+        .with_timeout(DEVICE_TIMEOUT)
+        .await
+        .map_err(|err| anyhow::anyhow!("Property {} timed out: {err:?}", prop.id))?
+        .map_err(|err| anyhow::anyhow!("Property {} failed: {err:?}", prop.id))
 }
 
 async fn publish_property(
