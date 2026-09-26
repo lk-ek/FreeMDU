@@ -85,6 +85,35 @@ impl OpticalPort<'_> {
         Ok(echo[0])
     }
 
+    /// Send a contiguous test frame without the production echo check.
+    /// The caller reads each echoed byte separately to identify its position.
+    pub async fn debug_send_frame(&mut self, frame: &[u8]) -> Result<(), OpticalError> {
+        let written = self
+            .0
+            .write_async(frame)
+            .await
+            .map_err(|_| OpticalError::Transmit)?;
+        if written != frame.len() {
+            return Err(OpticalError::Transmit);
+        }
+        self.0
+            .flush_async()
+            .await
+            .map_err(|_| OpticalError::Transmit)
+    }
+
+    /// Read one echoed byte without validating its value.
+    pub async fn debug_read_echo(&mut self) -> Result<u8, OpticalError> {
+        let mut echo = [0_u8; 1];
+        embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(100),
+            self.read_raw(&mut echo),
+        )
+        .await
+        .map_err(|_| OpticalError::EchoTimeout)??;
+        Ok(echo[0])
+    }
+
     /// Illuminate the emitter for about 4.7 seconds without requiring an
     /// appliance. Repeated 0x00 frames at 2400-8E1 keep the active-low LED
     /// on for 10 out of every 11 bit periods, long enough for a multimeter.

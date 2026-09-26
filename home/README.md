@@ -41,6 +41,14 @@ error. Unsupported baud rates are skipped. Results appear as `SEROPT ... OK`,
 the lowest supported rate points to the optical path or polarity; a failure
 only at higher rates points to pulse timing or receiver recovery.
 
+To check the actual protocol frame for intermittent errors at its normal
+2400-8E1 rate, disconnect the appliance and run `diag burst-test IR` or
+`diag burst-test IR2`. This sends `11 00 00 02` as one continuous UART frame
+100 times, compares all four local echo bytes, and reports the trial and
+one-based byte position on a failure. It stops after five failed trials and
+prints `SEROPT ... BURST END ok=N fail=M`. This checks the local optical path;
+it does not verify a reply from an appliance.
+
 | Appliance | UART | TX | RX | GPIO TX/RX |
 | --- | --- | --- | --- | --- |
 | Dryer (IR) | UART1 | D3 | D4 | 5 / 6 |

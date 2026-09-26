@@ -112,6 +112,7 @@ enum WasherCommand {
     Action(DeviceAction),
     OpticalTest,
     BaudSweep,
+    BurstTest,
 }
 static WASHER_ACTIONS: Channel<CriticalSectionRawMutex, WasherCommand, 4> = Channel::new();
 static WASHER_TEST_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
@@ -121,6 +122,7 @@ enum DiagnosticCommand {
     QueryId,
     OpticalTest,
     BaudSweep,
+    BurstTest,
     QueryMaxBaud,
     ScanStatus,
     ScanPause,
@@ -597,6 +599,11 @@ async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
                         .send(serial_baud_sweep(&mut port, "IR2").await)
                         .await;
                 }
+                WasherCommand::BurstTest => {
+                    WASHER_TEST_RESULTS
+                        .send(serial_burst_test(&mut port, "IR2").await)
+                        .await;
+                }
             },
             Either::Second(Either::First(())) if connected => {
                 let state = match publish_device(&mut port, &hostname, WASHER, published_id).await {
@@ -894,6 +901,13 @@ async fn execute_diagnostic_command(
                 diagnostic_error("OK baud_sweep_passed")
             } else {
                 diagnostic_error("ERR baud_sweep_failed see_SEROPT_log")
+            };
+        }
+        DiagnosticCommand::BurstTest => {
+            return if serial_burst_test(port, "IR").await {
+                diagnostic_error("OK burst_test_passed")
+            } else {
+                diagnostic_error("ERR burst_test_failed see_SEROPT_log")
             };
         }
         DiagnosticCommand::ScanStatus => return scan_status(),
@@ -2342,6 +2356,65 @@ async fn serial_baud_sweep(port: &mut OpticalPort<'_>, label: &str) -> bool {
     restored && tested && !failed
 }
 
+async fn serial_burst_test(port: &mut OpticalPort<'_>, label: &str) -> bool {
+    const FRAME: [u8; 4] = [0x11, 0x00, 0x00, 0x02];
+    const TRIALS: usize = 100;
+    const MAX_FAILURES: usize = 5;
+
+    esp_println::println!(
+        "SEROPT {label} BURST BEGIN baud=2400 trials={TRIALS} (disconnect appliance)"
+    );
+    if let Err(err) = port.debug_set_baudrate(2400) {
+        esp_println::println!("SEROPT {label} BURST ERR config={err:?}");
+        return false;
+    }
+    let mut passed = 0;
+    let mut failed = 0;
+    for trial in 1..=TRIALS {
+        if let Err(err) = port.drain_input().await {
+            esp_println::println!("SEROPT {label} burst={trial} FAIL drain={err:?}");
+            failed += 1;
+        } else if let Err(err) = port.debug_send_frame(&FRAME).await {
+            esp_println::println!("SEROPT {label} burst={trial} FAIL send={err:?}");
+            failed += 1;
+        } else {
+            let mut frame_ok = true;
+            for (index, expected) in FRAME.iter().copied().enumerate() {
+                match port.debug_read_echo().await {
+                    Ok(actual) if actual == expected => {}
+                    Ok(actual) => {
+                        esp_println::println!(
+                            "SEROPT {label} burst={trial} FAIL byte={} expected={expected:02x} got={actual:02x}",
+                            index + 1
+                        );
+                        frame_ok = false;
+                    }
+                    Err(err) => {
+                        esp_println::println!(
+                            "SEROPT {label} burst={trial} FAIL byte={} expected={expected:02x} error={err:?}",
+                            index + 1
+                        );
+                        frame_ok = false;
+                        break;
+                    }
+                }
+            }
+            if frame_ok {
+                passed += 1;
+            } else {
+                failed += 1;
+            }
+        }
+        if failed >= MAX_FAILURES {
+            break;
+        }
+    }
+    // Restore a quiet receiver before appliance polling resumes.
+    let _ = port.resynchronize().await;
+    esp_println::println!("SEROPT {label} BURST END ok={passed} fail={failed}");
+    failed == 0 && passed == TRIALS
+}
+
 async fn run_diag_command(command: DiagnosticCommand) -> DiagnosticResponse {
     if matches!(command, DiagnosticCommand::ScanStatus) {
         return scan_status();
@@ -2518,7 +2591,7 @@ async fn handle_serial_diag_line(line: &str) {
     match fields.next() {
         Some("help") | None => {
             esp_println::println!(
-                "SERDIAG usage: diag ir-test IR|IR2 | diag baud-sweep IR|IR2 | diag id | diag mem16 KEY ADDR | \
+                "SERDIAG usage: diag ir-test IR|IR2 | diag baud-sweep IR|IR2 | diag burst-test IR|IR2 | diag id | diag mem16 KEY ADDR | \
                  diag eeprom16 KEY WORD_ADDR | \
                  diag dump-memory KEY START END | \
                  diag dump-eeprom KEY BYTE_START BYTE_END | \
@@ -2566,6 +2639,21 @@ async fn handle_serial_diag_line(line: &str) {
                 );
             }
             _ => esp_println::println!("SERDIAG ERR usage: diag baud-sweep IR|IR2"),
+        },
+        Some("burst-test") => match (fields.next(), fields.next()) {
+            (Some("IR"), None) => {
+                serial_diag_print_response(&run_diag_command(DiagnosticCommand::BurstTest).await);
+            }
+            (Some("IR2"), None) => {
+                WASHER_ACTIONS.send(WasherCommand::BurstTest).await;
+                let passed = WASHER_TEST_RESULTS.receive().await;
+                esp_println::println!(
+                    "SERDIAG {} burst_test_{}",
+                    if passed { "OK" } else { "ERR" },
+                    if passed { "passed" } else { "failed" }
+                );
+            }
+            _ => esp_println::println!("SERDIAG ERR usage: diag burst-test IR|IR2"),
         },
         Some("max-baud") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryMaxBaud).await);
