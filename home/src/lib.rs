@@ -53,6 +53,38 @@ pub struct OpticalProgress {
 pub struct OpticalPort<'a>(Uart<'a, Async>, OpticalProgress);
 
 impl OpticalPort<'_> {
+    /// Change only the UART timing for an isolated optical loopback test.
+    /// The caller must restore 2400-8E1 before normal appliance traffic.
+    pub fn debug_set_baudrate(&mut self, baudrate: u32) -> Result<(), ConfigError> {
+        self.0.apply_config(
+            &Config::default()
+                .with_baudrate(baudrate)
+                .with_parity(Parity::Even),
+        )
+    }
+
+    /// Send one raw byte and return its optical echo, without treating an
+    /// incorrect value as an error. The receiver can then be diagnosed even
+    /// when FreeMDU's normal byte-for-byte echo check would abort.
+    pub async fn debug_echo_byte(&mut self, value: u8) -> Result<u8, OpticalError> {
+        self.0
+            .write_async(&[value])
+            .await
+            .map_err(|_| OpticalError::Transmit)?;
+        self.0
+            .flush_async()
+            .await
+            .map_err(|_| OpticalError::Transmit)?;
+        let mut echo = [0_u8; 1];
+        embassy_time::with_timeout(
+            embassy_time::Duration::from_millis(500),
+            self.read_raw(&mut echo),
+        )
+        .await
+        .map_err(|_| OpticalError::EchoTimeout)??;
+        Ok(echo[0])
+    }
+
     /// Illuminate the emitter for about 4.7 seconds without requiring an
     /// appliance. Repeated 0x00 frames at 2400-8E1 keep the active-low LED
     /// on for 10 out of every 11 bit periods, long enough for a multimeter.

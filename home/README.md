@@ -32,6 +32,15 @@ firmware then clears the receiver before returning to normal polling. The
 other optical channel continues to operate during the test. Disconnect the
 appliance while running this raw IR test.
 
+For a timing test without an oscilloscope, disconnect the appliance and run
+`diag baud-sweep IR` or `diag baud-sweep IR2` on the USB serial console. The
+selected port sends `55`, `11`, and `00` at 100, 150, 300, 600, 1200, 2400,
+4800, 9600, and 19200 baud, stopping at the first incorrect echo or UART
+error. Unsupported baud rates are skipped. Results appear as `SEROPT ... OK`,
+`FAIL`, or `SKIP`; the port is returned to 2400-8E1 afterward. A failure at
+the lowest supported rate points to the optical path or polarity; a failure
+only at higher rates points to pulse timing or receiver recovery.
+
 | Appliance | UART | TX | RX | GPIO TX/RX |
 | --- | --- | --- | --- | --- |
 | Dryer (IR) | UART1 | D3 | D4 | 5 / 6 |
