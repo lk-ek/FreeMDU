@@ -70,6 +70,14 @@ const ACCEL_SAMPLE_HZ: u32 = freemdu_home::num_from_env!("ACCEL_SAMPLE_HZ", u32)
 const ACCEL_PUBLISH_INTERVAL: u32 = freemdu_home::num_from_env!("ACCEL_PUBLISH_INTERVAL", u32);
 const ACCEL_RETRY_DELAY: Duration = Duration::from_secs(1);
 
+fn accelerometer_enabled() -> bool {
+    match option_env!("ACCEL_ENABLED") {
+        None | Some("false") => false,
+        Some("true") => true,
+        Some(_) => panic!("ACCEL_ENABLED must be 'true' or 'false'"),
+    }
+}
+
 const OTA_PORT: u16 = freemdu_home::num_from_env!("OTA_PORT", u16);
 const OTA_TOKEN: &str = env!("OTA_TOKEN");
 const OTA_MAX_IMAGE_SIZE: usize = 0x1f0000;
@@ -3345,14 +3353,12 @@ async fn main(spawner: Spawner) {
     let led = freemdu_home::new_status_led();
     let port = freemdu_home::new_optical_port(peripherals.UART1).unwrap();
     let port2 = freemdu_home::new_optical_port2(peripherals.UART0).unwrap();
-    let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
-    let accelerometer = Lis2dh::new(accel_i2c);
     static FLASH: StaticCell<FlashMutex> = StaticCell::new();
     let flash = SharedFlash(FLASH.init(FlashMutex::new(core::cell::RefCell::new(
         FlashStorage::new(peripherals.FLASH),
     ))));
     let usb_serial = UsbSerialJtag::new(peripherals.USB_DEVICE);
-    let accel_hostname = hostname.clone();
+    let accel_hostname = accelerometer_enabled().then(|| hostname.clone());
     let port2_hostname = hostname.clone();
     let (wifi_controller, net_stack, net_runner) =
         init_network(peripherals.WIFI, &hostname).unwrap();
@@ -3366,7 +3372,11 @@ async fn main(spawner: Spawner) {
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led, flash).unwrap());
     spawner.spawn(port2_task(port2, port2_hostname).unwrap());
-    spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
+    if let Some(accel_hostname) = accel_hostname {
+        let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
+        let accelerometer = Lis2dh::new(accel_i2c);
+        spawner.spawn(accelerometer_task(accelerometer, accel_hostname).unwrap());
+    }
     spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());

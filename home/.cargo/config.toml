@@ -18,6 +18,7 @@ OPTICAL_RX_INVERTED = "true"
 OPTICAL2_TX_INVERTED = "true"
 OPTICAL2_RX_INVERTED = "true"
 # Accelerometer must not share optical GPIOs (adapt to your actual wiring).
+ACCEL_ENABLED = "false"
 PIN_ACCEL_SDA = "3"
 PIN_ACCEL_SCL = "4"
 ACCEL_SAMPLE_HZ = "50"

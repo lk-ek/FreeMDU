@@ -16,7 +16,10 @@
 # OPTICAL_RX_INVERTED = "true"
 # OPTICAL2_TX_INVERTED = "false"
 # OPTICAL2_RX_INVERTED = "true"
-# Accelerometer: set these to its actual, distinct SDA/SCL pins.
+# Set to "true" only when a LIS2DH is installed. Otherwise I2C is not
+# initialized and no accelerometer task or Home Assistant entities are started.
+# ACCEL_ENABLED = "true"
+# Accelerometer: set these to its actual, distinct SDA/SCL pins when enabled.
 # PIN_ACCEL_SDA = "3"
 # PIN_ACCEL_SCL = "4"
 # ACCEL_SAMPLE_HZ = "50"

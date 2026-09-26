@@ -84,9 +84,9 @@ cd home
 ```
 
 The configured runner flashes over USB and starts the serial monitor; terminate
-serial diagnostics with Ctrl-J. The LIS2DH accelerometer is optional for
-optical communication, but a missing chip produces initialization errors in
-the log. On the current receiver boards, both ports passed repeated local
+serial diagnostics with Ctrl-J. The LIS2DH accelerometer is optional and
+disabled by default; set `ACCEL_ENABLED = "true"` in `.cargo/local.toml` when
+it is installed. On the current receiver boards, both ports passed repeated local
 2400-baud burst tests and a single-byte sweep through 4800 baud; 9600 baud has
 not passed reliably. These tests do not establish simultaneous appliance
 communication.

@@ -62,7 +62,14 @@ it does not verify a reply from an appliance.
 | IR | UART1 | D3 | D4 | 5 / 6 |
 | IR2 | UART0 | D6 | D7 | 21 / 20 |
 
-Pin `10` drives the active-low status LED. The accelerometer defaults to D1/D2 (GPIO3/4); set `PIN_ACCEL_SDA` and `PIN_ACCEL_SCL` in your ignored `.cargo/local.toml` to match its actual wiring. Do not assign a GPIO to both an optical port and the accelerometer. On other boards, override all pin numbers in `.cargo/local.toml` using the board's GPIO map (XIAO ESP32-C6 uses different GPIO numbers for the same D labels).
+Pin `10` drives the active-low status LED. The LIS2DH accelerometer is disabled
+by default. With `ACCEL_ENABLED = "false"`, the firmware neither initializes
+I2C nor starts its sampling/HA task, so an absent chip needs no dummy wiring.
+Set `ACCEL_ENABLED = "true"` under `[env]` in `.cargo/local.toml` if fitted.
+Its SDA/SCL pins default to D1/D2 (GPIO3/4); override `PIN_ACCEL_SDA` and
+`PIN_ACCEL_SCL` for other wiring. Do not share pins with an optical port.
+On other boards, override GPIO numbers using the board's pin map (XIAO
+ESP32-C6 uses different GPIO numbers for the same D labels).
 
 Both optical UARTs poll independently. After each successful software-ID query,
 ID 410 publishes to `washer/...` and ID 498 to `dryer/...` on either port;
