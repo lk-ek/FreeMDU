@@ -14,6 +14,15 @@ Because $R_P$ determines the phototransistor's sensitivity, an appropriate resis
 
 The standalone firmware uses two independent optical UARTs on a XIAO ESP32-C3:
 
+Both TX pins drive the SFH 7250 emitter directly as active-low current sinks:
+3V3 -> 100 ohm -> IR LED anode -> IR LED cathode -> GPIO TX. The TX GPIO
+rests high (LED off) and goes low for a transmitted start or data bit. For a
+board built with a low-side MOSFET, remove each MOSFET and bridge its gate pad
+to its LED-side pad; leave the GND pad unconnected. If the existing 100-ohm
+gate resistor is replaced with 0 ohm, the 100-ohm LED resistor still limits
+current to roughly 16–18 mA at 3.3 V. Apply this modification to both TX
+channels if both are to use direct GPIO drive.
+
 | Appliance | UART | TX | RX | GPIO TX/RX |
 | --- | --- | --- | --- | --- |
 | Dryer (IR) | UART1 | D3 | D4 | 5 / 6 |

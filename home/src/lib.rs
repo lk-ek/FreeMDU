@@ -239,7 +239,10 @@ fn new_optical_port_on_pins<'a>(
     let rx = Input::new(unsafe { AnyPin::steal(rx_pin) }, InputConfig::default());
     let tx = Output::new(
         unsafe { AnyPin::steal(tx_pin) },
-        Level::Low,
+        // The IR LED is wired from 3V3 through its current-limiting resistor
+        // to this GPIO. High is the idle/off state, including before UART
+        // takes ownership of the pin.
+        Level::High,
         OutputConfig::default(),
     );
     let cfg = Config::default()
@@ -247,7 +250,9 @@ fn new_optical_port_on_pins<'a>(
         .with_parity(Parity::Even);
     let uart = Uart::new(uart, cfg)?
         .with_rx(rx.peripheral_input().with_input_inverter(true))
-        .with_tx(tx.into_peripheral_output().with_output_inverter(true))
+        // UART idle is high. A low start/data bit sinks current through the
+        // LED; the receiver still needs inversion for its phototransistor.
+        .with_tx(tx.into_peripheral_output())
         .into_async();
 
     Ok(OpticalPort(uart, OpticalProgress::default()))
