@@ -1,133 +1,45 @@
 # FreeMDU
 
-<p align="center">
-  <img src="demo.gif" alt="Demo">
-</p>
+<p align="center"><img src="demo.gif" alt="FreeMDU demo"></p>
 
-The FreeMDU project provides open hardware and software tools for communicating with Miele appliances via their optical diagnostic interface. It serves as a free and open alternative to the proprietary **Miele Diagnostic Utility (MDU)** software, which is only available to registered service technicians.
-
-Most Miele devices manufactured after 1996 include an optical infrared-based diagnostic interface, hidden behind one of the indicator lights on the front panel. On older appliances, this interface is marked by a **Program Correction (PC)** label.
-
-Until now, communication with this interface required an expensive infrared adapter sold exclusively by Miele, along with their closed-source software. The goal of FreeMDU is to make this interface accessible to everyone for diagnostic and home automation purposes.
-
-The project is split into three main components:
-
-- [**Protocol**](protocol): core protocol library and device implementations
-- [**TUI**](tui): terminal-based device diagnostic and testing tool
-- [**Home**](home): communication adapter firmware with MQTT integration for Home Assistant
-
-More details about the proprietary diagnostic interface and the reverse-engineering process behind this project can be found in this [**blog post**](https://medusalix.github.io/posts/miele-interface).
+FreeMDU provides tools for Miele's optical diagnostic interface: a [protocol library](protocol/README.md), a [terminal UI](tui/README.md), and [ESP firmware](home/README.md) for a USB bridge or MQTT/Home Assistant monitoring. It is an independent alternative to the proprietary Miele Diagnostic Utility. Background on the interface is in the [original research post](https://medusalix.github.io/posts/miele-interface).
 
 > [!CAUTION]
-> This project is highly experimental and can cause permanent damage to your Miele devices if not used responsibly. Proceed at your own risk.
+> Diagnostic actions can affect an appliance. This project is experimental; use write or full-access functions only when you understand the device and their effects.
 
 ## Supported devices
 
-When a connection is established via the diagnostic interface, the appliance responds with its **software ID**, a 16-bit number that uniquely identifies the firmware version running on the device's microcontroller. However, this ID does not directly correspond to a specific model or board type, so it's impossible to provide a comprehensive list of supported models.
+The appliance reports a *software ID*. FreeMDU uses that ID to select a protocol implementation; the implementation supplies its device kind, properties and actions. A software ID identifies firmware, not necessarily a unique model. Confirmed combinations:
 
-The following table lists the software IDs and device/board combinations that have been confirmed to work with FreeMDU:
+| Software ID | Device | Board | Microcontroller | Interface | Support |
+| --- | --- | --- | --- | --- | --- |
+| 218 | W 985 | EDPW 213 | Mitsubishi M37451MC | Check inlet (PC) | Protocol profile |
+| 324 | W 980 | EDPW 213 | Mitsubishi M37451MC | Check inlet (PC) | Protocol profile |
+| 360 | Bare board | EDPW 223-A | Mitsubishi M38078MC-065FP | Check inlet (PC) | Protocol profile |
+| 419 | Bare board | EDPW 206 | Mitsubishi M37451MC-804FP | Check inlet (PC) | Protocol profile |
+| 469 | W 487 S | EDPW 228-A | Mitsubishi M38078MF | Check inlet (PC) | Protocol profile |
+| 517 | G 7804 | EGPL 061 | Mitsubishi M38079EFFP | (PC) DOS | Protocol profile |
+| 605 | G 651 I PLUS-3 | EGPL 542-C | Mitsubishi M38027M8 | Salt (PC) | Protocol profile |
+| 629 | W 2446 | EDPL 126-B | Mitsubishi M38079MF-308FP | Check inlet (PC) | Protocol profile |
+| 2088 | W 3241 | EDPL 162-B | Mitsubishi M38079EFFP | Check inlet (PC) | Protocol profile |
+| 2895 | W 3164 | EDPL 151-B | Mitsubishi M38079MF-322FP | Check inlet (PC) | Protocol profile |
+| 410 | W 307 | — | — | Optical diagnostic port | Experimental read-only monitoring |
+| 498 | T 4223 C | — | — | Optical diagnostic port | Experimental read-only monitoring |
 
-| Software ID | Device         | Board      | Microcontroller           | Optical interface location   | Status             |
-|-------------|----------------|------------|---------------------------|------------------------------|--------------------|
-| 218         | W 985          | EDPW 213   | Mitsubishi M37451MC       | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 324         | W 980          | EDPW 213   | Mitsubishi M37451MC       | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 360         | Bare board     | EDPW 223-A | Mitsubishi M38078MC-065FP | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 419         | Bare board     | EDPW 206   | Mitsubishi M37451MC-804FP | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 469         | W 487 S        | EDPW 228-A | Mitsubishi M38078MF       | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 517         | G 7804         | EGPL 061   | Mitsubishi M38079EFFP     | *(PC) DOS* indicator         | 🟢 Fully supported |
-| 605         | G 651 I PLUS-3 | EGPL 542-C | Mitsubishi M38027M8       | *Salt (PC)* indicator        | 🟢 Fully supported |
-| 629         | W 2446         | EDPL 126-B | Mitsubishi M38079MF-308FP | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 2088        | W 3241         | EDPL 162-B | Mitsubishi M38079EFFP     | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 2895        | W 3164         | EDPL 151-B | Mitsubishi M38079MF-322FP | *Check inlet (PC)* indicator | 🟢 Fully supported |
-| 410         | W 307          | —          | —                         | Optical diagnostic port      | Experimental Home Assistant monitoring |
-| 498         | T 4223 C       | —          | —                         | Optical diagnostic port      | Experimental read-only monitoring |
+Similar models may use a compatible software ID. Query the ID before assuming compatibility.
 
-If your appliance is not listed here but has a model number similar to one of the above, it might already be compatible. In all other cases, determining the **software ID** is the first step toward adding support for new devices.
+## Choose a mode
 
-Details for adding support for new devices will be provided soon.
+- **Diagnostics:** flash the ESP [bridge firmware](home/README.md#firmware-modes), connect the optical adapter and run the [TUI](tui/README.md).
+- **Home Assistant:** flash the [standalone firmware](home/README.md#build-and-flash). Its two IR ports poll independently and publish MQTT discovery and values.
+- **Custom tools:** use the [protocol crate](protocol/README.md) with a supported transport.
 
-## Getting started
+The standalone firmware maps a connected protocol profile's `DeviceKind::WashingMachine` to `washer/...` and `DeviceKind::TumbleDryer` to `dryer/...`, independently of the port. The MQTT mapping currently has one channel per kind. Other device kinds are supported by the protocol/TUI but have no standalone MQTT channel. Device-specific experimental features remain limited to their respective IDs. See [Home](home/README.md#device-detection-and-mqtt) for routing, pinout, configuration and limitations.
 
-Before using FreeMDU, install the [Rust toolchain](https://rust-lang.org/tools/install).
+Past receiver tests, EEPROM investigations and protocol observations are in the [historical notes](home/HISTORY.md).
 
-### Dual optical ESP32-C3 firmware
+## License and attribution
 
-The standalone firmware can monitor the W307 (software ID **410**) and T4223C
-(software ID **498**) on two independent IR ports at 2400-8E1. The ports are
-electrically separate; **either appliance can use either port**. The detected
-software ID selects the MQTT/HA role: ID 410 publishes `washer/...`, ID 498
-publishes `dryer/...`. Unknown IDs are reported in the log and are not assigned
-one of those topics. MQTT actions and availability follow the same mapping;
-the read-only ID410 RAM trace follows the washer's port.
+This project is independent of and not affiliated with Miele & Cie. KG. Product names are used only to identify compatible appliances.
 
-| Port | UART | XIAO ESP32-C3 TX / RX | GPIO TX / RX |
-| --- | --- | --- | --- |
-| IR | UART1 | D3 / D4 | 5 / 6 |
-| IR2 | UART0 | D6 / D7 | 21 / 20 |
-
-The USB bridge, remote bridge, key scan and general diagnostics use IR/UART1.
-`diag ir-test`, `diag baud-sweep` and `diag burst-test` accept `IR` or `IR2`.
-Local echo tests verify the transceivers; a machine reply must be checked with
-the actual appliance connected. See [Home](home/README.md) for the optical
-circuit, configuration, diagnostic commands and firmware details.
-
-From `home/`, copy `.cargo/local.example.toml` to `.cargo/local.toml` and enter
-Wi-Fi/MQTT credentials there. The ignored local file also carries board-specific
-GPIO settings. The default TX and RX inversion is the original FreeMDU polarity;
-for LEDs wired as GPIO current sinks set both `OPTICAL_TX_INVERTED = "false"`
-and `OPTICAL2_TX_INVERTED = "false"` under `[env]` before flashing. The RX
-inversion remains `"true"` with the documented phototransistor/Schmitt circuit.
-
-```sh
-cd home
-./cargo-local run --features esp32c3 --target riscv32imc-unknown-none-elf --release --bin standalone
-```
-
-The configured runner flashes over USB and starts the serial monitor; terminate
-serial diagnostics with Ctrl-J. The LIS2DH accelerometer is optional and
-disabled by default; set `ACCEL_ENABLED = "true"` in `.cargo/local.toml` when
-it is installed. On the current receiver boards, both ports passed repeated local
-2400-baud burst tests and a single-byte sweep through 4800 baud; 9600 baud has
-not passed reliably. These tests do not establish simultaneous appliance
-communication.
-
-Next, you'll need to build a [communication adapter](home/README.md#getting-started) to interface with your Miele device. Once the adapter is ready, choose the appropriate use case from the options below:
-
-### Device diagnostics and testing
-
-If you want to repair or test your appliance:
-
-1. Flash the [home](home) firmware in **bridge mode** onto your communication adapter and attach it to your device.
-
-2. Run the [TUI](tui) application on your desktop computer.
-
-### Integration into home automation systems
-
-If you want to integrate your appliance into **Home Assistant** or another home automation system:
-
-1. Flash the [home](home) firmware in **standalone mode** onto your communication adapter and attach it to your device.
-
-### Building custom tools
-
-If you want to develop your own software to communicate with Miele devices:
-
-1. Flash the [home](home) firmware in **bridge mode** onto your communication adapter and attach it to your device.
-
-2. Use the [protocol](protocol) crate to implement your custom software.
-
-## Disclaimer
-
-This is an independent, open-source project and is **not affiliated with, endorsed by, or sponsored by Miele & Cie. KG** or its affiliates. All product names and trademarks are the property of their respective owners. References to Miele appliances are for descriptive purposes only and do not imply any association with Miele.
-
-## License
-
-Licensed under either of
-
-- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or <http://www.apache.org/licenses/LICENSE-2.0>)
-- MIT license ([LICENSE-MIT](LICENSE-MIT) or <http://opensource.org/licenses/MIT>)
-
-at your option.
-
-## Contribution
-
-Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in the work by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
+Licensed under either [Apache-2.0](LICENSE-APACHE) or [MIT](LICENSE-MIT). Contributions submitted for inclusion are dual licensed under the same terms unless explicitly stated otherwise.

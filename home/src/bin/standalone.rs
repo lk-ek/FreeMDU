@@ -39,7 +39,7 @@ use esp_radio::wifi::{
 };
 use esp_storage::FlashStorage;
 use freemdu::Interface as MieleInterface;
-use freemdu::device::{self, Action, ActionKind, Date, Property, PropertyKind, Value};
+use freemdu::device::{self, Action, ActionKind, Date, DeviceKind, Property, PropertyKind, Value};
 use freemdu_home::{
     OpticalPort,
     accelerometer::{Lis2dh, Metrics, WindowStats},
@@ -119,11 +119,26 @@ enum ApplianceRole {
 }
 
 impl ApplianceRole {
-    fn from_software_id(id: u16) -> Option<Self> {
-        match id {
-            498 => Some(Self::Dryer),
-            410 => Some(Self::Washer),
+    fn from_kind(kind: DeviceKind) -> Option<Self> {
+        match kind {
+            DeviceKind::TumbleDryer => Some(Self::Dryer),
+            DeviceKind::WashingMachine => Some(Self::Washer),
             _ => None,
+        }
+    }
+
+    fn from_channel(channel: &str) -> Option<Self> {
+        match channel {
+            DRYER => Some(Self::Dryer),
+            WASHER => Some(Self::Washer),
+            _ => None,
+        }
+    }
+
+    fn code(self) -> u32 {
+        match self {
+            Self::Dryer => 1,
+            Self::Washer => 2,
         }
     }
 
@@ -131,13 +146,6 @@ impl ApplianceRole {
         match self {
             Self::Dryer => DRYER,
             Self::Washer => WASHER,
-        }
-    }
-
-    fn software_id(self) -> u32 {
-        match self {
-            Self::Dryer => 498,
-            Self::Washer => 410,
         }
     }
 
@@ -152,6 +160,8 @@ impl ApplianceRole {
 // The actual appliance on each optical UART is learned after its ID query.
 static IR_SOFTWARE_ID: AtomicU32 = AtomicU32::new(0);
 static IR2_SOFTWARE_ID: AtomicU32 = AtomicU32::new(0);
+static IR_ROLE: AtomicU32 = AtomicU32::new(0);
+static IR2_ROLE: AtomicU32 = AtomicU32::new(0);
 
 struct DeviceAction {
     software_id: u32,
@@ -545,6 +555,8 @@ async fn mqtt_message_task(
                 MQTT_CONNECTED.store(false, Ordering::Relaxed);
                 IR_SOFTWARE_ID.store(0, Ordering::Relaxed);
                 IR2_SOFTWARE_ID.store(0, Ordering::Relaxed);
+                IR_ROLE.store(0, Ordering::Relaxed);
+                IR2_ROLE.store(0, Ordering::Relaxed);
             }
             Either::Second(Either::Second(Either::First(MqttMessage::Publish(
                 Topic::Device(topic),
@@ -554,27 +566,21 @@ async fn mqtt_message_task(
                     && let Some((channel, rest)) = topic.split_once('/')
                     && let Some((action_id, "trigger")) = rest.split_once('/')
                 {
-                    let target = match channel {
-                        DRYER => Some(498),
-                        WASHER => Some(410),
-                        _ => None,
-                    };
-                    if target.is_some_and(|software_id| {
-                        IR_SOFTWARE_ID.load(Ordering::Relaxed) == software_id
-                    }) {
+                    let target = ApplianceRole::from_channel(channel);
+                    if target.is_some_and(|role| IR_ROLE.load(Ordering::Relaxed) == role.code()) {
+                        let software_id = IR_SOFTWARE_ID.load(Ordering::Relaxed);
                         if let Err(err) =
-                            trigger_action(&mut port, target.unwrap() as u16, action_id, param)
-                                .await
+                            trigger_action(&mut port, software_id as u16, action_id, param).await
                         {
                             error!("Failed to trigger IR action: {err:#}");
                             let _ = port.resynchronize().await;
                         }
-                    } else if target.is_some_and(|software_id| {
-                        IR2_SOFTWARE_ID.load(Ordering::Relaxed) == software_id
-                    }) {
+                    } else if target
+                        .is_some_and(|role| IR2_ROLE.load(Ordering::Relaxed) == role.code())
+                    {
                         PORT2_ACTIONS
                             .send(Port2Command::Action(DeviceAction {
-                                software_id: target.unwrap(),
+                                software_id: IR2_SOFTWARE_ID.load(Ordering::Relaxed),
                                 id: action_id.to_string(),
                                 param: param.to_string(),
                             }))
@@ -587,7 +593,7 @@ async fn mqtt_message_task(
                     Ok((id, role)) => {
                         if let Some(previous) = published_role
                             && previous != role
-                            && IR2_SOFTWARE_ID.load(Ordering::Relaxed) != previous.software_id()
+                            && IR2_ROLE.load(Ordering::Relaxed) != previous.code()
                         {
                             let _ = previous
                                 .status()
@@ -596,6 +602,7 @@ async fn mqtt_message_task(
                                 .await;
                         }
                         IR_SOFTWARE_ID.store(u32::from(id), Ordering::Relaxed);
+                        IR_ROLE.store(role.code(), Ordering::Relaxed);
                         published_role = Some(role);
                         if id != published_id {
                             info!("IR identified software ID {id} as {}", role.channel());
@@ -619,9 +626,10 @@ async fn mqtt_message_task(
                     Err(err) => {
                         error!("Failed to publish IR device: {err:#}");
                         IR_SOFTWARE_ID.store(0, Ordering::Relaxed);
+                        IR_ROLE.store(0, Ordering::Relaxed);
                         let _ = port.resynchronize().await;
                         if let Some(role) = published_role
-                            && IR2_SOFTWARE_ID.load(Ordering::Relaxed) != role.software_id()
+                            && IR2_ROLE.load(Ordering::Relaxed) != role.code()
                         {
                             let _ = role
                                 .status()
@@ -731,7 +739,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
                     Ok((id, role)) => {
                         if let Some(previous) = published_role
                             && previous != role
-                            && IR_SOFTWARE_ID.load(Ordering::Relaxed) != previous.software_id()
+                            && IR_ROLE.load(Ordering::Relaxed) != previous.code()
                         {
                             let _ = previous
                                 .status()
@@ -742,10 +750,16 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
                         if id != published_id {
                             info!("IR2 identified software ID {id} as {}", role.channel());
                             trace = Id410Trace::new();
+                            ticker = Ticker::every(if id == 498 {
+                                Duration::from_secs(5)
+                            } else {
+                                DEVICE_PUBLISH_INTERVAL
+                            });
                         }
                         published_id = id;
                         published_role = Some(role);
                         IR2_SOFTWARE_ID.store(u32::from(id), Ordering::Relaxed);
+                        IR2_ROLE.store(role.code(), Ordering::Relaxed);
                         if let Err(err) = role
                             .status()
                             .with_bytes(&AvailabilityState::Online)
@@ -758,9 +772,10 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
                     Err(err) => {
                         error!("Failed to publish IR2 device: {err:#}");
                         IR2_SOFTWARE_ID.store(0, Ordering::Relaxed);
+                        IR2_ROLE.store(0, Ordering::Relaxed);
                         let _ = port.resynchronize().await;
                         if let Some(role) = published_role
-                            && IR_SOFTWARE_ID.load(Ordering::Relaxed) != role.software_id()
+                            && IR_ROLE.load(Ordering::Relaxed) != role.code()
                         {
                             let _ = role
                                 .status()
@@ -1933,8 +1948,12 @@ async fn publish_device(
 ) -> Result<(u16, ApplianceRole)> {
     let mut dev = connect_to_device(port).await?;
     let id = dev.software_id();
-    let role = ApplianceRole::from_software_id(id)
-        .ok_or_else(|| anyhow::anyhow!("unsupported appliance software ID {id}"))?;
+    let role = ApplianceRole::from_kind(dev.kind()).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no MQTT channel for device kind {} (software ID {id})",
+            dev.kind()
+        )
+    })?;
     let channel = role.channel();
     let dev_kind = dev.kind().to_string();
     let dryer = if id == 498 {

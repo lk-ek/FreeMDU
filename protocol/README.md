@@ -8,6 +8,13 @@ More details about the interface and the FreeMDU project can be found [here](htt
 
 This crate can be used in `no_std` environments and embedded projects, but an allocator is required due to the use of `Box`.
 
+`device::connect` queries the appliance's software ID and selects the matching
+device implementation. That implementation reports its `DeviceKind` (for example,
+`WashingMachine` or `TumbleDryer`) and its available properties and actions.
+The software ID is the protocol dispatch key; the kind is supplied by the
+selected profile, not inferred from a numeric ID range. An unknown ID returns
+`UnknownSoftwareId`.
+
 ## Optional features
 
 When adding this crate as a dependency, the following optional features can be specified (all disabled by default):
