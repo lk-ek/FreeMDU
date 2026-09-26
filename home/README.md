@@ -11,7 +11,17 @@ Use an IR emitter and phototransistor appropriate for Miele's optical interface,
 | IR | UART1 | D3 | D4 | 5 / 6 |
 | IR2 | UART0 | D6 | D7 | 21 / 20 |
 
-The default `OPTICAL_TX_INVERTED`, `OPTICAL_RX_INVERTED`, `OPTICAL2_TX_INVERTED` and `OPTICAL2_RX_INVERTED` are all `"true"`, matching original FreeMDU. Configure each polarity for its physical circuit. For an LED driven directly as a GPIO current sink (3V3 → 100 Ω → LED anode → LED cathode → TX GPIO), set that port's `OPTICAL*_TX_INVERTED` to `"false"`; it idles high with the LED off. The tested phototransistor/Schmitt receiver uses `RX_INVERTED = "true"`. Its pulldown is circuit dependent; the prototype passed local 2400-baud echo tests with 10–15 kΩ. Check the input voltage and timing on your assembled hardware.
+### Optical circuit variants
+
+The preferred circuit drives the IR LED through an N-channel MOSFET and conditions the phototransistor signal with a Schmitt trigger:
+
+![Preferred optical circuit: MOSFET LED driver and Schmitt-trigger receiver](freemdu-preferred-schematic.png)
+
+The minimal circuit sinks the LED current directly through the TX GPIO and connects the phototransistor receiver without a Schmitt trigger:
+
+![Minimal optical circuit: direct GPIO LED drive and receiver without Schmitt trigger](freemdu-simple-schematic.png)
+
+Both variants apply to either optical port. The default `OPTICAL_TX_INVERTED`, `OPTICAL_RX_INVERTED`, `OPTICAL2_TX_INVERTED` and `OPTICAL2_RX_INVERTED` are all `"true"`, matching original FreeMDU. Set the TX inversion of a direct GPIO current-sink LED to `"false"`; it idles high with the LED off. Configure each port according to its actual circuit. The tested phototransistor/Schmitt receiver uses RX inversion `"true"` and passed local 2400-baud echo tests with a 10–15 kΩ pulldown. For the circuit without a Schmitt trigger, check the GPIO high level and run the echo tests on the assembled hardware; its reliability has not been established by those Schmitt-receiver tests.
 
 The status LED uses GPIO10 by default. The LIS2DH is disabled by default. Set `ACCEL_ENABLED = "true"` only when fitted, and set `PIN_ACCEL_SDA`/`PIN_ACCEL_SCL` if the default D1/D2 (GPIO3/4) pins differ. Do not share them with an IR port. The XIAO ESP32-C6 has a different GPIO map.
 
