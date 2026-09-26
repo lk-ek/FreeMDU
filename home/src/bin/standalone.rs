@@ -62,6 +62,9 @@ const DEVICE_PUBLISH_INTERVAL: Duration =
 
 // Timeout for device operations (e.g. connection)
 const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
+// Allow a slower reply after an optical error; resynchronize() already waits
+// for the appliance's three-second session timeout before each recovery read.
+const DEVICE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
 
 // Delay between Wi-Fi reconnection attempts
 const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -1953,12 +1956,12 @@ async fn publish_device_with_retry(
     hostname: &str,
     previous_id: u16,
 ) -> Result<(u16, ApplianceRole)> {
-    match publish_device(port, hostname, previous_id).await {
+    match publish_device(port, hostname, previous_id, DEVICE_TIMEOUT).await {
         Ok(result) => Ok(result),
         Err(first_error) => {
             warn!("Device polling failed ({first_error:#}); retrying once after resynchronization");
             port.resynchronize().await?;
-            publish_device(port, hostname, previous_id)
+            publish_device(port, hostname, previous_id, DEVICE_RECOVERY_TIMEOUT)
                 .await
                 .with_context(|| format!("first polling attempt failed: {first_error:#}"))
         }
@@ -1969,8 +1972,9 @@ async fn publish_device(
     port: &mut OpticalPort<'_>,
     hostname: &str,
     previous_id: u16,
+    timeout: Duration,
 ) -> Result<(u16, ApplianceRole)> {
-    let mut dev = connect_to_device(port).await?;
+    let mut dev = connect_to_device_with_timeout(port, timeout).await?;
     let id = dev.software_id();
     let role = ApplianceRole::from_kind(dev.kind()).ok_or_else(|| {
         anyhow::anyhow!(
@@ -1982,7 +1986,7 @@ async fn publish_device(
     let dev_kind = dev.kind().to_string();
     let dryer = if id == 498 {
         let snapshot = device::id498::Snapshot::read(dev.interface())
-            .with_timeout(DEVICE_TIMEOUT)
+            .with_timeout(timeout)
             .await
             .map_err(|_| anyhow::anyhow!("ID498 snapshot timeout"))??;
         info!(
@@ -2011,7 +2015,7 @@ async fn publish_device(
         let val: Result<Value> = if let Some(snapshot) = dryer {
             Ok(snapshot.value::<core::convert::Infallible>(prop)?)
         } else {
-            match dev.query_property(prop).with_timeout(DEVICE_TIMEOUT).await {
+            match dev.query_property(prop).with_timeout(timeout).await {
                 Ok(Ok(value)) => Ok(value),
                 Ok(Err(err)) => Err(anyhow::anyhow!("Property {} failed: {err:?}", prop.id)),
                 Err(err) => Err(anyhow::anyhow!("Property {} timed out: {err:?}", prop.id)),
@@ -2037,9 +2041,7 @@ async fn publish_device(
     // Release the current session before retrying each missing property in a
     // fresh session; one broken property must not hide the other entities.
     drop(dev);
-    for prop in props.clone().skip(vals.len()) {
-        vals.push(None);
-    }
+    vals.resize_with(props.clone().count(), || None);
     for (prop, val) in props.clone().zip(vals.iter_mut()) {
         if val.is_none() {
             match query_property_fresh(port, id, prop).await {
@@ -2091,12 +2093,12 @@ async fn query_property_fresh(
     prop: &Property,
 ) -> Result<Value> {
     port.resynchronize().await?;
-    let mut dev = connect_to_device(port).await?;
+    let mut dev = connect_to_device_with_timeout(port, DEVICE_RECOVERY_TIMEOUT).await?;
     if dev.software_id() != expected_id {
         return Err(anyhow::anyhow!("Device changed during polling"));
     }
     dev.query_property(prop)
-        .with_timeout(DEVICE_TIMEOUT)
+        .with_timeout(DEVICE_RECOVERY_TIMEOUT)
         .await
         .map_err(|err| anyhow::anyhow!("Property {} timed out: {err:?}", prop.id))?
         .map_err(|err| anyhow::anyhow!("Property {} failed: {err:?}", prop.id))
@@ -2240,8 +2242,15 @@ async fn trigger_action(
 async fn connect_to_device<'a, 'b>(
     port: &'a mut OpticalPort<'b>,
 ) -> Result<Box<dyn device::Device<&'a mut OpticalPort<'b>> + 'a>> {
+    connect_to_device_with_timeout(port, DEVICE_TIMEOUT).await
+}
+
+async fn connect_to_device_with_timeout<'a, 'b>(
+    port: &'a mut OpticalPort<'b>,
+    timeout: Duration,
+) -> Result<Box<dyn device::Device<&'a mut OpticalPort<'b>> + 'a>> {
     let dev = device::connect(port)
-        .with_timeout(DEVICE_TIMEOUT)
+        .with_timeout(timeout)
         .await
         .map_err(|err| anyhow::anyhow!("Failed to connect to device: {err:?}"))??;
 
