@@ -2127,7 +2127,7 @@ async fn publish_device(
 
     for (prop, val) in props.zip(vals) {
         if id != 498 || previous_id != id {
-            publish_property(prop, &dev_kind, hostname, channel).await?;
+            publish_property(prop, &dev_kind, hostname, channel, previous_id != id).await?;
         }
         if let Some(val) = val {
             publish_property_value(prop, &val, channel).await?;
@@ -2144,7 +2144,7 @@ async fn publish_device(
     for action in actions {
         // There's no suitable HA component for actions with parameters
         if action.params.is_none() {
-            publish_action(action, &dev_kind, hostname, channel).await?;
+            publish_action(action, &dev_kind, hostname, channel, previous_id != id).await?;
             info!("Published action: {action:?}");
         } else {
             info!("Skipped action due to parameters: {action:?}");
@@ -2225,13 +2225,38 @@ async fn publish_appliance_discovery(
         .map_err(|err| anyhow::anyhow!("Failed to publish HA discovery: {err:?}"))
 }
 
+// The original single-port firmware published under hostname_property,
+// without a washer/dryer channel. Those retained entries otherwise remain
+// visible alongside the new entities. Early dual-port firmware also used the
+// gateway's MAC as the device identifier on the current discovery topic.
+// Remove both variants on first contact/reconnect before rediscovering the
+// entity with its stable channel-specific unique_id and device identifier.
+async fn clear_appliance_discovery(component: &str, object_id: &str) -> Result<()> {
+    let prefix = option_env!("HA_DISCOVERY_PREFIX").unwrap_or("homeassistant");
+    Topic::General(format!("{prefix}/{component}/{object_id}/config"))
+        .with_bytes(b"")
+        .retain(true)
+        .publish()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to clear old HA discovery: {err:?}"))
+}
+
 async fn publish_property(
     prop: &Property,
     dev: &str,
     hostname: &str,
     channel: &'static str,
+    refresh_device: bool,
 ) -> Result<()> {
     let unique_id = format!("{}_{}_{}", hostname, channel, prop.id);
+    let display_name = prop
+        .name
+        .strip_prefix(if channel == DRYER {
+            "Dryer "
+        } else {
+            "Washer "
+        })
+        .unwrap_or(prop.name);
     let status = if channel == DRYER {
         DRYER_STATUS
     } else {
@@ -2248,7 +2273,7 @@ async fn publish_property(
         origin: Origin::default(),
         object_id: &unique_id,
         unique_id: &unique_id,
-        name: prop.name,
+        name: display_name,
         availability: [
             ApplianceAvailability {
                 topic: STATUS_TOPIC,
@@ -2259,6 +2284,11 @@ async fn publish_property(
         state_topic: state_topic.as_ref(),
         unit_of_measurement: prop.unit,
     };
+    if refresh_device {
+        let legacy_id = format!("{hostname}_{}", prop.id);
+        clear_appliance_discovery("sensor", &legacy_id).await?;
+        clear_appliance_discovery("sensor", &unique_id).await?;
+    }
     publish_appliance_discovery("sensor", &unique_id, &discovery).await
 }
 
@@ -2301,8 +2331,17 @@ async fn publish_action(
     dev: &str,
     hostname: &str,
     channel: &'static str,
+    refresh_device: bool,
 ) -> Result<()> {
     let unique_id = format!("{}_{}_{}", hostname, channel, action.id);
+    let display_name = action
+        .name
+        .strip_prefix(if channel == DRYER {
+            "Dryer "
+        } else {
+            "Washer "
+        })
+        .unwrap_or(action.name);
     let status = if channel == DRYER {
         DRYER_STATUS
     } else {
@@ -2319,7 +2358,7 @@ async fn publish_action(
         origin: Origin::default(),
         object_id: &unique_id,
         unique_id: &unique_id,
-        name: action.name,
+        name: display_name,
         availability: [
             ApplianceAvailability {
                 topic: STATUS_TOPIC,
@@ -2329,6 +2368,11 @@ async fn publish_action(
         availability_mode: "all",
         command_topic: command_topic.as_ref(),
     };
+    if refresh_device {
+        let legacy_id = format!("{hostname}_{}", action.id);
+        clear_appliance_discovery("button", &legacy_id).await?;
+        clear_appliance_discovery("button", &unique_id).await?;
+    }
     publish_appliance_discovery("button", &unique_id, &discovery).await
 }
 
