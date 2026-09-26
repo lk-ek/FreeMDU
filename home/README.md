@@ -70,7 +70,15 @@ All three commands accept `IR` or `IR2`. `ir-test` illuminates the selected LED 
 
 ## Key scans and diagnostic reads
 
-The authenticated `diag.py` and USB console use IR/UART1. A read-key scan runs on the ESP and persists its progress to flash, including across reboot. Do not swap appliances during an active scan: each handshake checks the stored software ID.
+The authenticated `diag.py` and USB console send ordinary diagnostic reads to **both** optical ports by default. Select one with `--device IR` or `--device IR2` in `diag.py`, or prefix a USB command with `IR` or `IR2`. The firmware TCP protocol likewise accepts `IR` or `IR2` between the token and command; without a selector it returns labeled responses from both ports. Missing or unresponsive appliances report an error for their own port without hiding the other response. For example:
+
+```sh
+./diag.py HOST id
+./diag.py HOST id --device IR2
+./diag.py HOST --device IR2 eeprom16 READ_KEY ADDRESS
+```
+
+Multi-device dumps use separate files ending in `-ir` and `-ir2`; probes use separate subdirectories. `capture-id498` selects the port whose appliance reports ID498. The persistent read-key scanner currently has one flash journal assigned to **IR**; scan and partition commands therefore run only there, and `--device IR2` is rejected for them. Do not swap appliances during an active scan: each handshake checks the stored software ID.
 
 ```sh
 ./diag.py HOST scan-start 0x0000 0xffff --timeout-ms 40 --max-timeout-ms 500

@@ -179,12 +179,15 @@ struct DeviceAction {
 }
 enum Port2Command {
     Action(DeviceAction),
+    Diagnostic(DiagnosticCommand),
     OpticalTest,
     BaudSweep,
     BurstTest,
 }
 static PORT2_ACTIONS: Channel<CriticalSectionRawMutex, Port2Command, 4> = Channel::new();
 static PORT2_TEST_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
+static PORT2_DIAG_RESPONSES: Channel<CriticalSectionRawMutex, DiagnosticResponse, 1> =
+    Channel::new();
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticCommand {
@@ -232,7 +235,27 @@ enum DiagnosticCommand {
     },
 }
 
-const DIAG_RESPONSE_CAPACITY: usize = 512;
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiagnosticTarget {
+    All,
+    Ir,
+    Ir2,
+}
+
+fn is_scan_command(command: DiagnosticCommand) -> bool {
+    matches!(
+        command,
+        DiagnosticCommand::ScanStatus
+            | DiagnosticCommand::ScanPause
+            | DiagnosticCommand::ScanResume
+            | DiagnosticCommand::ScanReset
+            | DiagnosticCommand::ScanStart { .. }
+            | DiagnosticCommand::PartitionInstall
+    )
+}
+
+// Two 128-byte diagnostic reads plus port labels fit in one TCP response.
+const DIAG_RESPONSE_CAPACITY: usize = 1024;
 
 #[derive(Clone, Copy)]
 struct DiagnosticResponse {
@@ -684,7 +707,7 @@ async fn mqtt_message_task(
 }
 
 #[embassy_executor::task]
-async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
+async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: SharedFlash) -> ! {
     let mut ticker = Ticker::every(DEVICE_PUBLISH_INTERVAL);
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut trace = Id410Trace::new();
@@ -692,6 +715,13 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
     let mut published_role: Option<ApplianceRole> = None;
     let mut was_connected = false;
     let mut ir_debug_buf = [0_u8; 8];
+    // The persistent key scan belongs to IR. IR2 diagnostics below only
+    // execute read-only commands and never touch this placeholder's journal.
+    let mut diag_scan = ScanJob {
+        flash,
+        journal: None,
+        state: ScanState::empty(),
+    };
     loop {
         let connected = MQTT_CONNECTED.load(Ordering::Relaxed);
         if connected && !was_connected {
@@ -712,6 +742,14 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
         .await
         {
             Either::First(command) => match command {
+                Port2Command::Diagnostic(command) => {
+                    let response = if is_scan_command(command) {
+                        diagnostic_error("ERR scan_requires_IR")
+                    } else {
+                        execute_diagnostic_command(&mut port, command, &mut diag_scan).await
+                    };
+                    PORT2_DIAG_RESPONSES.send(response).await;
+                }
                 Port2Command::Action(action) => {
                     if IR2_SOFTWARE_ID.load(Ordering::Relaxed) == action.software_id {
                         if let Err(err) = trigger_action(
@@ -2750,13 +2788,51 @@ async fn serial_burst_test(port: &mut OpticalPort<'_>, label: &str) -> bool {
     failed == 0 && passed == TRIALS
 }
 
-async fn run_diag_command(command: DiagnosticCommand) -> DiagnosticResponse {
+async fn run_diag_command_ir(command: DiagnosticCommand) -> DiagnosticResponse {
     if matches!(command, DiagnosticCommand::ScanStatus) {
         return scan_status();
     }
-    let _guard = DIAG_REQUEST_LOCK.lock().await;
     DIAG_COMMANDS.send(command).await;
     DIAG_RESPONSES.receive().await
+}
+
+async fn run_diag_command(command: DiagnosticCommand) -> DiagnosticResponse {
+    let _guard = DIAG_REQUEST_LOCK.lock().await;
+    run_diag_command_ir(command).await
+}
+
+async fn run_diag_command_target(
+    command: DiagnosticCommand,
+    target: DiagnosticTarget,
+) -> DiagnosticResponse {
+    let _guard = DIAG_REQUEST_LOCK.lock().await;
+    if is_scan_command(command) {
+        return if target == DiagnosticTarget::Ir2 {
+            diagnostic_error("ERR scan_requires_IR")
+        } else {
+            run_diag_command_ir(command).await
+        };
+    }
+
+    if target == DiagnosticTarget::Ir {
+        return run_diag_command_ir(command).await;
+    }
+    if target == DiagnosticTarget::Ir2 {
+        PORT2_ACTIONS.send(Port2Command::Diagnostic(command)).await;
+        return PORT2_DIAG_RESPONSES.receive().await;
+    }
+
+    let ir = run_diag_command_ir(command).await;
+    PORT2_ACTIONS.send(Port2Command::Diagnostic(command)).await;
+    let ir2 = PORT2_DIAG_RESPONSES.receive().await;
+    let mut combined = DiagnosticResponse::new();
+    for (label, reply) in [("IR", ir), ("IR2", ir2)] {
+        let _ = write!(&mut combined, "{label} ");
+        if let Ok(line) = core::str::from_utf8(reply.as_bytes()) {
+            let _ = combined.write_str(line);
+        }
+    }
+    combined
 }
 
 fn serial_diag_print_response(response: &DiagnosticResponse) {
@@ -2766,7 +2842,22 @@ fn serial_diag_print_response(response: &DiagnosticResponse) {
     }
 }
 
-async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
+async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32, target: DiagnosticTarget) {
+    if target == DiagnosticTarget::All {
+        serial_diag_dump_one(kind, key, start, end, DiagnosticTarget::Ir).await;
+        serial_diag_dump_one(kind, key, start, end, DiagnosticTarget::Ir2).await;
+    } else {
+        serial_diag_dump_one(kind, key, start, end, target).await;
+    }
+}
+
+async fn serial_diag_dump_one(
+    kind: &str,
+    key: u16,
+    start: u32,
+    end: u32,
+    target: DiagnosticTarget,
+) {
     if start > end || start % 16 != 0 || (end + 1) % 16 != 0 {
         esp_println::println!("SERDIAG ERR dump range must be 16-byte aligned and inclusive");
         return;
@@ -2774,7 +2865,7 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
 
     let mut address_unit = 2;
     if kind == "eeprom" {
-        let reply = run_diag_command(DiagnosticCommand::QueryId).await;
+        let reply = run_diag_command_target(DiagnosticCommand::QueryId, target).await;
         let id = core::str::from_utf8(reply.as_bytes())
             .ok()
             .and_then(|text| {
@@ -2823,7 +2914,7 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
             }
         };
 
-        let response = run_diag_command(command).await;
+        let response = run_diag_command_target(command, target).await;
         let Ok(text) = core::str::from_utf8(response.as_bytes()) else {
             esp_println::println!(
                 "SERDUMP ERROR {} 0x{:08x} invalid-response-encoding",
@@ -2853,13 +2944,13 @@ async fn serial_diag_dump(kind: &str, key: u16, start: u32, end: u32) {
     esp_println::println!("SERDUMP END {}", kind);
 }
 
-async fn serial_diag_probe_unknown() {
+async fn serial_diag_probe_unknown(target: DiagnosticTarget) {
     esp_println::println!("SERPROBE BEGIN read-only");
 
     // Query repeatedly so a marginal optical alignment is immediately visible
     // instead of being mistaken for an appliance/protocol mismatch.
     for sample in 1..=3 {
-        let response = run_diag_command(DiagnosticCommand::QueryId).await;
+        let response = run_diag_command_target(DiagnosticCommand::QueryId, target).await;
         match core::str::from_utf8(response.as_bytes()) {
             Ok(text) => esp_println::println!("SERPROBE ID sample={} {}", sample, text.trim_end()),
             Err(_) => {
@@ -2873,11 +2964,14 @@ async fn serial_diag_probe_unknown() {
     let mut selected_key = None;
     for candidate in KNOWN_READ_KEYS {
         let key = candidate.key;
-        let response = run_diag_command(DiagnosticCommand::ReadMemory16 {
-            full_key: None,
-            key,
-            address: 0,
-        })
+        let response = run_diag_command_target(
+            DiagnosticCommand::ReadMemory16 {
+                full_key: None,
+                key,
+                address: 0,
+            },
+            target,
+        )
         .await;
 
         if response.as_bytes().starts_with(b"OK ") {
@@ -2911,8 +3005,8 @@ async fn serial_diag_probe_unknown() {
         "SERPROBE BASELINE key=0x{:04x} memory=0x0000..0x03ff eeprom-bytes=0x0000..0x03ff",
         key
     );
-    serial_diag_dump("memory", key, 0x0000, 0x03ff).await;
-    serial_diag_dump("eeprom", key, 0x0000, 0x03ff).await;
+    serial_diag_dump("memory", key, 0x0000, 0x03ff, target).await;
+    serial_diag_dump("eeprom", key, 0x0000, 0x03ff, target).await;
     esp_println::println!("SERPROBE END key=0x{:04x}", key);
 }
 
@@ -2923,10 +3017,17 @@ async fn handle_serial_diag_line(line: &str) {
         return;
     }
 
-    match fields.next() {
+    let first = fields.next();
+    let (target, command_name) = match first {
+        Some("IR" | "ir") => (DiagnosticTarget::Ir, fields.next()),
+        Some("IR2" | "ir2") => (DiagnosticTarget::Ir2, fields.next()),
+        _ => (DiagnosticTarget::All, first),
+    };
+
+    match command_name {
         Some("help") | None => {
             esp_println::println!(
-                "SERDIAG usage: diag ir-test IR|IR2 | diag baud-sweep IR|IR2 | diag burst-test IR|IR2 | diag id | diag mem16 KEY ADDR | \
+                "SERDIAG usage: diag [IR|IR2] id|mem16|eeprom16|dump-memory|dump-eeprom|probe | diag ir-test IR|IR2 | diag baud-sweep IR|IR2 | diag burst-test IR|IR2 | \
                  diag eeprom16 KEY WORD_ADDR | \
                  diag dump-memory KEY START END | \
                  diag dump-eeprom KEY BYTE_START BYTE_END | \
@@ -2938,15 +3039,20 @@ async fn handle_serial_diag_line(line: &str) {
             | "scan-pause" | "scan-resume" | "scan-reset" | "partition-install"),
         ) => {
             if let Some(command) = parse_scan_command(name, &mut fields) {
-                serial_diag_print_response(&run_diag_command(command).await);
+                serial_diag_print_response(&run_diag_command_target(command, target).await);
             } else {
                 esp_println::println!("SERDIAG ERR invalid scan command");
             }
         }
         Some("id") if fields.next().is_none() => {
-            serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
+            serial_diag_print_response(
+                &run_diag_command_target(DiagnosticCommand::QueryId, target).await,
+            );
         }
         Some("ir-test") => match (fields.next(), fields.next()) {
+            (None, None) => serial_diag_print_response(
+                &run_diag_command_target(DiagnosticCommand::OpticalTest, target).await,
+            ),
             (Some("IR"), None) => {
                 serial_diag_print_response(&run_diag_command(DiagnosticCommand::OpticalTest).await);
             }
@@ -2961,6 +3067,9 @@ async fn handle_serial_diag_line(line: &str) {
             _ => esp_println::println!("SERDIAG ERR usage: diag ir-test IR|IR2"),
         },
         Some("baud-sweep") => match (fields.next(), fields.next()) {
+            (None, None) => serial_diag_print_response(
+                &run_diag_command_target(DiagnosticCommand::BaudSweep, target).await,
+            ),
             (Some("IR"), None) => {
                 serial_diag_print_response(&run_diag_command(DiagnosticCommand::BaudSweep).await);
             }
@@ -2976,6 +3085,9 @@ async fn handle_serial_diag_line(line: &str) {
             _ => esp_println::println!("SERDIAG ERR usage: diag baud-sweep IR|IR2"),
         },
         Some("burst-test") => match (fields.next(), fields.next()) {
+            (None, None) => serial_diag_print_response(
+                &run_diag_command_target(DiagnosticCommand::BurstTest, target).await,
+            ),
             (Some("IR"), None) => {
                 serial_diag_print_response(&run_diag_command(DiagnosticCommand::BurstTest).await);
             }
@@ -2991,10 +3103,16 @@ async fn handle_serial_diag_line(line: &str) {
             _ => esp_println::println!("SERDIAG ERR usage: diag burst-test IR|IR2"),
         },
         Some("max-baud") if fields.next().is_none() => {
-            serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryMaxBaud).await);
+            serial_diag_print_response(
+                &run_diag_command_target(DiagnosticCommand::QueryMaxBaud, target).await,
+            );
         }
         Some("probe") if fields.next().is_none() => {
-            serial_diag_probe_unknown().await;
+            for selected in [DiagnosticTarget::Ir, DiagnosticTarget::Ir2] {
+                if target == DiagnosticTarget::All || target == selected {
+                    serial_diag_probe_unknown(selected).await;
+                }
+            }
         }
         Some("mem16") => {
             let key = fields.next().and_then(parse_diag_u16);
@@ -3002,11 +3120,14 @@ async fn handle_serial_diag_line(line: &str) {
 
             if let (Some(key), Some(address), None) = (key, address, fields.next()) {
                 serial_diag_print_response(
-                    &run_diag_command(DiagnosticCommand::ReadMemory16 {
-                        full_key: None,
-                        key,
-                        address,
-                    })
+                    &run_diag_command_target(
+                        DiagnosticCommand::ReadMemory16 {
+                            full_key: None,
+                            key,
+                            address,
+                        },
+                        target,
+                    )
                     .await,
                 );
             } else {
@@ -3019,11 +3140,14 @@ async fn handle_serial_diag_line(line: &str) {
 
             if let (Some(key), Some(address), None) = (key, address, fields.next()) {
                 serial_diag_print_response(
-                    &run_diag_command(DiagnosticCommand::ReadEeprom1 {
-                        full_key: None,
-                        key,
-                        address,
-                    })
+                    &run_diag_command_target(
+                        DiagnosticCommand::ReadEeprom1 {
+                            full_key: None,
+                            key,
+                            address,
+                        },
+                        target,
+                    )
                     .await,
                 );
             } else {
@@ -3036,11 +3160,14 @@ async fn handle_serial_diag_line(line: &str) {
 
             if let (Some(key), Some(address), None) = (key, address, fields.next()) {
                 serial_diag_print_response(
-                    &run_diag_command(DiagnosticCommand::ReadEeprom16 {
-                        full_key: None,
-                        key,
-                        address,
-                    })
+                    &run_diag_command_target(
+                        DiagnosticCommand::ReadEeprom16 {
+                            full_key: None,
+                            key,
+                            address,
+                        },
+                        target,
+                    )
                     .await,
                 );
             } else {
@@ -3053,7 +3180,7 @@ async fn handle_serial_diag_line(line: &str) {
             let end = fields.next().and_then(parse_diag_u32);
 
             if let (Some(key), Some(start), Some(end), None) = (key, start, end, fields.next()) {
-                serial_diag_dump("memory", key, start, end).await;
+                serial_diag_dump("memory", key, start, end, target).await;
             } else {
                 esp_println::println!("SERDIAG ERR usage: diag dump-memory KEY START END");
             }
@@ -3064,7 +3191,7 @@ async fn handle_serial_diag_line(line: &str) {
             let end = fields.next().and_then(parse_diag_u32);
 
             if let (Some(key), Some(start), Some(end), None) = (key, start, end, fields.next()) {
-                serial_diag_dump("eeprom", key, start, end).await;
+                serial_diag_dump("eeprom", key, start, end, target).await;
             } else {
                 esp_println::println!(
                     "SERDIAG ERR usage: diag dump-eeprom KEY BYTE_START BYTE_END"
@@ -3183,7 +3310,13 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
             continue;
         }
 
-        let command = match fields.next() {
+        let first = fields.next();
+        let (target, name) = match first {
+            Some("IR" | "ir") => (DiagnosticTarget::Ir, fields.next()),
+            Some("IR2" | "ir2") => (DiagnosticTarget::Ir2, fields.next()),
+            _ => (DiagnosticTarget::All, first),
+        };
+        let command = match name {
             Some(
                 name @ ("scan-full-start" | "find-read-key" | "scan-start" | "scan-status"
                 | "scan-pause" | "scan-resume" | "scan-reset" | "partition-install"),
@@ -3331,7 +3464,7 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
         let Some(command) = command else {
             let _ = tcp_write_all(
                 &mut socket,
-                b"ERR usage: id | find-read-key START END | mem16 KEY ADDR | eeprom16 KEY ADDR\n",
+                b"ERR usage: [IR|IR2] id | max-baud | mem16 KEY ADDR | eeprom16 KEY ADDR\n",
             )
             .await;
             socket.close();
@@ -3345,7 +3478,7 @@ async fn diagnostic_server_task(stack: Stack<'static>) -> ! {
         socket.set_timeout(None);
 
         info!("DIAG request: {command:?}");
-        let response = run_diag_command(command).await;
+        let response = run_diag_command_target(command, target).await;
 
         match tcp_write_all(&mut socket, response.as_bytes()).await {
             Ok(()) => {
@@ -3541,7 +3674,7 @@ async fn main(spawner: Spawner) {
 
     spawner.spawn(mqtt_stack_task(mqtt_task).unwrap());
     spawner.spawn(mqtt_message_task(mqtt_receiver, hostname, port, led, flash).unwrap());
-    spawner.spawn(port2_task(port2, port2_hostname).unwrap());
+    spawner.spawn(port2_task(port2, port2_hostname, flash).unwrap());
     if let Some(accel_hostname) = accel_hostname {
         let accel_i2c = freemdu_home::accelerometer::new_i2c(peripherals.I2C0).unwrap();
         let accelerometer = Lis2dh::new(accel_i2c);

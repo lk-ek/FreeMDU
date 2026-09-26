@@ -44,7 +44,7 @@ class EepromByteCliTests(unittest.TestCase):
         for address in ['0x00ff', '0x0100', '0xffff']:
             output = io.StringIO()
             with patch.object(sys, 'argv', ['diag.py', 'esp', '--token', 'test',
-                                          'eeprom1', '0x2b2c', address]), \
+                                          'eeprom1', '0x2b2c', address, '--device', 'IR']), \
                  patch.object(diag, 'request', return_value=
                               f'OK kind=eeprom address={address} data=ff') as request, \
                  contextlib.redirect_stdout(output):

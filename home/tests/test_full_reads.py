@@ -19,7 +19,7 @@ class FullReadTests(unittest.TestCase):
                 req.assert_called_once_with('esp',3234,'token',command,'0x2b2c',f'0x{0x100:0{width}x}','0x0f2f')
 
     def test_single_byte_cli(self):
-        with patch.object(sys,'argv',['diag.py','esp','--token','token','eeprom1','0x2b2c','0x0100','--full-key','0x0f2f']), patch.object(diag,'request',return_value='OK kind=eeprom address=0x0100 data=ff') as req, contextlib.redirect_stdout(io.StringIO()) as out:
+        with patch.object(sys,'argv',['diag.py','esp','--token','token','eeprom1','0x2b2c','0x0100','--full-key','0x0f2f','--device','IR']), patch.object(diag,'request',return_value='OK kind=eeprom address=0x0100 data=ff') as req, contextlib.redirect_stdout(io.StringIO()) as out:
             diag.main()
             self.assertEqual(out.getvalue(),'ff\n')
             self.assertEqual(req.call_args.args[-1],'0x0f2f')

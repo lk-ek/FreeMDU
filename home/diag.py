@@ -15,6 +15,11 @@ import time
 
 from local_config import load_config_value
 
+# Each request targets one UART; the CLI fans out to both attached appliances
+# unless --device selects a port. This keeps existing single-device parsers
+# (including EEPROM address units) independent for each machine.
+ACTIVE_DIAG_TARGET = "IR"
+
 
 CHUNK_SIZE = 0x10
 DUMP_CHUNK_SIZE = 0x80
@@ -202,7 +207,7 @@ def connect_with_retry(host: str, port: int) -> socket.socket:
 
 def request_reply(host: str, port: int, token: str, *parts: object) -> str:
     """Send one diagnostic request and return the unclassified reply line."""
-    wire = ["FMDUDIAG1", token, *(str(part) for part in parts)]
+    wire = ["FMDUDIAG1", token, ACTIVE_DIAG_TARGET, *(str(part) for part in parts)]
 
     with connect_with_retry(host, port) as sock:
         sock.settimeout(30)
@@ -752,10 +757,13 @@ def watch_scan(host: str, port: int, token: str, interval: float) -> None:
 
 
 def main() -> None:
+    global ACTIVE_DIAG_TARGET
     parser = argparse.ArgumentParser(description="FreeMDU read-only diagnostic client")
     parser.add_argument("host")
     parser.add_argument("--port", type=int, default=3234)
     parser.add_argument("--token", help="override OTA_TOKEN from .cargo/local.toml")
+    parser.add_argument("--device", choices=("all", "IR", "IR2"), default="all",
+                        help="optical port (default: both connected appliances)")
 
     sub = parser.add_subparsers(dest="command", required=True)
     sub.add_parser("id")
@@ -832,6 +840,10 @@ def main() -> None:
         command_parser.add_argument("--full-key", type=number16,
                                     help="unlock full access after the read key; only reads follow")
 
+    for command_parser in {id(value): value for value in sub.choices.values()}.values():
+        command_parser.add_argument("--device", choices=("all", "IR", "IR2"),
+                                    default=argparse.SUPPRESS)
+
     args = parser.parse_args()
     full_key = int(args.full_key, 0) if getattr(args, "full_key", None) is not None else None
 
@@ -846,61 +858,105 @@ def main() -> None:
             "or pass --token"
         )
 
-    try:
-        if args.command == "id":
-            print(request(args.host, args.port, token, "id"))
-        elif args.command == "probe-unknown":
-            probe_unknown_device(
-                args.host, args.port, token, args.output_dir,
-                -1 if args.skip_eeprom else int(args.eeprom_end, 0),
-                args.no_interactive,
-            )
-        elif args.command in ("find-read-key", "scan-start"):
-            print(autonomous_start(args.host, args.port, token, int(args.start, 0),
-                                   int(args.end, 0), args.timeout_ms, args.max_timeout_ms))
-        elif args.command == "scan-full-start":
-            print(autonomous_full_start(args.host, args.port, token, int(args.read_key, 0),
-                                        int(args.start, 0), int(args.end, 0),
-                                        args.timeout_ms, args.max_timeout_ms))
-        elif args.command == "capture-id498":
-            capture_id498(args.host, args.port, token, args.output, args.interval)
-        elif args.command == "scan-status":
-            if args.watch is None:
-                print(request(args.host, args.port, token, "scan-status"))
-            else:
-                watch_scan(args.host, args.port, token, args.watch)
-        elif args.command in ("scan-pause", "scan-resume", "scan-reset", "partition-install"):
-            print(request(args.host, args.port, token, args.command))
-        elif args.command == "max-baud":
-            print(request(args.host, args.port, token, "max-baud"))
-        elif args.command == "mem16":
-            data = read_block(
-                args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0), full_key=full_key
-            )
-            print(data.hex())
-        elif args.command == "eeprom1":
-            print(read_block(args.host, args.port, token, "eeprom", int(args.key, 0),
-                             int(args.address, 0), 1, full_key=full_key).hex())
-        elif args.command == "eeprom16":
-            address = int(args.address, 0)
-            if address > 0xFFF0:
-                parser.error("eeprom16 address must be <= 0xfff0")
-            data = read_block(
-                args.host, args.port, token, "eeprom", int(args.key, 0), address, full_key=full_key
-            )
-            print(data.hex())
-        elif args.command == "dump-memory":
-            dump_range(
-                args.host, args.port, token, "memory", int(args.key, 0),
-                int(args.start, 0), int(args.end, 0), args.output, full_key=full_key,
-            )
-        elif args.command == "dump-eeprom":
-            dump_range(
-                args.host, args.port, token, "eeprom", int(args.key, 0),
-                int(args.start, 0), int(args.end, 0), args.output, full_key=full_key,
-            )
-    except (OSError, RuntimeError) as exc:
-        print(f"error: {exc}", file=sys.stderr)
+    scan_commands = {
+        "scan-start", "find-read-key", "scan-full-start", "scan-status",
+        "scan-pause", "scan-resume", "scan-reset", "partition-install",
+    }
+    if args.command in scan_commands:
+        if args.device == "IR2":
+            parser.error("the persistent key scanner is assigned to IR")
+        targets = ["IR"]
+    elif args.device == "all":
+        targets = ["IR", "IR2"]
+    else:
+        targets = [args.device]
+
+    if args.command == "capture-id498" and args.device == "all":
+        targets = []
+        for candidate in ("IR", "IR2"):
+            ACTIVE_DIAG_TARGET = candidate
+            try:
+                if parse_software_id(request_with_transient_retry(
+                    args.host, args.port, token, "id", attempts=2
+                )) == 498:
+                    targets.append(candidate)
+            except (OSError, RuntimeError):
+                pass
+        if len(targets) != 1:
+            parser.error("capture-id498 requires exactly one detected ID498 device; use --device")
+
+    output = getattr(args, "output", None)
+    output_dir = getattr(args, "output_dir", None)
+    succeeded = 0
+    for target in targets:
+        ACTIVE_DIAG_TARGET = target
+        if args.device == "all" and len(targets) > 1:
+            print(f"[{target}]", flush=True)
+        if output is not None and len(targets) > 1:
+            args.output = output.with_name(f"{output.stem}-{target.lower()}{output.suffix}")
+        if output_dir is not None and len(targets) > 1:
+            args.output_dir = output_dir / target.lower()
+        try:
+            if args.command == "id":
+                print(request(args.host, args.port, token, "id"))
+            elif args.command == "probe-unknown":
+                probe_unknown_device(
+                    args.host, args.port, token, args.output_dir,
+                    -1 if args.skip_eeprom else int(args.eeprom_end, 0),
+                    args.no_interactive,
+                )
+            elif args.command in ("find-read-key", "scan-start"):
+                print(autonomous_start(args.host, args.port, token, int(args.start, 0),
+                                       int(args.end, 0), args.timeout_ms, args.max_timeout_ms))
+            elif args.command == "scan-full-start":
+                print(autonomous_full_start(args.host, args.port, token, int(args.read_key, 0),
+                                            int(args.start, 0), int(args.end, 0),
+                                            args.timeout_ms, args.max_timeout_ms))
+            elif args.command == "capture-id498":
+                capture_id498(args.host, args.port, token, args.output, args.interval)
+            elif args.command == "scan-status":
+                if args.watch is None:
+                    print(request(args.host, args.port, token, "scan-status"))
+                else:
+                    watch_scan(args.host, args.port, token, args.watch)
+            elif args.command in ("scan-pause", "scan-resume", "scan-reset", "partition-install"):
+                print(request(args.host, args.port, token, args.command))
+            elif args.command == "max-baud":
+                print(request(args.host, args.port, token, "max-baud"))
+            elif args.command == "mem16":
+                data = read_block(
+                    args.host, args.port, token, "memory", int(args.key, 0), int(args.address, 0), full_key=full_key
+                )
+                print(data.hex())
+            elif args.command == "eeprom1":
+                print(read_block(args.host, args.port, token, "eeprom", int(args.key, 0),
+                                 int(args.address, 0), 1, full_key=full_key).hex())
+            elif args.command == "eeprom16":
+                address = int(args.address, 0)
+                if address > 0xFFF0:
+                    parser.error("eeprom16 address must be <= 0xfff0")
+                data = read_block(
+                    args.host, args.port, token, "eeprom", int(args.key, 0), address, full_key=full_key
+                )
+                print(data.hex())
+            elif args.command == "dump-memory":
+                dump_range(
+                    args.host, args.port, token, "memory", int(args.key, 0),
+                    int(args.start, 0), int(args.end, 0), args.output, full_key=full_key,
+                )
+            elif args.command == "dump-eeprom":
+                dump_range(
+                    args.host, args.port, token, "eeprom", int(args.key, 0),
+                    int(args.start, 0), int(args.end, 0), args.output, full_key=full_key,
+                )
+        except (OSError, RuntimeError) as exc:
+            if len(targets) == 1:
+                print(f"error: {exc}", file=sys.stderr)
+                raise SystemExit(1)
+            print(f"{target}: {exc}", file=sys.stderr)
+        else:
+            succeeded += 1
+    if not succeeded:
         raise SystemExit(1)
 
 
