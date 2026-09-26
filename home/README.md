@@ -70,7 +70,7 @@ All three commands accept `IR` or `IR2`. `ir-test` illuminates the selected LED 
 
 ## Key scans and diagnostic reads
 
-The authenticated `diag.py` and USB console send ordinary diagnostic reads to **both** optical ports by default. Select one with `--device IR` or `--device IR2` in `diag.py`, or prefix a USB command with `IR` or `IR2`. The firmware TCP protocol likewise accepts `IR` or `IR2` between the token and command; without a selector it returns labeled responses from both ports. Missing or unresponsive appliances report an error for their own port without hiding the other response. For example:
+The authenticated `diag.py` and USB console send ordinary diagnostic reads to **both** optical ports by default. Select one with `--device IR` or `--device IR2` in `diag.py`, or prefix a USB command with `IR` or `IR2`. The firmware TCP protocol likewise accepts `IR` or `IR2` between the token and command; without a selector it returns labeled responses from both ports. Missing or unresponsive appliances report an error for their own port without hiding the other response. Before a read the firmware leaves the optical line quiet for the appliance's session timeout; after a failed optical read it waits again and retries once with a three-second response timeout. Diagnostics can therefore take several seconds per port. For example:
 
 ```sh
 ./diag.py HOST id

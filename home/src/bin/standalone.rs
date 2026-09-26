@@ -507,7 +507,8 @@ async fn mqtt_message_task(
             && scan.state.phase != ScanPhase::Running
         {
             if let Ok(command) = DIAG_COMMANDS.try_receive() {
-                let response = execute_diagnostic_command(&mut port, command, &mut scan).await;
+                let response =
+                    execute_diagnostic_command_recovering(&mut port, command, &mut scan).await;
                 DIAG_RESPONSES.send(response).await;
             }
             Timer::after(Duration::from_millis(10)).await;
@@ -520,7 +521,8 @@ async fn mqtt_message_task(
                 BRIDGE_EVENTS.send(BridgeEvent::Disconnected).await;
             }
             if let Ok(command) = DIAG_COMMANDS.try_receive() {
-                let response = execute_diagnostic_command(&mut port, command, &mut scan).await;
+                let response =
+                    execute_diagnostic_command_recovering(&mut port, command, &mut scan).await;
                 DIAG_RESPONSES.send(response).await;
             } else {
                 netlog::set_quiet_diagnostic_scan(true);
@@ -570,7 +572,8 @@ async fn mqtt_message_task(
                 // before ownership was established. Ignore it.
             }
             Either::Second(Either::First(command)) => {
-                let response = execute_diagnostic_command(&mut port, command, &mut scan).await;
+                let response =
+                    execute_diagnostic_command_recovering(&mut port, command, &mut scan).await;
                 if response.as_bytes().starts_with(b"ERR ") {
                     let _ = port.resynchronize().await;
                 }
@@ -746,7 +749,8 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                     let response = if is_scan_command(command) {
                         diagnostic_error("ERR scan_requires_IR")
                     } else {
-                        execute_diagnostic_command(&mut port, command, &mut diag_scan).await
+                        execute_diagnostic_command_recovering(&mut port, command, &mut diag_scan)
+                            .await
                     };
                     PORT2_DIAG_RESPONSES.send(response).await;
                 }
@@ -1083,10 +1087,51 @@ async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
     }
 }
 
+// Diagnostic reads can arrive just after an MQTT transaction. Give the
+// controller its full session timeout before starting, and only retry a
+// failed read after another quiet interval. Scans and hardware tests manage
+// their own timing; commands with a full access key must not be repeated.
+async fn execute_diagnostic_command_recovering(
+    port: &mut OpticalPort<'_>,
+    command: DiagnosticCommand,
+    scan: &mut ScanJob,
+) -> DiagnosticResponse {
+    let retryable = matches!(
+        command,
+        DiagnosticCommand::QueryId
+            | DiagnosticCommand::QueryMaxBaud
+            | DiagnosticCommand::ReadMemory16 { full_key: None, .. }
+            | DiagnosticCommand::ReadMemory128 { full_key: None, .. }
+            | DiagnosticCommand::ReadEeprom1 { full_key: None, .. }
+            | DiagnosticCommand::ReadEeprom16 { full_key: None, .. }
+            | DiagnosticCommand::ReadEeprom128 { full_key: None, .. }
+    );
+    if !retryable || scan.state.phase == ScanPhase::Running {
+        return execute_diagnostic_command(port, command, scan, DEVICE_TIMEOUT).await;
+    }
+    if port.resynchronize().await.is_err() {
+        return diagnostic_error("ERR noisy_line");
+    }
+    let first = execute_diagnostic_command(port, command, scan, DEVICE_TIMEOUT).await;
+    let failed_optical_read = first.as_bytes().starts_with(b"ERR query_")
+        || first.as_bytes().starts_with(b"ERR read_")
+        || first
+            .as_bytes()
+            .starts_with(b"ERR unlock_read_access timeout");
+    if !failed_optical_read {
+        return first;
+    }
+    if port.resynchronize().await.is_err() {
+        return first;
+    }
+    execute_diagnostic_command(port, command, scan, DEVICE_RECOVERY_TIMEOUT).await
+}
+
 async fn execute_diagnostic_command(
     port: &mut OpticalPort<'_>,
     command: DiagnosticCommand,
     scan: &mut ScanJob,
+    timeout: Duration,
 ) -> DiagnosticResponse {
     let mut response = DiagnosticResponse::new();
     if scan.state.phase == ScanPhase::Running
@@ -1197,7 +1242,7 @@ async fn execute_diagnostic_command(
             }
             let id = {
                 let mut intf = MieleInterface::new(&mut *port);
-                match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+                match intf.query_software_id().with_timeout(timeout).await {
                     Ok(Ok(id)) => id,
                     _ => return diagnostic_error("ERR query_software_id timeout"),
                 }
@@ -1218,7 +1263,7 @@ async fn execute_diagnostic_command(
         }
         DiagnosticCommand::QueryId => {
             let mut intf = MieleInterface::new(&mut *port);
-            match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+            match intf.query_software_id().with_timeout(timeout).await {
                 Ok(Ok(id)) => {
                     let _ = writeln!(&mut response, "OK software_id={id} hex=0x{id:04x}");
                 }
@@ -1232,11 +1277,7 @@ async fn execute_diagnostic_command(
         }
         DiagnosticCommand::QueryMaxBaud => {
             let mut intf = MieleInterface::new(&mut *port);
-            match intf
-                .query_max_baud_rate()
-                .with_timeout(DEVICE_TIMEOUT)
-                .await
-            {
+            match intf.query_max_baud_rate().with_timeout(timeout).await {
                 Ok(Ok(rate)) => {
                     let _ = writeln!(&mut response, "OK max_baud={}", rate.as_baud());
                 }
@@ -1255,12 +1296,12 @@ async fn execute_diagnostic_command(
         } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
 
-            match intf.read_memory(address).with_timeout(DEVICE_TIMEOUT).await {
+            match intf.read_memory(address).with_timeout(timeout).await {
                 Ok(Ok(data)) => {
                     let data: [u8; 0x10] = data;
                     let _ = write!(
@@ -1287,7 +1328,7 @@ async fn execute_diagnostic_command(
         } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -1295,18 +1336,14 @@ async fn execute_diagnostic_command(
             let mut data = [0u8; 0x80];
             for block in 0..8 {
                 if block == 4 {
-                    if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+                    if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                         let _ = writeln!(&mut response, "{err}");
                         return response;
                     }
                 }
 
                 let block_address = address + block as u32 * 0x10;
-                match intf
-                    .read_memory(block_address)
-                    .with_timeout(DEVICE_TIMEOUT)
-                    .await
-                {
+                match intf.read_memory(block_address).with_timeout(timeout).await {
                     Ok(Ok(block_data)) => {
                         let block_data: [u8; 0x10] = block_data;
                         data[block * 0x10..(block + 1) * 0x10].copy_from_slice(&block_data);
@@ -1347,12 +1384,12 @@ async fn execute_diagnostic_command(
         } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
 
-            match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
+            match intf.read_eeprom(address).with_timeout(timeout).await {
                 Ok(Ok(data)) => {
                     let data: [u8; 1] = data;
                     let _ = write!(
@@ -1379,12 +1416,12 @@ async fn execute_diagnostic_command(
         } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
 
-            match intf.read_eeprom(address).with_timeout(DEVICE_TIMEOUT).await {
+            match intf.read_eeprom(address).with_timeout(timeout).await {
                 Ok(Ok(data)) => {
                     let data: [u8; 0x10] = data;
                     let _ = write!(
@@ -1411,13 +1448,13 @@ async fn execute_diagnostic_command(
         } => {
             let mut intf = MieleInterface::new(&mut *port);
 
-            let address_unit = match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+            let address_unit = match intf.query_software_id().with_timeout(timeout).await {
                 Ok(Ok(498)) => 1,
                 Ok(Ok(_)) => 2,
                 _ => return diagnostic_error("ERR query_software_id failed"),
             };
 
-            if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+            if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                 let _ = writeln!(&mut response, "{err}");
                 return response;
             }
@@ -1425,18 +1462,14 @@ async fn execute_diagnostic_command(
             let mut data = [0u8; 0x80];
             for block in 0..8 {
                 if block == 4 {
-                    if let Err(err) = prepare_read_access(&mut intf, key, full_key).await {
+                    if let Err(err) = prepare_read_access(&mut intf, key, full_key, timeout).await {
                         let _ = writeln!(&mut response, "{err}");
                         return response;
                     }
                 }
 
                 let block_address = address + block as u16 * (0x10 / address_unit);
-                match intf
-                    .read_eeprom(block_address)
-                    .with_timeout(DEVICE_TIMEOUT)
-                    .await
-                {
+                match intf.read_eeprom(block_address).with_timeout(timeout).await {
                     Ok(Ok(block_data)) => {
                         let block_data: [u8; 0x10] = block_data;
                         data[block * 0x10..(block + 1) * 0x10].copy_from_slice(&block_data);
@@ -1778,8 +1811,9 @@ async fn prepare_read_access(
     intf: &mut MieleInterface<&mut OpticalPort<'_>>,
     key: u16,
     full_key: Option<u16>,
+    timeout: Duration,
 ) -> Result<(), &'static str> {
-    match intf.query_software_id().with_timeout(DEVICE_TIMEOUT).await {
+    match intf.query_software_id().with_timeout(timeout).await {
         Ok(Ok(id)) => debug!("DIAG connected to software ID {id}"),
         Ok(Err(err)) => {
             warn!("DIAG query_software_id failed: {err:?}");
@@ -1791,11 +1825,7 @@ async fn prepare_read_access(
         }
     }
 
-    match intf
-        .unlock_read_access(key)
-        .with_timeout(DEVICE_TIMEOUT)
-        .await
-    {
+    match intf.unlock_read_access(key).with_timeout(timeout).await {
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
             warn!("DIAG unlock_read_access failed: {err:?}");
@@ -1809,7 +1839,7 @@ async fn prepare_read_access(
     if let Some(full_key) = full_key {
         match intf
             .unlock_full_access(full_key)
-            .with_timeout(DEVICE_TIMEOUT)
+            .with_timeout(timeout)
             .await
         {
             Ok(Ok(())) => (),
