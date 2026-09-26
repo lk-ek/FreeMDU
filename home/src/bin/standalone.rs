@@ -50,8 +50,7 @@ use log::{debug, error, info, warn};
 use mcutie::{
     McutieBuilder, McutieReceiver, McutieTask, MqttMessage, PublishBytes, Publishable, Topic,
     homeassistant::{
-        AvailabilityState, AvailabilityTopics, Device as HaDevice, Entity, Origin, button::Button,
-        sensor::Sensor,
+        AvailabilityState, AvailabilityTopics, Device as HaDevice, Entity, Origin, sensor::Sensor,
     },
 };
 use static_cell::StaticCell;
@@ -2104,6 +2103,60 @@ async fn query_property_fresh(
         .map_err(|err| anyhow::anyhow!("Property {} failed: {err:?}", prop.id))
 }
 
+// Mcutie's default HA device identifier is the gateway MAC for every entity.
+// Give each detected appliance its own identifier while keeping the existing
+// entity IDs, discovery topics and state topics stable.
+#[derive(serde::Serialize)]
+struct ApplianceHaDevice<'a> {
+    identifiers: [&'a str; 1],
+    name: &'a str,
+}
+
+#[derive(serde::Serialize)]
+struct ApplianceAvailability<'a> {
+    topic: Topic<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct ApplianceSensorDiscovery<'a> {
+    device: ApplianceHaDevice<'a>,
+    origin: Origin<'a>,
+    object_id: &'a str,
+    unique_id: &'a str,
+    name: &'a str,
+    availability: [ApplianceAvailability<'a>; 2],
+    availability_mode: &'static str,
+    state_topic: Topic<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unit_of_measurement: Option<&'a str>,
+}
+
+#[derive(serde::Serialize)]
+struct ApplianceButtonDiscovery<'a> {
+    device: ApplianceHaDevice<'a>,
+    origin: Origin<'a>,
+    object_id: &'a str,
+    unique_id: &'a str,
+    name: &'a str,
+    availability: [ApplianceAvailability<'a>; 2],
+    availability_mode: &'static str,
+    command_topic: Topic<&'a str>,
+}
+
+async fn publish_appliance_discovery(
+    component: &str,
+    object_id: &str,
+    discovery: &impl serde::Serialize,
+) -> Result<()> {
+    let prefix = option_env!("HA_DISCOVERY_PREFIX").unwrap_or("homeassistant");
+    Topic::General(format!("{prefix}/{component}/{object_id}/config"))
+        .with_json(discovery)
+        .retain(true)
+        .publish()
+        .await
+        .map_err(|err| anyhow::anyhow!("Failed to publish HA discovery: {err:?}"))
+}
+
 async fn publish_property(
     prop: &Property,
     dev: &str,
@@ -2116,28 +2169,29 @@ async fn publish_property(
     } else {
         WASHER_STATUS
     };
+    let device_id = format!("{hostname}_{channel}");
+    let state_topic = Topic::Device(format!("{channel}/{}/value", prop.id));
 
-    Entity {
-        device: HaDevice {
-            name: Some(dev),
-            ..HaDevice::default()
+    let discovery = ApplianceSensorDiscovery {
+        device: ApplianceHaDevice {
+            identifiers: [&device_id],
+            name: dev,
         },
         origin: Origin::default(),
         object_id: &unique_id,
-        unique_id: Some(&unique_id),
+        unique_id: &unique_id,
         name: prop.name,
-        availability: AvailabilityTopics::All([STATUS_TOPIC, status]),
-        state_topic: Some(Topic::Device(format!("{channel}/{}/value", prop.id)).as_ref()),
-        command_topic: None,
-        component: Sensor {
-            device_class: None,
-            state_class: None,
-            unit_of_measurement: prop.unit,
-        },
-    }
-    .publish_discovery()
-    .await
-    .map_err(|err| anyhow::anyhow!("Failed to publish HA sensor: {err:?}"))
+        availability: [
+            ApplianceAvailability {
+                topic: STATUS_TOPIC,
+            },
+            ApplianceAvailability { topic: status },
+        ],
+        availability_mode: "all",
+        state_topic: state_topic.as_ref(),
+        unit_of_measurement: prop.unit,
+    };
+    publish_appliance_discovery("sensor", &unique_id, &discovery).await
 }
 
 async fn publish_property_value(prop: &Property, val: &Value, channel: &str) -> Result<()> {
@@ -2186,24 +2240,28 @@ async fn publish_action(
     } else {
         WASHER_STATUS
     };
+    let device_id = format!("{hostname}_{channel}");
+    let command_topic = Topic::Device(format!("{channel}/{}/trigger", action.id));
 
-    Entity {
-        device: HaDevice {
-            name: Some(dev),
-            ..HaDevice::default()
+    let discovery = ApplianceButtonDiscovery {
+        device: ApplianceHaDevice {
+            identifiers: [&device_id],
+            name: dev,
         },
         origin: Origin::default(),
         object_id: &unique_id,
-        unique_id: Some(&unique_id),
+        unique_id: &unique_id,
         name: action.name,
-        availability: AvailabilityTopics::All([STATUS_TOPIC, status]),
-        state_topic: None,
-        command_topic: Some(Topic::Device(format!("{channel}/{}/trigger", action.id)).as_ref()),
-        component: Button { device_class: None },
-    }
-    .publish_discovery()
-    .await
-    .map_err(|err| anyhow::anyhow!("Failed to publish HA button: {err:?}"))
+        availability: [
+            ApplianceAvailability {
+                topic: STATUS_TOPIC,
+            },
+            ApplianceAvailability { topic: status },
+        ],
+        availability_mode: "all",
+        command_topic: command_topic.as_ref(),
+    };
+    publish_appliance_discovery("button", &unique_id, &discovery).await
 }
 
 async fn trigger_action(

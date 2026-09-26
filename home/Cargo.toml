@@ -40,6 +40,7 @@ esp-radio = { version = "0.18.0", features = [
 freemdu = { path = "../protocol" }
 log = "0.4.29"
 mcutie = { version = "0.4.0", features = ["log"] }
+serde = { version = "1.0.228", default-features = false, features = ["derive"] }
 static_cell = "2.1.1"
 
 [features]

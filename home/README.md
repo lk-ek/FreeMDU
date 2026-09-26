@@ -39,7 +39,7 @@ In standalone mode, Home Assistant MQTT discovery registers the properties and a
 freemdu_home/<ESP_ADDRESS>/<washer|dryer>/<PROPERTY>/value
 ```
 
-An action uses `freemdu_home/<ESP_ADDRESS>/<washer|dryer>/<ACTION>/trigger`. An action with parameters accepts the MQTT payload as its argument; only parameterless actions receive HA buttons. Each channel has its own `washer/status` or `dryer/status` availability topic alongside the gateway `status`. Old single-port discovery entries may need removing once after migration.
+An action uses `freemdu_home/<ESP_ADDRESS>/<washer|dryer>/<ACTION>/trigger`. An action with parameters accepts the MQTT payload as its argument; only parameterless actions receive HA buttons. Each channel has its own `washer/status` or `dryer/status` availability topic alongside the gateway `status`. Discovery gives the washer and dryer separate device identifiers derived from the gateway MAC and appliance role, so their entities appear under separate Home Assistant devices. Entity IDs and state topics remain stable across this change. Old single-port discovery entries may need removing once after migration.
 
 ## Firmware modes
 
