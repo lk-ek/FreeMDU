@@ -23,6 +23,15 @@ gate resistor is replaced with 0 ohm, the 100-ohm LED resistor still limits
 current to roughly 16–18 mA at 3.3 V. Apply this modification to both TX
 channels if both are to use direct GPIO drive.
 
+To test each LED and receiver without an appliance, enter `diag ir-test IR`
+or `diag ir-test IR2` in the USB serial console (terminate with Ctrl-J). The
+selected LED is on for about 91% of each UART frame for roughly 4.7 seconds.
+Between `SEROPT ... ON` and `SEROPT ... OFF`, use a multimeter to check the
+SFH 7250 phototransistor output / Schmitt input and the Schmitt output; the
+firmware then clears the receiver before returning to normal polling. The
+other optical channel continues to operate during the test. Disconnect the
+appliance while running this raw IR test.
+
 | Appliance | UART | TX | RX | GPIO TX/RX |
 | --- | --- | --- | --- | --- |
 | Dryer (IR) | UART1 | D3 | D4 | 5 / 6 |

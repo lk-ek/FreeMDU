@@ -108,11 +108,17 @@ struct DeviceAction {
     id: String,
     param: String,
 }
-static WASHER_ACTIONS: Channel<CriticalSectionRawMutex, DeviceAction, 4> = Channel::new();
+enum WasherCommand {
+    Action(DeviceAction),
+    OpticalTest,
+}
+static WASHER_ACTIONS: Channel<CriticalSectionRawMutex, WasherCommand, 4> = Channel::new();
+static WASHER_TEST_RESULTS: Channel<CriticalSectionRawMutex, bool, 1> = Channel::new();
 
 #[derive(Clone, Copy, Debug)]
 enum DiagnosticCommand {
     QueryId,
+    OpticalTest,
     QueryMaxBaud,
     ScanStatus,
     ScanPause,
@@ -485,10 +491,10 @@ async fn mqtt_message_task(
                 {
                     if channel == WASHER {
                         WASHER_ACTIONS
-                            .send(DeviceAction {
+                            .send(WasherCommand::Action(DeviceAction {
                                 id: id.to_string(),
                                 param: param.to_string(),
-                            })
+                            }))
                             .await;
                     } else if channel == DRYER {
                         if let Err(err) = trigger_action(&mut port, id, param).await {
@@ -572,12 +578,19 @@ async fn washer_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
         )
         .await
         {
-            Either::First(action) => {
-                if let Err(err) = trigger_action(&mut port, &action.id, &action.param).await {
-                    error!("Failed to trigger washer action: {err:#}");
-                    let _ = port.resynchronize().await;
+            Either::First(command) => match command {
+                WasherCommand::Action(action) => {
+                    if let Err(err) = trigger_action(&mut port, &action.id, &action.param).await {
+                        error!("Failed to trigger washer action: {err:#}");
+                        let _ = port.resynchronize().await;
+                    }
                 }
-            }
+                WasherCommand::OpticalTest => {
+                    WASHER_TEST_RESULTS
+                        .send(serial_optical_test(&mut port, "IR2").await)
+                        .await;
+                }
+            },
             Either::Second(Either::First(())) if connected => {
                 let state = match publish_device(&mut port, &hostname, WASHER, published_id).await {
                     Ok(id) => {
@@ -862,6 +875,13 @@ async fn execute_diagnostic_command(
     }
 
     match command {
+        DiagnosticCommand::OpticalTest => {
+            return if serial_optical_test(port, "IR").await {
+                diagnostic_error("OK ir_test_complete")
+            } else {
+                diagnostic_error("ERR ir_test_failed")
+            };
+        }
         DiagnosticCommand::ScanStatus => return scan_status(),
         DiagnosticCommand::ScanPause => {
             if scan.state.phase == ScanPhase::Running {
@@ -2235,6 +2255,21 @@ async fn bridge_server_task(stack: Stack<'static>) -> ! {
     }
 }
 
+async fn serial_optical_test(port: &mut OpticalPort<'_>, label: &str) -> bool {
+    esp_println::println!("SEROPT {label} ON (~91% duty for ~4.7s)");
+    let result = port.debug_illuminate().await;
+    esp_println::println!("SEROPT {label} OFF");
+    // Discard the test's own received bytes before normal polling resumes.
+    let _ = port.resynchronize().await;
+    if let Err(err) = result {
+        esp_println::println!("SEROPT {label} ERR {err:?}");
+        false
+    } else {
+        esp_println::println!("SEROPT {label} DONE");
+        true
+    }
+}
+
 async fn run_diag_command(command: DiagnosticCommand) -> DiagnosticResponse {
     if matches!(command, DiagnosticCommand::ScanStatus) {
         return scan_status();
@@ -2411,7 +2446,7 @@ async fn handle_serial_diag_line(line: &str) {
     match fields.next() {
         Some("help") | None => {
             esp_println::println!(
-                "SERDIAG usage: diag id | diag mem16 KEY ADDR | \
+                "SERDIAG usage: diag ir-test IR|IR2 | diag id | diag mem16 KEY ADDR | \
                  diag eeprom16 KEY WORD_ADDR | \
                  diag dump-memory KEY START END | \
                  diag dump-eeprom KEY BYTE_START BYTE_END | \
@@ -2431,6 +2466,20 @@ async fn handle_serial_diag_line(line: &str) {
         Some("id") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryId).await);
         }
+        Some("ir-test") => match (fields.next(), fields.next()) {
+            (Some("IR"), None) => {
+                serial_diag_print_response(&run_diag_command(DiagnosticCommand::OpticalTest).await);
+            }
+            (Some("IR2"), None) => {
+                WASHER_ACTIONS.send(WasherCommand::OpticalTest).await;
+                let ok = WASHER_TEST_RESULTS.receive().await;
+                esp_println::println!(
+                    "SERDIAG {} ir2_test_complete",
+                    if ok { "OK" } else { "ERR" }
+                );
+            }
+            _ => esp_println::println!("SERDIAG ERR usage: diag ir-test IR|IR2"),
+        },
         Some("max-baud") if fields.next().is_none() => {
             serial_diag_print_response(&run_diag_command(DiagnosticCommand::QueryMaxBaud).await);
         }

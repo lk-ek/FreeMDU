@@ -53,6 +53,25 @@ pub struct OpticalProgress {
 pub struct OpticalPort<'a>(Uart<'a, Async>, OpticalProgress);
 
 impl OpticalPort<'_> {
+    /// Illuminate the emitter for about 4.7 seconds without requiring an
+    /// appliance. Repeated 0x00 frames at 2400-8E1 keep the active-low LED
+    /// on for 10 out of every 11 bit periods, long enough for a multimeter.
+    /// Do not use the normal Write implementation: it expects a valid echo.
+    pub async fn debug_illuminate(&mut self) -> Result<(), OpticalError> {
+        const ZEROS: [u8; 32] = [0; 32];
+        for _ in 0..32 {
+            self.0
+                .write_async(&ZEROS)
+                .await
+                .map_err(|_| OpticalError::Transmit)?;
+            self.0
+                .flush_async()
+                .await
+                .map_err(|_| OpticalError::Transmit)?;
+        }
+        Ok(())
+    }
+
     /// Perform one unfiltered UART read for idle optical activity debugging.
     ///
     /// Like protocol reads, this exposes errors immediately. A consumer can
