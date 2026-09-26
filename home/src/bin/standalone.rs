@@ -440,7 +440,7 @@ async fn mqtt_message_task(
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut trace = Id410Trace::new();
     let mut published_id = 0u16;
-    let mut published_role = None;
+    let mut published_role: Option<ApplianceRole> = None;
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
     let mut scan = ScanJob::open(flash);
@@ -664,7 +664,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String) -> ! {
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut trace = Id410Trace::new();
     let mut published_id = 0_u16;
-    let mut published_role = None;
+    let mut published_role: Option<ApplianceRole> = None;
     let mut was_connected = false;
     let mut ir_debug_buf = [0_u8; 8];
     loop {
