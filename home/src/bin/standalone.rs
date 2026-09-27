@@ -2171,9 +2171,9 @@ async fn query_property_fresh(
         .map_err(|err| anyhow::anyhow!("Property {} failed: {err:?}", prop.id))
 }
 
-// Mcutie's default HA device identifier is the gateway MAC for every entity.
-// Give each detected appliance its own identifier while keeping the existing
-// entity IDs, discovery topics and state topics stable.
+// HA keeps the device assignment of an existing entity in its registry. A
+// fresh discovery identity is needed to split entities created with mcutie's
+// old gateway-wide identifier into separate appliance devices.
 #[derive(serde::Serialize)]
 struct ApplianceHaDevice<'a> {
     identifiers: [&'a str; 1],
@@ -2220,22 +2220,22 @@ async fn publish_appliance_discovery(
     Topic::General(format!("{prefix}/{component}/{object_id}/config"))
         .with_json(discovery)
         .retain(true)
+        .qos(mcutie::QoS::AtLeastOnce)
         .publish()
         .await
         .map_err(|err| anyhow::anyhow!("Failed to publish HA discovery: {err:?}"))
 }
 
-// The original single-port firmware published under hostname_property,
-// without a washer/dryer channel. Those retained entries otherwise remain
-// visible alongside the new entities. Early dual-port firmware also used the
-// gateway's MAC as the device identifier on the current discovery topic.
-// Remove both variants on first contact/reconnect before rediscovering the
-// entity with its stable channel-specific unique_id and device identifier.
+// Remove the single-port and first dual-port discovery topics once per MQTT
+// connection. The new discovery topic and unique ID must differ so HA creates
+// a new entity on the right appliance device instead of keeping its old
+// device-registry association.
 async fn clear_appliance_discovery(component: &str, object_id: &str) -> Result<()> {
     let prefix = option_env!("HA_DISCOVERY_PREFIX").unwrap_or("homeassistant");
     Topic::General(format!("{prefix}/{component}/{object_id}/config"))
         .with_bytes(b"")
         .retain(true)
+        .qos(mcutie::QoS::AtLeastOnce)
         .publish()
         .await
         .map_err(|err| anyhow::anyhow!("Failed to clear old HA discovery: {err:?}"))
@@ -2248,7 +2248,18 @@ async fn publish_property(
     channel: &'static str,
     refresh_device: bool,
 ) -> Result<()> {
-    let unique_id = format!("{}_{}_{}", hostname, channel, prop.id);
+    let old_id = format!("{hostname}_{channel}_{}", prop.id);
+    let unique_id = format!("{hostname}_appliance_v2_{channel}_{}", prop.id);
+    let object_id = format!(
+        "{hostname}_{channel}_{}",
+        prop.id
+            .strip_prefix(if channel == DRYER {
+                "dryer_"
+            } else {
+                "washer_"
+            })
+            .unwrap_or(prop.id)
+    );
     let display_name = prop
         .name
         .strip_prefix(if channel == DRYER {
@@ -2262,7 +2273,7 @@ async fn publish_property(
     } else {
         WASHER_STATUS
     };
-    let device_id = format!("{hostname}_{channel}");
+    let device_id = format!("{hostname}_appliance_v2_{channel}");
     let state_topic = Topic::Device(format!("{channel}/{}/value", prop.id));
 
     let discovery = ApplianceSensorDiscovery {
@@ -2271,7 +2282,7 @@ async fn publish_property(
             name: dev,
         },
         origin: Origin::default(),
-        object_id: &unique_id,
+        object_id: &object_id,
         unique_id: &unique_id,
         name: display_name,
         availability: [
@@ -2287,7 +2298,7 @@ async fn publish_property(
     if refresh_device {
         let legacy_id = format!("{hostname}_{}", prop.id);
         clear_appliance_discovery("sensor", &legacy_id).await?;
-        clear_appliance_discovery("sensor", &unique_id).await?;
+        clear_appliance_discovery("sensor", &old_id).await?;
     }
     publish_appliance_discovery("sensor", &unique_id, &discovery).await
 }
@@ -2333,7 +2344,19 @@ async fn publish_action(
     channel: &'static str,
     refresh_device: bool,
 ) -> Result<()> {
-    let unique_id = format!("{}_{}_{}", hostname, channel, action.id);
+    let old_id = format!("{hostname}_{channel}_{}", action.id);
+    let unique_id = format!("{hostname}_appliance_v2_{channel}_{}", action.id);
+    let object_id = format!(
+        "{hostname}_{channel}_{}",
+        action
+            .id
+            .strip_prefix(if channel == DRYER {
+                "dryer_"
+            } else {
+                "washer_"
+            })
+            .unwrap_or(action.id)
+    );
     let display_name = action
         .name
         .strip_prefix(if channel == DRYER {
@@ -2347,7 +2370,7 @@ async fn publish_action(
     } else {
         WASHER_STATUS
     };
-    let device_id = format!("{hostname}_{channel}");
+    let device_id = format!("{hostname}_appliance_v2_{channel}");
     let command_topic = Topic::Device(format!("{channel}/{}/trigger", action.id));
 
     let discovery = ApplianceButtonDiscovery {
@@ -2356,7 +2379,7 @@ async fn publish_action(
             name: dev,
         },
         origin: Origin::default(),
-        object_id: &unique_id,
+        object_id: &object_id,
         unique_id: &unique_id,
         name: display_name,
         availability: [
@@ -2371,7 +2394,7 @@ async fn publish_action(
     if refresh_device {
         let legacy_id = format!("{hostname}_{}", action.id);
         clear_appliance_discovery("button", &legacy_id).await?;
-        clear_appliance_discovery("button", &unique_id).await?;
+        clear_appliance_discovery("button", &old_id).await?;
     }
     publish_appliance_discovery("button", &unique_id, &discovery).await
 }
