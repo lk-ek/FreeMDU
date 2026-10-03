@@ -64,6 +64,10 @@ const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
 // Allow a slower reply after an optical error; resynchronize() already waits
 // for the appliance's three-second session timeout before each recovery read.
 const DEVICE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+// Limit time spent recovering missing properties on a noisy optical link.
+// Rotate across later properties on subsequent polls.
+const MAX_PROPERTY_RECOVERIES_PER_POLL: usize = 2;
+const PROPERTY_QUERY_GAP: Duration = Duration::from_millis(50);
 
 // Delay between Wi-Fi reconnection attempts
 const WIFI_RETRY_DELAY: Duration = Duration::from_secs(5);
@@ -490,6 +494,7 @@ async fn mqtt_message_task(
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut trace = Id410Trace::new();
     let mut published_id = 0u16;
+    let mut recovery_cursor = 0usize;
     let mut published_role: Option<ApplianceRole> = None;
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
@@ -624,7 +629,14 @@ async fn mqtt_message_task(
                 }
             }
             Either::Second(Either::Second(Either::Second(Either::First(())))) if connected => {
-                match publish_device_with_retry(&mut port, &hostname, published_id).await {
+                match publish_device_with_retry(
+                    &mut port,
+                    &hostname,
+                    published_id,
+                    &mut recovery_cursor,
+                )
+                .await
+                {
                     Ok((id, role)) => {
                         if let Some(previous) = published_role
                             && previous != role
@@ -681,6 +693,8 @@ async fn mqtt_message_task(
                 {
                     error!("Failed to publish gateway status: {err:?}");
                 }
+                // A slow poll must not trigger catch-up polls back-to-back.
+                ticker.reset();
             }
             Either::Second(Either::Second(Either::Second(Either::Second(Either::First(())))))
                 if connected && id410_trace_enabled() && published_id == 410 =>
@@ -715,6 +729,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
     let mut trace_ticker = Ticker::every(ID410_TRACE_INTERVAL);
     let mut trace = Id410Trace::new();
     let mut published_id = 0_u16;
+    let mut recovery_cursor = 0usize;
     let mut published_role: Option<ApplianceRole> = None;
     let mut was_connected = false;
     let mut ir_debug_buf = [0_u8; 8];
@@ -786,7 +801,14 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                 }
             },
             Either::Second(Either::First(())) if connected => {
-                match publish_device_with_retry(&mut port, &hostname, published_id).await {
+                match publish_device_with_retry(
+                    &mut port,
+                    &hostname,
+                    published_id,
+                    &mut recovery_cursor,
+                )
+                .await
+                {
                     Ok((id, role)) => {
                         if let Some(previous) = published_role
                             && previous != role
@@ -836,6 +858,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                         }
                     }
                 }
+                ticker.reset();
             }
             Either::Second(Either::Second(Either::First(())))
                 if connected && id410_trace_enabled() && published_id == 410 =>
@@ -2022,15 +2045,22 @@ async fn publish_device_with_retry(
     port: &mut OpticalPort<'_>,
     hostname: &str,
     previous_id: u16,
+    recovery_cursor: &mut usize,
 ) -> Result<(u16, ApplianceRole)> {
-    match publish_device(port, hostname, previous_id, DEVICE_TIMEOUT).await {
+    match publish_device(port, hostname, previous_id, DEVICE_TIMEOUT, recovery_cursor).await {
         Ok(result) => Ok(result),
         Err(first_error) => {
             warn!("Device polling failed ({first_error:#}); retrying once after resynchronization");
             port.resynchronize().await?;
-            publish_device(port, hostname, previous_id, DEVICE_RECOVERY_TIMEOUT)
-                .await
-                .with_context(|| format!("first polling attempt failed: {first_error:#}"))
+            publish_device(
+                port,
+                hostname,
+                previous_id,
+                DEVICE_RECOVERY_TIMEOUT,
+                recovery_cursor,
+            )
+            .await
+            .with_context(|| format!("first polling attempt failed: {first_error:#}"))
         }
     }
 }
@@ -2040,6 +2070,7 @@ async fn publish_device(
     hostname: &str,
     previous_id: u16,
     timeout: Duration,
+    recovery_cursor: &mut usize,
 ) -> Result<(u16, ApplianceRole)> {
     let mut dev = connect_to_device_with_timeout(port, timeout).await?;
     let id = dev.software_id();
@@ -2076,9 +2107,11 @@ async fn publish_device(
         .iter()
         .filter(|action| action.kind == ActionKind::Operation);
     let mut vals = Vec::with_capacity(props.clone().count());
+    let mut checked = Vec::with_capacity(props.clone().count());
 
     // Query properties first, as publishing them immediately might lead to timeout
     for prop in props.clone() {
+        checked.push(true);
         let val: Result<Value> = if let Some(snapshot) = dryer {
             Ok(snapshot.value::<core::convert::Infallible>(prop)?)
         } else {
@@ -2093,6 +2126,9 @@ async fn publish_device(
             Ok(val) => {
                 info!("Queried property {prop:?} with value {val:?}");
                 vals.push(Some(val));
+                if dryer.is_none() {
+                    Timer::after(PROPERTY_QUERY_GAP).await;
+                }
             }
             Err(err) => {
                 warn!(
@@ -2105,19 +2141,40 @@ async fn publish_device(
         }
     }
     // The failed optical exchange may have left the protocol out of sync.
-    // Release the current session before retrying each missing property in a
-    // fresh session; one broken property must not hide the other entities.
+    // Try a bounded number of missing properties in fresh sessions, rotating
+    // the starting position so a persistently broken property cannot prevent
+    // later valid properties from being sampled on subsequent polls.
     drop(dev);
     vals.resize_with(props.clone().count(), || None);
-    for (prop, val) in props.clone().zip(vals.iter_mut()) {
-        if val.is_none() {
-            match query_property_fresh(port, id, prop).await {
-                Ok(value) => *val = Some(value),
-                Err(err) => warn!(
-                    "Failed to query {} after resynchronization: {err:#}",
-                    prop.id
-                ),
-            }
+    checked.resize(props.clone().count(), false);
+    let prop_count = vals.len();
+    let start = if prop_count == 0 {
+        0
+    } else {
+        *recovery_cursor % prop_count
+    };
+    let mut attempted = 0;
+    for offset in 0..prop_count {
+        let index = (start + offset) % prop_count;
+        if vals[index].is_some() {
+            continue;
+        }
+        let prop = props
+            .clone()
+            .nth(index)
+            .expect("property index within count");
+        checked[index] = true;
+        match query_property_fresh(port, id, prop).await {
+            Ok(value) => vals[index] = Some(value),
+            Err(err) => warn!(
+                "Failed to query {} after resynchronization: {err:#}",
+                prop.id
+            ),
+        }
+        *recovery_cursor = (index + 1) % prop_count;
+        attempted += 1;
+        if attempted == MAX_PROPERTY_RECOVERIES_PER_POLL {
+            break;
         }
     }
 
@@ -2125,13 +2182,13 @@ async fn publish_device(
         return Err(anyhow::anyhow!("No device properties could be read"));
     }
 
-    for (prop, val) in props.zip(vals) {
+    for ((prop, val), checked) in props.zip(vals).zip(checked) {
         if id != 498 || previous_id != id {
             publish_property(prop, &dev_kind, hostname, channel, previous_id != id).await?;
         }
         if let Some(val) = val {
             publish_property_value(prop, &val, channel).await?;
-        } else {
+        } else if checked {
             Topic::Device(format!("{channel}/{}/value", prop.id))
                 .with_display("unknown")
                 .publish()
