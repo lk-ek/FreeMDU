@@ -30,6 +30,7 @@ pub enum OpticalError {
     EchoMismatch,
     NoisyLine,
     LateInput,
+    Configuration(ConfigError),
 }
 
 impl core::fmt::Display for OpticalError {
@@ -50,7 +51,7 @@ pub struct OpticalProgress {
     pub rx: usize,
 }
 
-pub struct OpticalPort<'a>(Uart<'a, Async>, OpticalProgress);
+pub struct OpticalPort<'a>(Uart<'a, Async>, OpticalProgress, u32);
 
 impl OpticalPort<'_> {
     /// Change only the UART timing for an isolated optical loopback test.
@@ -60,7 +61,9 @@ impl OpticalPort<'_> {
             &Config::default()
                 .with_baudrate(baudrate)
                 .with_parity(Parity::Even),
-        )
+        )?;
+        self.2 = baudrate;
+        Ok(())
     }
 
     /// Send one raw byte and return its optical echo, without treating an
@@ -147,24 +150,29 @@ impl OpticalPort<'_> {
         self.1
     }
 
+    /// Reset both FIFOs after a cancelled exchange, preserving current timing.
+    /// apply_config preserves GPIO routing/inversion and the async ISR.
+    /// Only call this when this task has exclusive ownership of the port.
+    fn reset_transport(&mut self) -> Result<(), OpticalError> {
+        self.debug_set_baudrate(self.2)
+            .map_err(OpticalError::Configuration)?;
+        // FIFO resets do not clear latched framing/parity/glitch flags.
+        let _ = self.0.check_for_rx_errors();
+        Ok(())
+    }
+
     /// Drain stale bytes until 30 ms of silence; bounded even with ambient IR.
+    /// Discarded old bytes are expected during recovery, not a new failure.
     pub async fn drain_input(&mut self) -> Result<(), OpticalError> {
         use embassy_time::{Duration, Timer, with_timeout};
         with_timeout(Duration::from_millis(300), async {
             let mut buf = [0_u8; 32];
-            let mut activity = false;
             loop {
                 match with_timeout(Duration::from_millis(30), self.0.read_async(&mut buf)).await {
-                    Err(_) => {
-                        return if activity {
-                            Err(OpticalError::LateInput)
-                        } else {
-                            Ok(())
-                        };
-                    }
-                    Ok(Ok(_)) => activity = true,
+                    Err(_) => return Ok(()),
+                    Ok(Ok(_)) => {}
                     Ok(Err(_)) => {
-                        activity = true;
+                        self.reset_transport()?;
                         Timer::after(Duration::from_millis(1)).await;
                     }
                 }
@@ -174,19 +182,39 @@ impl OpticalPort<'_> {
         .map_err(|_| OpticalError::NoisyLine)?
     }
 
-    /// No TX for longer than the appliance's three-second session timeout.
-    /// Drain delayed responses while waiting, then require a quiet input.
+    /// Stop queued TX, restore 2400-8E1, and let the appliance session expire.
+    /// Each attempt is bounded; persistent ambient IR cannot stall this task.
     pub async fn resynchronize(&mut self) -> Result<(), OpticalError> {
         use embassy_time::{Duration, Timer, with_timeout};
-        let _ = with_timeout(Duration::from_millis(3200), async {
-            let mut buf = [0_u8; 32];
-            loop {
-                let _ = self.0.read_async(&mut buf).await;
-                Timer::after(Duration::from_millis(1)).await;
+        // Drain-only calls during a baud sweep preserve the selected baud;
+        // protocol recovery always returns to the appliance default.
+        self.debug_set_baudrate(2400)
+            .map_err(OpticalError::Configuration)?;
+        for attempt in 0..3 {
+            self.reset_transport()?;
+            let wait: Result<Result<(), OpticalError>, _> =
+                with_timeout(Duration::from_millis(3200), async {
+                    let mut buf = [0_u8; 32];
+                    loop {
+                        if self.0.read_async(&mut buf).await.is_err() {
+                            self.reset_transport()?;
+                        }
+                        Timer::after(Duration::from_millis(1)).await;
+                    }
+                })
+                .await;
+            if let Ok(Err(err)) = wait {
+                return Err(err);
             }
-        })
-        .await;
-        self.drain_input().await
+            // Keep the last quiet-window check separate: resetting immediately
+            // before it could hide a continuously noisy receiver.
+            match self.drain_input().await {
+                Ok(()) => return Ok(()),
+                Err(err) if attempt == 2 => return Err(err),
+                Err(err) => log::warn!("OPT recovery attempt {}: {err:?}", attempt + 1),
+            }
+        }
+        Err(OpticalError::NoisyLine)
     }
 
     async fn read_raw(&mut self, buf: &mut [u8]) -> Result<usize, OpticalError> {
@@ -349,5 +377,5 @@ fn new_optical_port_on_pins<'a>(
         )
         .into_async();
 
-    Ok(OpticalPort(uart, OpticalProgress::default()))
+    Ok(OpticalPort(uart, OpticalProgress::default(), 2400))
 }

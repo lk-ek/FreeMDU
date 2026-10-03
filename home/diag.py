@@ -210,7 +210,9 @@ def request_reply(host: str, port: int, token: str, *parts: object) -> str:
     wire = ["FMDUDIAG1", token, ACTIVE_DIAG_TARGET, *(str(part) for part in parts)]
 
     with connect_with_retry(host, port) as sock:
-        sock.settimeout(30)
+        # Recovery may wait through three session expirations on a noisy link.
+        # Bulk reads also retry whole read-only requests after restoring the UART.
+        sock.settimeout(180)
         sock.sendall((" ".join(wire) + "\n").encode("ascii"))
 
         reader = sock.makefile("rb", buffering=0)
@@ -229,7 +231,9 @@ def request(host: str, port: int, token: str, *parts: object) -> str:
         # busy or noisy. Treat explicit timeout replies as transient so dump
         # commands retry the same block instead of aborting the whole file.
         if text.startswith("ERR ") and (
-            "timeout" in text.lower() or text.startswith("ERR query_software_id")
+            "timeout" in text.lower()
+            or text.startswith(("ERR query_", "ERR read_", "ERR noisy_line",
+                                "ERR unlock_read_access transport"))
         ):
             raise DiagnosticTransientError(text)
         raise RuntimeError(text)

@@ -64,6 +64,7 @@ const DEVICE_TIMEOUT: Duration = Duration::from_secs(1);
 // Allow a slower reply after an optical error; resynchronize() already waits
 // for the appliance's three-second session timeout before each recovery read.
 const DEVICE_RECOVERY_TIMEOUT: Duration = Duration::from_secs(3);
+const OPTICAL_READ_ATTEMPTS: usize = 3;
 // Limit time spent recovering missing properties on a noisy optical link.
 // Rotate across later properties on subsequent polls.
 const MAX_PROPERTY_RECOVERIES_PER_POLL: usize = 2;
@@ -495,6 +496,7 @@ async fn mqtt_message_task(
     let mut trace = Id410Trace::new();
     let mut published_id = 0u16;
     let mut recovery_cursor = 0usize;
+    let mut poll_failures = 0_u32;
     let mut published_role: Option<ApplianceRole> = None;
     let mut connected = false;
     let mut ir_debug_buf = [0_u8; 8];
@@ -638,6 +640,12 @@ async fn mqtt_message_task(
                 .await
                 {
                     Ok((id, role)) => {
+                        poll_failures = 0;
+                        ticker = Ticker::every(if id == 498 {
+                            Duration::from_secs(5)
+                        } else {
+                            DEVICE_PUBLISH_INTERVAL
+                        });
                         if let Some(previous) = published_role
                             && previous != role
                             && IR2_ROLE.load(Ordering::Relaxed) != previous.code()
@@ -655,11 +663,6 @@ async fn mqtt_message_task(
                             info!("IR identified software ID {id} as {}", role.channel());
                             trace = Id410Trace::new();
                             published_id = id;
-                            ticker = Ticker::every(if id == 498 {
-                                Duration::from_secs(5)
-                            } else {
-                                DEVICE_PUBLISH_INTERVAL
-                            });
                         }
                         if let Err(err) = role
                             .status()
@@ -672,6 +675,8 @@ async fn mqtt_message_task(
                     }
                     Err(err) => {
                         error!("Failed to publish IR device: {err:#}");
+                        poll_failures = poll_failures.saturating_add(1);
+                        ticker = Ticker::every(optical_retry_delay(poll_failures));
                         IR_SOFTWARE_ID.store(0, Ordering::Relaxed);
                         IR_ROLE.store(0, Ordering::Relaxed);
                         let _ = port.resynchronize().await;
@@ -715,6 +720,7 @@ async fn mqtt_message_task(
                 Err(err),
             ))))) => {
                 debug!("OPT AMBIENT UART activity/error: {err:?}");
+                Timer::after(Duration::from_millis(5)).await;
             }
             _ => {}
         }
@@ -730,6 +736,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
     let mut trace = Id410Trace::new();
     let mut published_id = 0_u16;
     let mut recovery_cursor = 0usize;
+    let mut poll_failures = 0_u32;
     let mut published_role: Option<ApplianceRole> = None;
     let mut was_connected = false;
     let mut ir_debug_buf = [0_u8; 8];
@@ -767,6 +774,9 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                         execute_diagnostic_command_recovering(&mut port, command, &mut diag_scan)
                             .await
                     };
+                    if response.as_bytes().starts_with(b"ERR ") && !is_scan_command(command) {
+                        let _ = port.resynchronize().await;
+                    }
                     PORT2_DIAG_RESPONSES.send(response).await;
                 }
                 Port2Command::Action(action) => {
@@ -810,6 +820,12 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                 .await
                 {
                     Ok((id, role)) => {
+                        poll_failures = 0;
+                        ticker = Ticker::every(if id == 498 {
+                            Duration::from_secs(5)
+                        } else {
+                            DEVICE_PUBLISH_INTERVAL
+                        });
                         if let Some(previous) = published_role
                             && previous != role
                             && IR_ROLE.load(Ordering::Relaxed) != previous.code()
@@ -823,11 +839,6 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                         if id != published_id {
                             info!("IR2 identified software ID {id} as {}", role.channel());
                             trace = Id410Trace::new();
-                            ticker = Ticker::every(if id == 498 {
-                                Duration::from_secs(5)
-                            } else {
-                                DEVICE_PUBLISH_INTERVAL
-                            });
                         }
                         published_id = id;
                         published_role = Some(role);
@@ -844,6 +855,8 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
                     }
                     Err(err) => {
                         error!("Failed to publish IR2 device: {err:#}");
+                        poll_failures = poll_failures.saturating_add(1);
+                        ticker = Ticker::every(optical_retry_delay(poll_failures));
                         IR2_SOFTWARE_ID.store(0, Ordering::Relaxed);
                         IR2_ROLE.store(0, Ordering::Relaxed);
                         let _ = port.resynchronize().await;
@@ -875,6 +888,7 @@ async fn port2_task(mut port: OpticalPort<'static>, hostname: String, flash: Sha
             }
             Either::Second(Either::Second(Either::Second(Err(err)))) => {
                 debug!("OPT2 AMBIENT UART activity/error: {err:?}");
+                Timer::after(Duration::from_millis(5)).await;
             }
             _ => {}
         }
@@ -1081,7 +1095,13 @@ async fn run_optical_bridge(port: &mut OpticalPort<'_>) {
     loop {
         match select::select(BRIDGE_COMMANDS.receive(), port.read(&mut rx_buf)).await {
             Either::First(BridgeCommand::Data(chunk)) => {
-                if let Err(err) = port.write_all(chunk.as_bytes()).await {
+                if let Err(err) = port
+                    .write_all(chunk.as_bytes())
+                    .with_timeout(DEVICE_RECOVERY_TIMEOUT)
+                    .await
+                    .map_err(|_| anyhow::anyhow!("bridge write timeout"))
+                    .and_then(|result| result.map_err(anyhow::Error::from))
+                {
                     warn!("Remote optical bridge TX failed: {err:?}");
                     return;
                 }
@@ -1132,22 +1152,36 @@ async fn execute_diagnostic_command_recovering(
     if !retryable || scan.state.phase == ScanPhase::Running {
         return execute_diagnostic_command(port, command, scan, DEVICE_TIMEOUT).await;
     }
-    if port.resynchronize().await.is_err() {
-        return diagnostic_error("ERR noisy_line");
+    let mut last = diagnostic_error("ERR noisy_line");
+    for attempt in 0..OPTICAL_READ_ATTEMPTS {
+        if port.resynchronize().await.is_err() {
+            continue;
+        }
+        let timeout = if attempt == 0 {
+            DEVICE_TIMEOUT
+        } else {
+            DEVICE_RECOVERY_TIMEOUT
+        };
+        last = execute_diagnostic_command(port, command, scan, timeout).await;
+        let failed_optical_read = last.as_bytes().starts_with(b"ERR query_")
+            || last.as_bytes().starts_with(b"ERR read_")
+            || last
+                .as_bytes()
+                .starts_with(b"ERR unlock_read_access transport")
+            || last
+                .as_bytes()
+                .starts_with(b"ERR unlock_read_access timeout");
+        if !failed_optical_read {
+            return last;
+        }
+        warn!(
+            "Optical diagnostic attempt {} failed; restoring transport",
+            attempt + 1
+        );
     }
-    let first = execute_diagnostic_command(port, command, scan, DEVICE_TIMEOUT).await;
-    let failed_optical_read = first.as_bytes().starts_with(b"ERR query_")
-        || first.as_bytes().starts_with(b"ERR read_")
-        || first
-            .as_bytes()
-            .starts_with(b"ERR unlock_read_access timeout");
-    if !failed_optical_read {
-        return first;
-    }
-    if port.resynchronize().await.is_err() {
-        return first;
-    }
-    execute_diagnostic_command(port, command, scan, DEVICE_RECOVERY_TIMEOUT).await
+    // Leave a failed session quiet before handing ownership back to polling.
+    let _ = port.resynchronize().await;
+    last
 }
 
 async fn execute_diagnostic_command(
@@ -1852,7 +1886,11 @@ async fn prepare_read_access(
         Ok(Ok(())) => Ok(()),
         Ok(Err(err)) => {
             warn!("DIAG unlock_read_access failed: {err:?}");
-            Err("ERR unlock_read_access")
+            if matches!(err, freemdu::Error::Io(_)) {
+                Err("ERR unlock_read_access transport")
+            } else {
+                Err("ERR unlock_read_access")
+            }
         }
         Err(err) => {
             warn!("DIAG unlock_read_access timeout: {err:?}");
@@ -2041,28 +2079,40 @@ async fn publish_accelerometer_value(id: &str, value: impl core::fmt::Display) -
         .map_err(|err| anyhow::anyhow!("Failed to publish LIS2DH value {id}: {err:?}"))
 }
 
+// Probe again soon after a transient failure, then reduce load on a missing
+// or persistently noisy appliance. Each port keeps its own failure count.
+fn optical_retry_delay(failures: u32) -> Duration {
+    Duration::from_secs((5_u64 << failures.saturating_sub(1).min(4)).min(60))
+}
+
 async fn publish_device_with_retry(
     port: &mut OpticalPort<'_>,
     hostname: &str,
     previous_id: u16,
     recovery_cursor: &mut usize,
 ) -> Result<(u16, ApplianceRole)> {
-    match publish_device(port, hostname, previous_id, DEVICE_TIMEOUT, recovery_cursor).await {
-        Ok(result) => Ok(result),
-        Err(first_error) => {
-            warn!("Device polling failed ({first_error:#}); retrying once after resynchronization");
-            port.resynchronize().await?;
-            publish_device(
-                port,
-                hostname,
-                previous_id,
-                DEVICE_RECOVERY_TIMEOUT,
-                recovery_cursor,
-            )
-            .await
-            .with_context(|| format!("first polling attempt failed: {first_error:#}"))
+    let mut last_error = None;
+    for attempt in 0..OPTICAL_READ_ATTEMPTS {
+        if attempt != 0 {
+            if let Err(err) = port.resynchronize().await {
+                last_error = Some(anyhow::anyhow!("Optical recovery failed: {err}"));
+                continue;
+            }
+        }
+        let timeout = if attempt == 0 {
+            DEVICE_TIMEOUT
+        } else {
+            DEVICE_RECOVERY_TIMEOUT
+        };
+        match publish_device(port, hostname, previous_id, timeout, recovery_cursor).await {
+            Ok(result) => return Ok(result),
+            Err(err) => {
+                warn!("Device polling attempt {} failed ({err:#})", attempt + 1);
+                last_error = Some(err);
+            }
         }
     }
+    Err(last_error.expect("at least one polling attempt"))
 }
 
 async fn publish_device(
@@ -2499,6 +2549,8 @@ async fn connect_to_device_with_timeout<'a, 'b>(
     port: &'a mut OpticalPort<'b>,
     timeout: Duration,
 ) -> Result<Box<dyn device::Device<&'a mut OpticalPort<'b>> + 'a>> {
+    // Reject persistent noise and discard delayed bytes before a new handshake.
+    port.drain_input().await?;
     let dev = device::connect(port)
         .with_timeout(timeout)
         .await

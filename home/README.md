@@ -25,13 +25,39 @@ Both variants apply to either optical port. The default `OPTICAL_TX_INVERTED`, `
 
 The status LED uses GPIO10 by default. The LIS2DH is disabled by default. Set `ACCEL_ENABLED = "true"` only when fitted, and set `PIN_ACCEL_SDA`/`PIN_ACCEL_SCL` if the default D1/D2 (GPIO3/4) pins differ. Do not share them with an IR port. The XIAO ESP32-C6 has a different GPIO map.
 
+## Automatic optical recovery
+
+Both IR ports recover independently. Recovery restores 2400-8E1, resets RX/TX
+FIFOs and clears UART receive error flags while preserving pin routing and
+inversion. It waits at least 3.2 seconds without transmitting so the appliance
+can expire its old session, then discards delayed input until 30 ms of silence.
+Old bytes followed by silence count as successful recovery. A continuous noisy
+line is rejected after a bounded wait; recovery tries up to three quiet windows.
+
+Polling and read-only diagnostics make at most three attempts. Recovery reads
+use a three-second operation timeout. Failed polling cycles probe again after
+5, 10, 20, 40 and then 60 seconds; a successful cycle restores normal polling.
+Ambient UART errors yield briefly so the other port and network tasks can run.
+The remote optical bridge disconnects on an error or a three-second write timeout;
+its owner resynchronizes the port before returning it to normal polling.
+
+Actions and commands with a full-access key are not automatically replayed,
+since the appliance may already have performed the command. A full key scan
+keeps its existing persistent progress and explicit resume rules.
+
+The diagnostic client allows 180 seconds for a reply, covering recovery and bulk
+reads. Communication errors are classified as transient for the existing dump
+retry loop; a rejected read key remains an ordinary error. Recovery attempts are
+visible in the live logs. A failed transmitter, wrong polarity, permanent optical
+interference or a nonresponsive appliance still needs a hardware check.
+
 ## Device detection and MQTT
 
 The two ports poll independently. The protocol library queries each appliance's software ID, selects a compatible implementation, and reads its [`DeviceKind`](../protocol/src/device.rs). A washing-machine profile publishes to `washer/...`; a tumble-dryer profile publishes to `dryer/...`, regardless of port. The same detected kind selects availability and the MQTT action route. Before executing an action the firmware reconnects and checks the *actual software ID* against the ID detected on that port. Unknown IDs and other device kinds receive no washer/dryer MQTT entities.
 
 The current MQTT namespace supports **one washer and one dryer**. Two devices of the same kind would use the same topics and entity IDs; use a separate gateway or extend the namespace before connecting that pair. The protocol library and TUI support additional kinds, such as dishwashers, without standalone MQTT channels.
 
-The ID410 read-only RAM trace is disabled by default; `ID410_TRACE_ENABLED = "true"` enables it on either port for diagnostics. The ID498 snapshot optimization and five-second polling run only for software ID 498. Other supported washers and dryers use their profile's normal `Operation` properties at `DEVICE_PUBLISH_INTERVAL` (default 60 seconds). If one property read fails, the gateway waits for the old optical session to expire, then retries up to two missing properties in fresh sessions with a three-second timeout instead of the normal one-second timeout. The next poll rotates to other missing properties, so a persistent error cannot monopolize the optical port. Successfully read values are published, failed reads become `unknown`, and properties skipped by the per-poll limit retain their previous state until their turn. If no properties can be read, the polling cycle is retried once after resynchronization. The next polling interval starts after the previous poll completes, including after errors. These device-specific features do not imply equivalent addresses or semantics on another software ID.
+The ID410 read-only RAM trace is disabled by default; `ID410_TRACE_ENABLED = "true"` enables it on either port for diagnostics. The ID498 snapshot optimization and five-second polling run only for software ID 498. Other supported washers and dryers use their profile's normal `Operation` properties at `DEVICE_PUBLISH_INTERVAL` (default 60 seconds). If one property read fails, the gateway waits for the old optical session to expire, then retries up to two missing properties in fresh sessions with a three-second timeout instead of the normal one-second timeout. The next poll rotates to other missing properties, so a persistent error cannot monopolize the optical port. Successfully read values are published, failed reads become `unknown`, and properties skipped by the per-poll limit retain their previous state until their turn. If no properties can be read, the polling cycle is attempted up to three times with resynchronization between attempts. The next polling interval starts after the previous poll completes, including after errors. These device-specific features do not imply equivalent addresses or semantics on another software ID.
 
 In standalone mode, Home Assistant MQTT discovery registers the properties and actions reported by the selected device implementation. Operation properties are published under:
 
