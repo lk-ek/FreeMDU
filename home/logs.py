@@ -38,7 +38,7 @@ def stream(host: str, port: int, token: str, timeout: float) -> None:
 def main() -> int:
     parser = argparse.ArgumentParser(description="Stream FreeMDU live logs over Wi-Fi")
     parser.add_argument("host", help="FreeMDU IP address or hostname")
-    parser.add_argument("--port", type=int, default=3233)
+    parser.add_argument("--port", type=int, help="override LOG_PORT from .cargo/local.toml/config.toml")
     parser.add_argument("--token", help="override OTA_TOKEN from .cargo/local.toml")
     parser.add_argument("--reconnect", action="store_true", help="reconnect after OTA/reboots")
     parser.add_argument("--retry-delay", type=float, default=1.0)
@@ -47,8 +47,12 @@ def main() -> int:
 
     try:
         token = args.token or load_config_value("OTA_TOKEN")
-    except RuntimeError as exc:
+        port = args.port if args.port is not None else int(load_config_value("LOG_PORT"))
+    except (RuntimeError, ValueError) as exc:
         parser.error(str(exc))
+
+    if not 1 <= port <= 65535:
+        parser.error("LOG_PORT must be within 1..65535")
 
     if not token or token == "change-me":
         parser.error(
@@ -58,7 +62,7 @@ def main() -> int:
 
     while True:
         try:
-            stream(args.host, args.port, token, args.timeout)
+            stream(args.host, port, token, args.timeout)
         except (OSError, RuntimeError) as exc:
             if not args.reconnect:
                 print(f"error: {exc}", file=sys.stderr)

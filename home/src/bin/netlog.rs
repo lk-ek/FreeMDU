@@ -1,7 +1,24 @@
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::{
+    fmt::Write as _,
+    sync::atomic::{AtomicBool, Ordering},
+};
+use embassy_futures::select::{Either, select};
+use embassy_net::{Stack, tcp::TcpSocket};
+use embassy_sync::{
+    blocking_mutex::{Mutex, raw::CriticalSectionRawMutex},
+    channel::Channel,
+};
+use embassy_time::{Duration, Timer, with_timeout};
+use embedded_io_async::Write as _;
 use log::{Level, LevelFilter, Log, Metadata, Record};
 
 const ESP_LOG: &str = env!("ESP_LOG");
+const LOG_PORT: u16 = freemdu_home::num_from_env!("LOG_PORT", u16);
+const OTA_TOKEN: &str = env!("OTA_TOKEN");
+// Fixed memory, no allocation or network waits in the synchronous logger.
+static LINES: Channel<CriticalSectionRawMutex, LogLine, 16> = Channel::new();
+static DROPPED: Mutex<CriticalSectionRawMutex, core::cell::Cell<u32>> =
+    Mutex::new(core::cell::Cell::new(0));
 static LOGGER: SerialLogger = SerialLogger;
 static QUIET_DIAGNOSTIC_SCAN: AtomicBool = AtomicBool::new(false);
 
@@ -23,10 +40,18 @@ impl Log for SerialLogger {
             return;
         }
 
-        // Keep diagnostics on USB Serial/JTAG only. Do not mirror log records
-        // into RAM or expose a TCP log service; this keeps logging independent
-        // of Wi-Fi quality and avoids a large static network-log backlog.
         esp_println::println!("{} - {}", record.level(), record.args());
+        let mut line = LogLine::new();
+        let _ = write!(&mut line, "{} - {}", record.level(), record.args());
+        line.finish();
+        if let Err(embassy_sync::channel::TrySendError::Full(line)) = LINES.try_send(line) {
+            // Retain recent records, including when nobody is connected.
+            let _ = LINES.try_receive();
+            DROPPED.lock(|count| count.set(count.get().saturating_add(1)));
+            if LINES.try_send(line).is_err() {
+                DROPPED.lock(|count| count.set(count.get().saturating_add(1)));
+            }
+        }
     }
 
     fn flush(&self) {}
@@ -89,5 +114,141 @@ fn parse_filter(value: &str) -> Option<LevelFilter> {
         Some(LevelFilter::Trace)
     } else {
         None
+    }
+}
+
+struct LogLine {
+    bytes: [u8; 192],
+    len: usize,
+}
+
+impl LogLine {
+    const fn new() -> Self {
+        Self {
+            bytes: [0; 192],
+            len: 0,
+        }
+    }
+
+    fn finish(&mut self) {
+        self.bytes[self.len] = b'\n';
+        self.len += 1;
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        &self.bytes[..self.len]
+    }
+}
+
+impl core::fmt::Write for LogLine {
+    fn write_str(&mut self, text: &str) -> core::fmt::Result {
+        let mut count = text.len().min(self.bytes.len() - 1 - self.len);
+        while !text.is_char_boundary(count) {
+            count -= 1;
+        }
+        self.bytes[self.len..self.len + count].copy_from_slice(&text.as_bytes()[..count]);
+        self.len += count;
+        if count == text.len() {
+            Ok(())
+        } else {
+            Err(core::fmt::Error)
+        }
+    }
+}
+
+async fn authenticate(socket: &mut TcpSocket<'_>) -> bool {
+    let mut line = [0_u8; 192];
+    let mut len = 0;
+    while len < line.len() {
+        match socket.read(&mut line[len..len + 1]).await {
+            Ok(1) if line[len] == b'\n' => {
+                let Ok(text) = core::str::from_utf8(&line[..len]) else {
+                    return false;
+                };
+                let mut fields = text.split_ascii_whitespace();
+                return fields.next() == Some("FMDULOG1")
+                    && fields.next() == Some(OTA_TOKEN)
+                    && fields.next().is_none();
+            }
+            Ok(1) => len += 1,
+            _ => return false,
+        }
+    }
+    false
+}
+
+#[embassy_executor::task]
+pub async fn server_task(stack: Stack<'static>) -> ! {
+    if OTA_TOKEN.is_empty() || OTA_TOKEN == "change-me" || LOG_PORT == 0 {
+        log::error!("WLAN logs disabled: set a non-default OTA_TOKEN and LOG_PORT");
+        core::future::pending::<()>().await;
+        unreachable!();
+    }
+    let mut rx = [0_u8; 256];
+    let mut tx = [0_u8; 512];
+    log::info!("WLAN log server listening on port {LOG_PORT}");
+    loop {
+        stack.wait_config_up().await;
+        let mut socket = TcpSocket::new(stack, &mut rx, &mut tx);
+        if socket.accept(LOG_PORT).await.is_err() {
+            Timer::after(Duration::from_millis(250)).await;
+            continue;
+        }
+        socket.set_timeout(Some(Duration::from_secs(10)));
+        if !matches!(
+            with_timeout(Duration::from_secs(10), authenticate(&mut socket)).await,
+            Ok(true)
+        ) {
+            let _ = with_timeout(
+                Duration::from_secs(2),
+                socket.write_all(b"ERR authentication\n"),
+            )
+            .await;
+            socket.abort();
+            continue;
+        }
+        if !matches!(
+            with_timeout(
+                Duration::from_secs(5),
+                socket.write_all(b"OK FreeMDU live logs\n")
+            )
+            .await,
+            Ok(Ok(()))
+        ) {
+            socket.abort();
+            continue;
+        }
+        // A quiet logger should stay connected. Bound writes separately so
+        // stalled clients never retain the only log socket indefinitely.
+        socket.set_timeout(None);
+        let mut peer = [0_u8; 1];
+        loop {
+            let line = match select(socket.read(&mut peer), LINES.receive()).await {
+                Either::First(_) => break, // disconnect or unexpected client data
+                Either::Second(line) => line,
+            };
+            let dropped = DROPPED.lock(|count| count.replace(0));
+            if dropped != 0 {
+                let mut notice = LogLine::new();
+                let _ = write!(
+                    &mut notice,
+                    "WARN - {dropped} log records dropped (buffer full)"
+                );
+                notice.finish();
+                if !matches!(
+                    with_timeout(Duration::from_secs(5), socket.write_all(notice.as_bytes())).await,
+                    Ok(Ok(()))
+                ) {
+                    break;
+                }
+            }
+            if !matches!(
+                with_timeout(Duration::from_secs(5), socket.write_all(line.as_bytes())).await,
+                Ok(Ok(()))
+            ) {
+                break;
+            }
+        }
+        socket.abort();
     }
 }

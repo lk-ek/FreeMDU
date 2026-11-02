@@ -3806,7 +3806,7 @@ fn init_network(
     Stack<'static>,
     Runner<'static, Interface<'static>>,
 )> {
-    static RESOURCES: StaticCell<StackResources<7>> = StaticCell::new();
+    static RESOURCES: StaticCell<StackResources<8>> = StaticCell::new();
 
     let (controller, intfs) = wifi::new(
         wifi,
@@ -3889,6 +3889,7 @@ async fn main(spawner: Spawner) {
     spawner.spawn(serial_diag_task(usb_serial).unwrap());
     spawner.spawn(network_stack_task(net_runner).unwrap());
     spawner.spawn(ota_server_task(net_stack, flash).unwrap());
+    spawner.spawn(netlog::server_task(net_stack).unwrap());
     spawner.spawn(diagnostic_server_task(net_stack).unwrap());
     spawner.spawn(bridge_server_task(net_stack).unwrap());
     spawner.spawn(wifi_connect_task(wifi_controller).unwrap());

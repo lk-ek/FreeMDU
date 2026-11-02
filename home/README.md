@@ -25,6 +25,27 @@ Both variants apply to either optical port. The default `OPTICAL_TX_INVERTED`, `
 
 The status LED uses GPIO10 by default. The LIS2DH is disabled by default. Set `ACCEL_ENABLED = "true"` only when fitted, and set `PIN_ACCEL_SDA`/`PIN_ACCEL_SCL` if the default D1/D2 (GPIO3/4) pins differ. Do not share them with an IR port. The XIAO ESP32-C6 has a different GPIO map.
 
+## Live logs over Wi-Fi
+
+Build and flash the updated standalone firmware before using the log client:
+
+```sh
+./logs.py 10.0.42.164 --reconnect
+./logs.py 10.0.42.164 --reconnect | tee freemdu.log
+```
+
+The client reads `LOG_PORT` (default 3233) and `OTA_TOKEN` from
+`.cargo/config.toml` plus `.cargo/local.toml` overrides. Both values are compiled
+into the firmware; changing config files requires a new firmware build/upload.
+`--port` and `--token` override the client's values. A default or empty token
+and a firmware `LOG_PORT` of zero disable the server.
+
+The server authenticates one client at a time with the OTA token. It retains at
+most 16 recent lines of up to 192 bytes each, reports dropped records, and mirrors
+USB logs according to `ESP_LOG`. Long lines are truncated at a UTF-8 boundary.
+A stalled client is disconnected after a bounded write wait. Network logging
+never waits inside the logger; continuous verbose logs can overflow the buffer.
+
 ## Automatic optical recovery
 
 Both IR ports recover independently. Recovery restores 2400-8E1, resets RX/TX
